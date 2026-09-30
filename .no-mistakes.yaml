@@ -2,3 +2,7 @@
 # Declaring this lets the no-mistakes gate treat an empty check list as
 # green instead of waiting for checks that will never register.
 no_ci: true
+
+# Pipeline PRs target main (the repo default).
+pr:
+  base_branch: main
