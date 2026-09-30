@@ -447,8 +447,8 @@ so the mode hard-forces exclusion.
   (the running process holds the file). `Stop-Process` first.
 - `EnumWindows` order is top-of-z-order first, and a `printf` with two
   `Cls()` calls shares ONE static buffer (the second overwrites the first):
-  print classes one per line in probes (zorder3.c does it right, zorder2.c
-  does not).
+  print classes one per line in probes (`probes/zorder3.c` does it right,
+  `probes/zorder2.c` does not).
 - Capturing from WSL PowerShell: `CopyFromScreen(0,0,0,0,(1440,900))` takes
   the top-left PHYSICAL quarter of a 2880x1800 screen. To see the taskbar
   (bottom edge), capture `CopyFromScreen(0,1440,0,0,(1440,360))`.

@@ -2,8 +2,9 @@
 
 > **Update 2026-09-29:** the v1 program this report greenlit is built and staged
 > at `C:\Users\tyanw\bin\mnPaper.exe`. Build facts, CLI, traps and the remaining
-> validation list now live in `AGENTS.md` in this directory. This document is
-> kept as the original feasibility evidence.
+> validation list now live in `AGENTS.md` at the repository root, one level
+> above this `probes/` directory. This document is kept as the original
+> feasibility evidence.
 
 Date: 2026-09-29. Machine: WSL2 Ubuntu on Windows 11 Home build 26200,
 display 1440x900 @ 96 dpi, 32-bit, single monitor.
@@ -16,8 +17,8 @@ the PoC ran DPI-unaware so it saw logical pixels.
 **Feasible.** The effect Paperman sells is not magic: it is a click-through,
 always-on-top layered window that paints a very low-alpha procedural paper
 texture over the whole screen. That exact mechanism was built and measured on
-this machine as `probes/poc.c` (459 lines, single file, C, zero dependencies). Every
-core claim below is backed by a live run, not by reading docs.
+this machine as `poc.c` in this directory (459 lines, single file, C, zero
+dependencies). Every core claim below is backed by a live run, not by reading docs.
 
 ## What the PoC actually does
 
@@ -111,7 +112,7 @@ Build recipe used (works today, reproduced twice):
 ```
 pushd <workdir>
 call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
-cl /nologo /O2 /W3 probes/poc.c user32.lib gdi32.lib shell32.lib psapi.lib
+cl /nologo /O2 /W3 probes\poc.c user32.lib gdi32.lib shell32.lib psapi.lib
 ```
 
 Run note: Windows PATH is intentionally not imported into WSL; `cmd.exe` had
