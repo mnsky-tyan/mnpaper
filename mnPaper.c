@@ -1918,7 +1918,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
         y += 34;
         g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
         y += 34;
         g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
         g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
@@ -1991,6 +1991,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetBkMode(d->hDC, TRANSPARENT);
             SetTextColor(d->hDC, RGB(40, 40, 40));
             DrawTextW(d->hDC, L"?", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (d->itemState & ODS_FOCUS)
+                DrawFocusRect(d->hDC, &rc);
             return TRUE;
         }
         break;
@@ -2323,6 +2325,10 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
             g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
+            if (g_dlg && IsWindow(g_dlg)) {
+                DlgSyncBars();
+                UpdateVals(g_dlg);
+            }
             SaveSettings();
             if (g_s.master && g_s.mode == MODE_PAPER)
                 RequestPaper();

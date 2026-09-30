@@ -60,6 +60,10 @@ SetCursorPos bypasses WH_MOUSE_LL while SendInput traverses it),
 - Source: `mnPaper.c` (this directory). PoC: `probes/poc.c`.
 - Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (a release /O2 /W3 build;
   the source now ships a 2.7.0 VERSIONINFO and the app icon via `mnPaper.rc`).
+  The DEPLOYED exe may lag this merged source until the post-merge redeploy the
+  agent performs (currently a 2.6.0 build with no icon resource), so an agent
+  session must not assume the binary on disk carries the 118/119 GUI work or
+  the 2.7.0 VERSIONINFO.
   Settings live in `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the
   `mnPaper` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - Tuning samples: `samples/` (paper at intensity 20 and 30, e-ink at 2/4/16
@@ -354,7 +358,7 @@ ShowWindow so hidden tests never flash a window on the desktop.
   until the captain buys one); e-ink shimmer at shades=4 documented, needs
   consent to tune live; update feed not published.
 - Repo: github.com/mnsky-tyan/mnpaper (private), default branch
-  `release-readiness`, validated through the no-mistakes pipeline on feature
+  `main`, validated through the no-mistakes pipeline on feature
   branches.
 
 E-ink flicker (not yet fixed, needs consent to test live): the render math is

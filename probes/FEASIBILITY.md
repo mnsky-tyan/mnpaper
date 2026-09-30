@@ -16,7 +16,7 @@ the PoC ran DPI-unaware so it saw logical pixels.
 **Feasible.** The effect Paperman sells is not magic: it is a click-through,
 always-on-top layered window that paints a very low-alpha procedural paper
 texture over the whole screen. That exact mechanism was built and measured on
-this machine as `poc.c` (459 lines, single file, C, zero dependencies). Every
+this machine as `probes/poc.c` (459 lines, single file, C, zero dependencies). Every
 core claim below is backed by a live run, not by reading docs.
 
 ## What the PoC actually does
@@ -111,7 +111,7 @@ Build recipe used (works today, reproduced twice):
 ```
 pushd <workdir>
 call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
-cl /nologo /O2 /W3 poc.c user32.lib gdi32.lib shell32.lib psapi.lib
+cl /nologo /O2 /W3 probes/poc.c user32.lib gdi32.lib shell32.lib psapi.lib
 ```
 
 Run note: Windows PATH is intentionally not imported into WSL; `cmd.exe` had
