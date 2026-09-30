@@ -1,0 +1,2542 @@
+/*
+ * mnPaper.c - whole-screen paper texture + e-ink mode for Windows.
+ *
+ * One portable native exe, zero dependencies, no installer, no cache files.
+ *
+ *   Paper mode : per-monitor WS_EX_LAYERED click-through overlay painting a
+ *                procedural paper texture (grain + fibres + blotches, warm
+ *                off-white) via UpdateLayeredWindow per-pixel alpha.
+ *   E-ink mode : DXGI Desktop Duplication capture (GDI poll fallback), then
+ *                capture -> luminance -> shade quantization -> Bayer dither,
+ *                presented through the same click-through overlays.
+ *
+ * State model (frozen spec):
+ *   master : on/off, Ctrl+Alt+P toggles
+ *   mode   : paper / e-ink, Ctrl+Alt+E switches (also turns master on)
+ * All overlay windows use SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)
+ * so the effect never appears in screen shares or captures.
+ *
+ * Second instance commands: --on --off --toggle --paper --eink --settings
+ *                           --quit --set key=value --log FILE --no-exclude
+ *                           --capture on|off
+ */
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS 1
+#define WINVER 0x0A00
+#define _WIN32_WINNT 0x0A00
+#define UNICODE
+#define _UNICODE
+#define CINTERFACE
+
+#include <windows.h>
+#include <shellapi.h>
+#include <shellscalingapi.h>
+#include <commctrl.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <emmintrin.h>  /* SSE2 byte interpolation on the native x64 build */
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shcore.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "ole32.lib")
+
+#ifndef DXGI_ERROR_WAIT_TIMEOUT
+#define DXGI_ERROR_WAIT_TIMEOUT ((HRESULT)0x887A0027L)
+#endif
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+#endif
+
+#define WM_APP_TRAY     (WM_APP + 2)
+#define IDM_MASTER      9001
+#define IDM_PAPER       9002
+#define IDM_EINK        9003
+#define IDM_SETTINGS    9004
+#define IDM_STRENGTH    9007      /* + index: 10/20/30/40 */
+#define IDM_SHARE       9020
+#define IDM_AUTOSTART   9005
+#define IDM_EXIT        9006
+#define TIMER_TICK      1
+#define TIMER_DEBOUNCE  2
+#define TICK_MS         50
+#define DEBOUNCE_MS     400     /* trailing registry save only; the live
+                                 * preview itself applies immediately */
+#define WM_APP_UPDATE   (WM_APP + 5)   /* update-check thread -> host window */
+
+/* ------------------------------- version -------------------------------- */
+/* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
+ * plain-text file whose first line is the latest version ("2.6.0") and
+ * PRODUCT_URL at the page users download from (GitHub Releases recommended:
+ * free TLS hosting, the release itself is the artifact). The update check
+ * NEVER downloads or replaces code: it compares version numbers and links
+ * out, so a hostile or offline feed can at worst show a wrong message. */
+#define MNVER_MAJOR 2
+#define MNVER_MINOR 6
+#define MNVER_PATCH 0
+#define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-app/mnpaper/main/version.txt"
+#define PRODUCT_URL L"https://github.com/mnsky-app/mnpaper/releases"
+
+#define MODE_PAPER 0
+#define MODE_EINK  1
+
+#define HOTKEY_MASTER 1
+#define HOTKEY_EINK   2
+
+/* ------------------------------------------------------------ settings --- */
+
+typedef struct {
+    int master;
+    int mode;
+    int intensity;
+    int warmth;
+    int grain;
+    int fibre;
+    int blotch;
+    int shades;
+    int contrast;
+    int dither;
+    int autostart;
+    int share;     /* 1 = the texture is visible in screenshots / screen shares */
+} SETTINGS;
+
+static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
+
+/* crash forensics: minidump for offline stack mapping */
+static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
+    HANDLE f;
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH - 19);
+    char *slash;
+    path[n] = 0;
+    slash = strrchr(path, '\\');
+    if (slash) *slash = 0;
+    lstrcatA(path, "\\mnpaper-crash.dmp");
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei;
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          MiniDumpNormal, &mei, NULL, NULL);
+        CloseHandle(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0 };
+static int g_hotkey_failed;
+
+static const WCHAR *REG_KEY = L"Software\\mnPaper";
+static const WCHAR *REG_RUN = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static FILE *g_log;
+static void L(const char *fmt, ...) {
+    va_list ap;
+    if (!g_log) return;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    fprintf(g_log, "\n");
+    fflush(g_log);
+    va_end(ap);
+}
+
+static void ClampSettingsOf(SETTINGS *s) {
+    int *vals[] = { &s->master, &s->mode, &s->intensity, &s->warmth,
+                    &s->grain, &s->fibre, &s->blotch, &s->shades,
+                    &s->contrast, &s->dither, &s->autostart, &s->share };
+    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0 };
+    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1 };
+    int i;
+    for (i = 0; i < 12; i++) {
+        if (*vals[i] < mins[i]) *vals[i] = mins[i];
+        if (*vals[i] > maxs[i]) *vals[i] = maxs[i];
+    }
+}
+
+static void ClampSettings(void) {
+    ClampSettingsOf(&g_s);
+}
+
+static void ApplyAutostart(void) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    if (g_s.autostart) {
+        WCHAR path[MAX_PATH];
+        DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+        if (n > 0)
+            RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)path, (n + 1) * sizeof(WCHAR));        else
+            RegDeleteValueW(k, L"mnPaper");
+    } else {
+        RegDeleteValueW(k, L"mnPaper");
+    }
+    RegCloseKey(k);
+}
+
+static void SaveSettings(void) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(k, L"master",    0, REG_DWORD, (BYTE *)&g_s.master,    sizeof(int));
+    RegSetValueExW(k, L"mode",      0, REG_DWORD, (BYTE *)&g_s.mode,      sizeof(int));
+    RegSetValueExW(k, L"intensity", 0, REG_DWORD, (BYTE *)&g_s.intensity, sizeof(int));
+    RegSetValueExW(k, L"warmth",    0, REG_DWORD, (BYTE *)&g_s.warmth,    sizeof(int));
+    RegSetValueExW(k, L"grain",     0, REG_DWORD, (BYTE *)&g_s.grain,     sizeof(int));
+    RegSetValueExW(k, L"fibre",     0, REG_DWORD, (BYTE *)&g_s.fibre,     sizeof(int));
+    RegSetValueExW(k, L"blotch",    0, REG_DWORD, (BYTE *)&g_s.blotch,    sizeof(int));
+    RegSetValueExW(k, L"shades",    0, REG_DWORD, (BYTE *)&g_s.shades,    sizeof(int));
+    RegSetValueExW(k, L"contrast",  0, REG_DWORD, (BYTE *)&g_s.contrast,  sizeof(int));
+    RegSetValueExW(k, L"dither",    0, REG_DWORD, (BYTE *)&g_s.dither,    sizeof(int));
+    RegSetValueExW(k, L"autostart", 0, REG_DWORD, (BYTE *)&g_s.autostart, sizeof(int));
+    RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
+    RegCloseKey(k);
+    ApplyAutostart();
+}
+
+static int GetDword(HKEY k, const WCHAR *name, int def) {
+    DWORD v = 0, sz = sizeof(v), t = 0;
+    if (RegQueryValueExW(k, name, NULL, &t, (BYTE *)&v, &sz) == ERROR_SUCCESS && t == REG_DWORD)
+        return (int)v;
+    return def;
+}
+
+static void LoadSettings(void) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        g_s.master    = GetDword(k, L"master",    g_s.master);
+        g_s.mode      = GetDword(k, L"mode",      g_s.mode);
+        g_s.intensity = GetDword(k, L"intensity", g_s.intensity);
+        g_s.warmth    = GetDword(k, L"warmth",    g_s.warmth);
+        g_s.grain     = GetDword(k, L"grain",     g_s.grain);
+        g_s.fibre     = GetDword(k, L"fibre",     g_s.fibre);
+        g_s.blotch    = GetDword(k, L"blotch",    g_s.blotch);
+        g_s.shades    = GetDword(k, L"shades",    g_s.shades);
+        g_s.contrast  = GetDword(k, L"contrast",  g_s.contrast);
+        g_s.dither    = GetDword(k, L"dither",    g_s.dither);
+        g_s.share     = GetDword(k, L"share",     g_s.share);
+        RegCloseKey(k);
+    }
+    /* autostart mirrors the Run key so an external edit stays honest */
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
+        DWORD sz = sizeof(path), t = 0;
+        if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
+            GetModuleFileNameW(NULL, mine, MAX_PATH);
+            if (_wcsicmp(path, mine) == 0) g_s.autostart = 1;
+            else g_s.autostart = 0;
+        }
+        RegCloseKey(k);
+    }
+    ClampSettings();
+}
+
+/* ---------------------------------------------------------------- noise --- */
+
+static unsigned lh(int x, int y, int seed) {
+    unsigned h = (unsigned)(x * 73856093 ^ y * 19349663 ^ seed * 83492791);
+    h = (h ^ (h >> 15)) * 2246822519u;
+    h ^= h >> 13;
+    h *= 3266489917u;
+    h ^= h >> 16;
+    return h;
+}
+static const float R32 = 2.3283064365386963e-10f;
+
+static float vnoise(float x, float y, int p, int seed) {
+    int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    float fx = x - x0, fy = y - y0, v00, v10, v01, v11, a, b;
+    int xa, ya, xb, yb;
+    fx = fx * fx * (3.f - 2.f * fx);
+    fy = fy * fy * (3.f - 2.f * fy);
+    xa = ((x0 % p) + p) % p; ya = ((y0 % p) + p) % p;
+    xb = (xa + 1) % p;         yb = (ya + 1) % p;
+    v00 = lh(xa, ya, seed) * R32; v10 = lh(xb, ya, seed) * R32;
+    v01 = lh(xa, yb, seed) * R32; v11 = lh(xb, yb, seed) * R32;
+    a = v00 + (v10 - v00) * fx;
+    b = v01 + (v11 - v01) * fx;
+    return a + (b - a) * fy;
+}
+
+static float fbm(float x, float y, int p) {
+    float sum = 0.f, amp = 0.5f, tot = 0.f;
+    int i;
+    for (i = 0; i < 4; i++) {
+        sum += amp * vnoise(x, y, p, i * 101 + 7);
+        tot += amp;
+        amp *= 0.5f;
+        x *= 2.03f; y *= 2.01f; p *= 2;
+    }
+    return sum / tot;
+}
+
+static int NextPow2(int v) {
+    int p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+
+
+/* ------------------------------------------------------------- overlays --- */
+
+#define MAX_MON 16
+
+#define MAX_STRIPS 8                /* per monitor; STRIP_H tall each      */
+#define STRIP_H    450              /* < the shell's ~800-900px fullscreen
+                                      * height trigger: a full-width window
+                                      * this short never suppresses the
+                                      * auto-hide taskbar raise (measured
+                                      * 4/4 raises at 450, 0/2 at 1800)     */
+typedef struct {
+    int      idx;
+    HMONITOR mon;
+    HWND     hwnd;                 /* = shwnd[0]; kept for single-window use */
+    HWND     shwnd[MAX_STRIPS];    /* horizontal strips covering the monitor */
+    int      n_strips;
+    RECT     rc;
+    int      w, h;
+    HDC      mem;
+    HBITMAP  dib;
+    void    *bits;
+} OVL;
+
+static OVL  g_ov[MAX_MON];
+static int  g_n;
+/* Hole-in-the-veil state. Fighting the shell over the taskbar's z-order
+ * turned out to be intermittent (the shell re-orders it whenever it feels
+ * like it), so instead the veil stops painting over the taskbar entirely:
+ * while the taskbar is revealed, the veil pixels there are fully
+ * transparent alpha and the real taskbar shows through pristine, no matter
+ * which side of the overlay it sits on. */
+static RECT g_hole[MAX_MON];
+static int  g_hole_on[MAX_MON];
+static int  g_hole_dirty;
+static HWND g_host;
+static int  g_force_capture_show;   /* --no-exclude validation flag, session only */
+
+/* Should the overlay be excluded from screenshots and screen shares?
+ * Yes by default so the texture never leaks into a share. The captain can
+ * toggle that at runtime. E-ink mode is always excluded: Desktop
+ * Duplication would capture the e-ink output itself and feed it back,
+ * white-washing the screen within seconds. */
+static int CaptureHidden(void) {
+    if (g_s.mode == MODE_EINK) return 1;   /* before any flag: no capture feedback */
+    if (g_force_capture_show) return 0;
+    return g_s.share ? 0 : 1;
+}
+
+static void ApplyCaptureState(OVL *ov) {
+    int s;
+    for (s = 0; s < ov->n_strips; s++) {
+        if (!ov->shwnd[s]) continue;
+        SetWindowDisplayAffinity(ov->shwnd[s],
+                                 CaptureHidden() ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    }
+}
+
+typedef struct {
+    HMONITOR mon;
+    RECT     rc;
+    int      w, h;
+} MONINFO;
+static MONINFO g_mi[MAX_MON];
+static int     g_nmi;
+
+/* Preview samples the same full-screen coordinate system on an 8px grid.
+ * Bilinear expansion preserves colour/strength changes while reducing the
+ * costly noise evaluation to 1/64 of the pixels. Full quality follows idle. */
+#define PAPER_PREVIEW_SHIFT 3
+#define PAPER_PREVIEW_STEP (1 << PAPER_PREVIEW_SHIFT)
+static volatile LONG g_stop_thread;
+static volatile LONG g_pepoch[MAX_MON];
+
+typedef struct {
+    SETTINGS s;
+    int pg, pf, pm, wr, wg_r, wb_r, dr, dg, db, bias, spread;
+    int fspread, bspread;      /* fibre/blotch own alpha-modulation gain */
+    float wg, wf, wm, wsum;
+    float fs;                  /* coordinate scale: 1 full, step in preview */
+} PAPERPARAMS;
+
+static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
+    PAPERPARAMS p;
+    int wb;
+    /* Warmth spans cool -> neutral(50) -> aged amber. The old mapping only
+     * moved endpoints by ~24/255 and never went below neutral, so 0-100
+     * looked identical on screen (captain: "too calm"). Signed swing:
+     * cool reduces red and raises blue; warm raises red/brown and cuts blue. */
+    int tw = sp->warmth * 2 - 100;          /* -100 cool .. +100 warm */
+    int cool = tw < 0 ? -tw : 0;
+    int warm = tw > 0 ? tw : 0;
+    p.s = *sp;
+    p.pg = NextPow2(w / sp->grain + 2);
+    p.pf = NextPow2(w / 2 + 2);
+    p.pm = NextPow2(w / 90 + 2);
+    p.wg = 0.45f;
+    p.wf = 0.30f * sp->fibre / 100.f;
+    p.wm = 0.25f * sp->blotch / 100.f;
+    p.wsum = p.wg + p.wf + p.wm;
+    wb = warm * 44 / 100;
+    p.wr = 255 - cool * 55 / 100;           /* highlight red: cool drops to 200 */
+    p.wg_r = 250 + cool / 25 - warm / 7;    /* highlight green */
+    p.wb_r = 236 + cool / 5 - wb;           /* highlight blue (255-capped when cool) */
+    if (p.wb_r > 255) p.wb_r = 255;
+    p.dr = 145 + warm / 8 - cool * 40 / 100;  /* shadow red   */
+    p.dg = 133 + warm / 10 - cool / 8;        /* shadow green */
+    p.db = 108 - wb + cool / 2;               /* shadow blue  */
+    p.bias = sp->intensity / 4; p.spread = sp->intensity * 3 / 4;
+    /* Fibre and blotch used to only nudge the noise mix (captain: "they
+     * don't seem to do much"). They now add their own alpha modulation on
+     * top of the mix, scaled with the strength slider, so the endpoints are
+     * unmistakable and 0 still means off. */
+    p.fspread = p.spread * 13 * sp->fibre / 10 / 100;   /* up to +1.3x spread */
+    p.bspread = p.spread * 12 * sp->blotch / 10 / 100;  /* up to +1.2x spread */
+    return p;
+}
+
+static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
+    /* fs scales ALL noise frequencies at once: the 8px preview grid samples
+     * a coarser paper (same character, 8x larger features) instead of
+     * aliasing fine grain into a flat smear - the old preview made grain
+     * changes look dead until the full refine landed (captain: "grain lags
+     * behind"). */
+    float u = (float)x / p->fs, v = (float)y / p->fs;
+    float grain = fbm(u / (float)p->s.grain, v / (float)p->s.grain, p->pg);
+    float fibre = fbm(u / 2.f, v / 12.f, p->pf);
+    float macro = fbm(u / 90.f, v / 70.f, p->pm);
+    float n = (grain * p->wg + fibre * p->wf + macro * p->wm) / p->wsum;
+    float d = (n - 0.5f) * 2.f;
+    float mag = d < 0 ? -d : d;
+    int ai = p->bias + (int)(mag * (float)p->spread)
+           + (int)((fabsf(fibre - 0.5f) * 2.f) * (float)p->fspread)
+           + (int)((fabsf(macro - 0.5f) * 2.f) * (float)p->bspread);
+    int cr = d >= 0 ? p->wr : p->dr;
+    int cg = d >= 0 ? p->wg_r : p->dg;
+    int cb = d >= 0 ? p->wb_r : p->db;
+    if (ai < 0) ai = 0;
+    if (ai > 255) ai = 255;
+    out[0] = (unsigned char)(cb * ai / 255);
+    out[1] = (unsigned char)(cg * ai / 255);
+    out[2] = (unsigned char)(cr * ai / 255);
+    out[3] = (unsigned char)ai;
+}
+
+static int PaperCancelled(volatile LONG *epoch, LONG expected) {
+    return epoch && (InterlockedCompareExchange(&g_stop_thread, 0, 0) ||
+                    InterlockedCompareExchange(epoch, 0, 0) != expected);
+}
+
+static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
+                          volatile LONG *epoch, LONG expected) {
+    PAPERPARAMS p = PaperParams(w, sp);
+    int x, y;
+    p.fs = 1.f;   /* full build: true frequencies */
+    for (y = 0; y < h; y++) {
+        if (PaperCancelled(epoch, expected)) return 0;
+        for (x = 0; x < w; x++)
+            PaperPixel(px + 4 * ((size_t)y * w + x), x, y, &p);
+    }
+    return 1;
+}
+
+static void ExpandPaperRow(unsigned char *dst, const unsigned char *grid, int w) {
+    int x, c;
+    for (x = 0; x < w; x++) {
+        int fx = x % PAPER_PREVIEW_STEP;
+        const unsigned char *a = grid + 4 * (x / PAPER_PREVIEW_STEP);
+        for (c = 0; c < 4; c++)
+            dst[4 * x + c] = (unsigned char)((a[c] * (PAPER_PREVIEW_STEP - fx) +
+                                  a[c + 4] * fx + PAPER_PREVIEW_STEP / 2) / PAPER_PREVIEW_STEP);
+    }
+}
+
+static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp) {
+    PAPERPARAMS p = PaperParams(w, sp);
+    int step = PAPER_PREVIEW_STEP;
+    p.fs = (float)step;   /* preview: same character, step-x coarser noise */
+    int gw = (w + step - 1) / step + 1, gh = (h + step - 1) / step + 1;
+    unsigned char *grid = (unsigned char *)malloc((size_t)gw * gh * 4);
+    unsigned char *rows = (unsigned char *)malloc((size_t)w * 8);
+    int x, y;
+    __m128i zero = _mm_setzero_si128(), round = _mm_set1_epi16(PAPER_PREVIEW_STEP / 2);
+    if (!grid || !rows) { free(grid); free(rows); return 0; }
+    for (y = 0; y < gh; y++) {
+        if (InterlockedCompareExchange(&g_stop_thread, 0, 0)) goto cancelled;
+        for (x = 0; x < gw; x++)
+            PaperPixel(grid + 4 * ((size_t)y * gw + x), x * step, y * step, &p);
+    }
+    for (y = 0; y < h; y++) {
+        int fy = y % step, bytes = w * 4;
+        unsigned char *top = rows, *bot = rows + bytes;
+        unsigned char *out = px + (size_t)y * bytes;
+        __m128i wa = _mm_set1_epi16((short)(step - fy)), wb = _mm_set1_epi16((short)fy);
+        if (InterlockedCompareExchange(&g_stop_thread, 0, 0)) goto cancelled;
+        if (!fy) {
+            if (y) memcpy(top, bot, bytes);
+            else ExpandPaperRow(top, grid, w);
+            ExpandPaperRow(bot, grid + (size_t)(y / step + 1) * gw * 4, w);
+        }
+        /* Interpolate 16 BGRA bytes together; reuse expanded grid rows for
+         * eight output rows rather than evaluating horizontal weights per
+         * full-resolution pixel. No additional persistent texture cache. */
+        for (x = 0; x + 16 <= bytes; x += 16) {
+            __m128i a = _mm_loadu_si128((const __m128i *)(top + x));
+            __m128i b = _mm_loadu_si128((const __m128i *)(bot + x));
+            __m128i lo = _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(a, zero), wa),
+                                     _mm_mullo_epi16(_mm_unpacklo_epi8(b, zero), wb));
+            __m128i hi = _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(a, zero), wa),
+                                     _mm_mullo_epi16(_mm_unpackhi_epi8(b, zero), wb));
+            lo = _mm_srli_epi16(_mm_add_epi16(lo, round), PAPER_PREVIEW_SHIFT);
+            hi = _mm_srli_epi16(_mm_add_epi16(hi, round), PAPER_PREVIEW_SHIFT);
+            _mm_storeu_si128((__m128i *)(out + x), _mm_packus_epi16(lo, hi));
+        }
+        for (; x < bytes; x++)
+            out[x] = (unsigned char)((top[x] * (step - fy) + bot[x] * fy + step / 2) / step);
+    }
+    free(grid); free(rows);
+    return 1;
+cancelled:
+    free(grid); free(rows);
+    return 0;
+}
+
+static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp,
+                          int hole_on, int hx0, int hy0, int hx1, int hy1) {
+    int y;
+    BuildPaperFull(px, w, h, sp, NULL, 0);
+    if (hole_on)
+        for (y = hy0; y < hy1; y++)
+            memset(px + 4 * ((size_t)y * w + hx0), 0, (size_t)(hx1 - hx0) * 4);
+}
+
+
+/* hole rect in overlay-local coordinates, 0 if none */
+static void LocalHole(const OVL *ov, int *on, int *x0, int *y0, int *x1, int *y1) {
+    *on = 0; *x0 = *y0 = *x1 = *y1 = 0;
+    if (ov->idx >= 0 && ov->idx < MAX_MON && g_hole_on[ov->idx]) {
+        int a = g_hole[ov->idx].left - ov->rc.left, b = g_hole[ov->idx].top - ov->rc.top;
+        int c = g_hole[ov->idx].right - ov->rc.left, d = g_hole[ov->idx].bottom - ov->rc.top;
+        if (a < 0) a = 0;
+        if (b < 0) b = 0;
+        if (c > ov->w) c = ov->w;
+        if (d > ov->h) d = ov->h;
+        if (c > a && d > b) { *on = 1; *x0 = a; *y0 = b; *x1 = c; *y1 = d; }
+    }
+}
+
+static void BuildPaper(OVL *ov) {
+    BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s, 0, 0, 0, 0, 0);
+}
+
+static int ApplyLayered(OVL *ov) {
+    HDC screen = GetDC(NULL);
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    unsigned char *saved = NULL;
+    int s, ok = 1, on = 0, x0, y0, x1, y1, y;
+    size_t rowbytes = 0;
+    /* Keep the backing texture intact. Taskbar animation changes only the
+     * presentation mask, not the noise: never queue a seconds-long rebuild
+     * merely to move a hole. ULW copies the pixels before we restore them. */
+    if (g_s.mode == MODE_PAPER) {
+        LocalHole(ov, &on, &x0, &y0, &x1, &y1);
+        if (on) {
+            rowbytes = (size_t)(x1 - x0) * 4;
+            saved = (unsigned char *)malloc(rowbytes * (y1 - y0));
+            if (!saved) on = 0;
+            else for (y = y0; y < y1; y++) {
+                unsigned char *row = (unsigned char *)ov->bits + 4 * ((size_t)y * ov->w + x0);
+                memcpy(saved + rowbytes * (y - y0), row, rowbytes);
+                memset(row, 0, rowbytes);
+            }
+        }
+    }
+    for (s = 0; s < ov->n_strips; s++) {
+        SIZE size = { ov->w, min(STRIP_H, ov->h - s * STRIP_H) };
+        POINT src = { 0, s * STRIP_H };
+        if (!UpdateLayeredWindow(ov->shwnd[s], screen, NULL, &size, ov->mem,
+                                 &src, 0, &bf, ULW_ALPHA)) {
+            L("layered upload failed: monitor=%d strip=%d error=%lu", ov->idx, s, GetLastError());
+            ok = 0;
+        }
+    }
+    if (on) for (y = y0; y < y1; y++)
+        memcpy((unsigned char *)ov->bits + 4 * ((size_t)y * ov->w + x0),
+               saved + rowbytes * (y - y0), rowbytes);
+    free(saved);
+    ReleaseDC(NULL, screen);
+    return ok;
+}
+
+static void PresentEinkRect(OVL *ov);
+
+static LRESULT CALLBACK OvlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static void DestroyOverlay(OVL *ov) {
+    int s;
+    for (s = 0; s < MAX_STRIPS; s++) {
+        if (ov->shwnd[s]) DestroyWindow(ov->shwnd[s]);
+        ov->shwnd[s] = NULL;
+    }
+    ov->hwnd = NULL; ov->mon = NULL;
+    if (ov->dib) DeleteObject(ov->dib);
+    if (ov->mem) DeleteDC(ov->mem);
+    ov->dib = NULL; ov->mem = NULL; ov->bits = NULL;
+}
+
+static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
+    BITMAPINFO bi;
+    HDC screen;
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    memset(ov, 0, sizeof(*ov));
+    ov->mon = mon;
+    ov->rc = *rc;
+    ov->w = rc->right - rc->left;
+    ov->h = rc->bottom - rc->top;
+    /* One strip per STRIP_H rows, full width: no window is ever both
+     * full-width AND tall, so the shell never mistakes the veil for a
+     * fullscreen app and the auto-hide taskbar keeps raising (the whole
+     * point of the strip design). */
+    for (ov->n_strips = 0; ov->n_strips < MAX_STRIPS; ov->n_strips++) {
+        int sy = ov->n_strips * STRIP_H;
+        int sh = ov->h - sy;
+        if (sh <= 0) break;
+        if (sh > STRIP_H) sh = STRIP_H;
+        ov->shwnd[ov->n_strips] = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            L"MnPaperOverlay", L"mnPaper", WS_POPUP,
+            rc->left, rc->top + sy, ov->w, sh, NULL, NULL, hi, NULL);
+        if (!ov->shwnd[ov->n_strips]) {
+            int k;
+            for (k = 0; k < ov->n_strips; k++) { DestroyWindow(ov->shwnd[k]); ov->shwnd[k] = NULL; }
+            ov->n_strips = 0;
+            return 0;
+        }
+    }
+    ov->hwnd = ov->shwnd[0];
+    ApplyCaptureState(ov);
+
+    screen = GetDC(NULL);
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = ov->w;
+    bi.bmiHeader.biHeight = -ov->h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    ov->dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &ov->bits, NULL, 0);
+    ov->mem = CreateCompatibleDC(screen);
+    SelectObject(ov->mem, ov->dib);
+    ReleaseDC(NULL, screen);
+    return 1;
+}
+
+static void ShowOverlay(OVL *ov, int show) {
+    int s;
+    if (!ov->hwnd) return;
+    if (show) {
+        if (g_s.mode == MODE_PAPER)
+            BuildPaper(ov);
+        else
+            PresentEinkRect(ov);
+        ApplyLayered(ov);
+        for (s = 0; s < ov->n_strips; s++)
+            ShowWindow(ov->shwnd[s], SW_SHOWNA);
+    } else {
+        for (s = 0; s < ov->n_strips; s++)
+            ShowWindow(ov->shwnd[s], SW_HIDE);
+    }
+}
+
+static BOOL CALLBACK MonRectCb(HMONITOR hm, HDC hdc, LPRECT rc, LPARAM lp) {
+    if (g_nmi >= MAX_MON) return FALSE;
+    g_mi[g_nmi].mon = hm;
+    g_mi[g_nmi].rc = *rc;
+    g_mi[g_nmi].w = rc->right - rc->left;
+    g_mi[g_nmi].h = rc->bottom - rc->top;
+    g_nmi++;
+    return TRUE;
+}
+
+static void SyncOverlays(void) {
+    OVL tmp[MAX_MON];
+    int i, j, n = 0;
+
+    g_nmi = 0;
+    EnumDisplayMonitors(NULL, NULL, MonRectCb, 0);
+
+    /* keep windows whose monitor still exists, drop the rest */
+    for (i = 0; i < g_n; i++) {
+        int alive = 0;
+        for (j = 0; j < g_nmi; j++)
+            if (g_mi[j].mon == g_ov[i].mon) { alive = 1; break; }
+        if (alive && n < MAX_MON)
+            tmp[n++] = g_ov[i];
+        else
+            DestroyOverlay(&g_ov[i]);
+    }
+    /* add monitors that have no window yet */
+    for (j = 0; j < g_nmi; j++) {
+        int have = 0;
+        for (i = 0; i < n; i++)
+            if (tmp[i].mon == g_mi[j].mon) { have = 1; break; }
+        if (!have && n < MAX_MON) {
+            RECT rc = g_mi[j].rc;
+            if (MakeOverlay(&tmp[n], g_mi[j].mon, &rc))
+                n++;
+        }
+    }
+    for (i = 0; i < n; i++) tmp[i].idx = i;
+    memcpy(g_ov, tmp, sizeof(tmp));
+    g_n = n;
+    L("monitors=%d", g_n);
+}
+
+
+/* ------------------------------------------------ overlay housekeeping ---
+ * The overlay is topmost and covers the whole screen, but some apps
+ * (Live2D mascots, computer-use overlays) re-assert WS_EX_TOPMOST
+ * themselves and end up ABOVE the veil. A periodic
+ * SetWindowPos(HWND_TOPMOST) re-claims the top of the topmost band; when
+ * the order is already correct the call is a no-op. The captain wants the
+ * whole screen textured, so the veil never withdraws - not even where the
+ * taskbar reveals. */
+#define TB_MAX 4
+static RECT g_tb[TB_MAX];
+static HWND g_tbw[TB_MAX];
+static int  g_ntb;
+static int  g_tb_state[TB_MAX];   /* 0 unknown, 1 parked, 2 revealed */
+static int  g_housekeep_n;  /* (reserved for slow tick work) */
+
+static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
+    WCHAR cls[64];
+    RECT r;
+    if (g_ntb >= TB_MAX) return FALSE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    GetClassNameW(hwnd, cls, 64);
+    if (lstrcmpW(cls, L"Shell_TrayWnd") != 0) return TRUE;
+    if (!GetWindowRect(hwnd, &r)) return TRUE;
+    if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
+    g_tb[g_ntb] = r;
+    g_tbw[g_ntb] = hwnd;
+    g_ntb++;
+    return TRUE;
+}
+
+static int IsTaskbarWnd(HWND h) {
+    WCHAR cls[64];
+    if (!h) return 0;
+    GetClassNameW(h, cls, 64);
+    return lstrcmpiW(cls, L"Shell_TrayWnd") == 0 ||
+           lstrcmpiW(cls, L"SecondaryTrayWnd") == 0;
+}
+
+static void CollectTaskbars(void) {
+    g_ntb = 0;
+    EnumWindows(TbEnumProc, 0);
+}
+
+static HWND g_dlg;   /* settings window, declared below */
+/* Hover tooltips RETIRED 2026-09-30 (captain: "the information window is
+ * bad"): hover popups replaced by a ? button that opens a help window only
+ * when pressed. The comctl32 tooltip had crashed; the own tip popup worked
+ * but popped unprompted while dragging. */
+
+static void ComputeHoles(void) {
+    int i, j;
+    RECT newh[MAX_MON];
+    int  newon[MAX_MON];
+
+    memset(newh, 0, sizeof(newh));
+    for (i = 0; i < g_n; i++) newon[i] = 0;
+    for (j = 0; j < g_ntb; j++) {
+        int mon = -1;
+        RECT on;
+        for (i = 0; i < g_n; i++)
+            if (g_tb[j].left < g_ov[i].rc.right && g_tb[j].right > g_ov[i].rc.left &&
+                g_tb[j].top < g_ov[i].rc.bottom && g_tb[j].bottom > g_ov[i].rc.top) {
+                mon = i; break;
+            }
+        if (mon < 0) continue;
+        on = g_tb[j];
+        if (on.left   < g_ov[mon].rc.left)   on.left   = g_ov[mon].rc.left;
+        if (on.right  > g_ov[mon].rc.right)  on.right  = g_ov[mon].rc.right;
+        if (on.top    < g_ov[mon].rc.top)    on.top    = g_ov[mon].rc.top;
+        if (on.bottom > g_ov[mon].rc.bottom) on.bottom = g_ov[mon].rc.bottom;
+        if (on.bottom - on.top <= 16) {          /* parked sliver          */
+            g_tb_state[j] = 1;                    /* unlatch: armed again   */
+            continue;
+        }
+        g_tb_state[j] = 2;
+        /* The shell's auto-hide manager is supposed to set WS_EX_TOPMOST on
+         * the taskbar when it reveals, but with a topmost full-screen veil
+         * present it never does (verified: app stopped -> task reveals at
+         * rank 8 topmost=1; app running -> topmost never set, rank 230+,
+         * the taskbar sinks behind every window). Re-assert the bit for it,
+         * ADD-ONLY: never demote. Demoting is what the first guard attempt
+         * did, and a SetWindowPos with a non-topmost insert-after clears
+         * WS_EX_TOPMOST, which ping-ponged with the shell and made the
+         * sinking intermittent.
+         *
+         * Raise UNCONDITIONALLY while revealed, not only when the bit is
+         * missing: the shell never clears WS_EX_TOPMOST on park, so after
+         * the first cycle the bit is permanently set and a bit-gated raise
+         * never fires again - the taskbar then re-reveals at its parked
+         * rank, BEHIND our topmost strips (captain-visible sinking a few
+         * minutes after launch). SetWindowPos(HWND_TOPMOST) is idempotent
+         * and lifts the window to the top of the topmost band; repeated
+         * raises while revealed are harmless and we still never demote. */
+        if (g_tbw[j])
+            SetWindowPos(g_tbw[j], HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        if (newon[mon]) UnionRect(&newh[mon], &newh[mon], &on);
+        else { newh[mon] = on; newon[mon] = 1; }
+    }
+    for (i = 0; i < g_n; i++) {
+        int changed = newon[i] != g_hole_on[i];
+        if (!changed && newon[i] &&
+            (newh[i].left != g_hole[i].left || newh[i].top != g_hole[i].top ||
+             newh[i].right != g_hole[i].right || newh[i].bottom != g_hole[i].bottom))
+            changed = 1;
+        if (changed) {
+            g_hole[i] = newh[i];
+            g_hole_on[i] = newon[i];
+            g_hole_dirty = 1;
+            L("taskbar hole %d %s rect=(%ld,%ld)-(%ld,%ld) on-screen=%ld",
+              i, newon[i] ? "ON" : "off",
+              newh[i].left, newh[i].top, newh[i].right, newh[i].bottom,
+              newon[i] ? newh[i].bottom - newh[i].top : 0);
+        }
+    }
+}
+
+static void RequestPaper(void);
+
+static void Housekeeping(void) {
+    int i, j, walked;
+    static int logged;
+    HWND h;
+    DWORD mypid = GetCurrentProcessId();
+    RECT vs;
+
+    /* Walk the top of the band. Re-assert only when a foreign, visible,
+       on-screen window (>= 8x8) sits above one of our overlays: mascots
+       and computer-use overlays keep pushing themselves up. Skipping our
+       own windows keeps the settings dialog above the veil; skipping the
+       0x0 / 1x1 IME and DWM helper windows avoids pointless z-order churn. */
+    vs.left   = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    vs.top    = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    vs.right  = vs.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    vs.bottom = vs.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    /* While a taskbar is revealed, do not fight foreign windows for the top
+       of the band: the shell's auto-hide manager sets WS_EX_TOPMOST on the
+       taskbar when it reveals, and a veil re-assert above it within the
+       same second makes the shell drop the bit again (observed: taskbar
+       stuck at rank ~330, topmost=0, hidden behind every window). The cost
+       is a possibly untextured mascot while the taskbar is up. */
+    {
+        int tb_up = 0;
+        for (j = 0; j < TB_MAX; j++)
+            if (g_tb_state[j] == 2) { tb_up = 1; break; }
+        if (!tb_up) {
+    h = GetTopWindow(NULL);
+    walked = 0;
+    while (h && walked < 24) {     /* cap the walk; ours sits near the top */
+        int ours = 0;
+        walked++;
+        RECT r;
+        DWORD pid = 0;
+        if (g_ov[0].hwnd == h) break;             /* reached the top overlay */
+        for (i = 0; i < g_n; i++) {
+            int s;
+            if (g_ov[i].hwnd == h) { ours = 1; break; }
+            for (s = 0; s < g_ov[i].n_strips; s++)
+                if (g_ov[i].shwnd[s] == h) { ours = 1; break; }
+            if (ours) break;
+        }
+        if (ours) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == mypid) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+        if (!IsWindowVisible(h)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+        if (!GetWindowRect(h, &r)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+        if (r.right - r.left < 8 || r.bottom - r.top < 8) {
+            h = GetWindow(h, GW_HWNDNEXT); continue;
+        }
+        if (r.right <= vs.left || r.left >= vs.right ||
+            r.bottom <= vs.top || r.top >= vs.bottom) {
+            h = GetWindow(h, GW_HWNDNEXT); continue;
+        }
+        /* a real foreign window is above the veil: take the top back */
+        for (i = 0; i < g_n; i++) {
+            int s;
+            for (s = 0; s < g_ov[i].n_strips; s++)
+                SetWindowPos(g_ov[i].shwnd[s], HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        }
+        if (g_dlg)   /* keep the settings window above the veil too */
+            SetWindowPos(g_dlg, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        break;
+        }
+    }
+    }
+
+    /* No z-order fight with the taskbar any more: the veil simply stops
+       painting over the revealed taskbar (see g_hole). The walk above
+       skips taskbars entirely. */
+    CollectTaskbars();
+    ComputeHoles();
+    if (g_hole_dirty) {
+        g_hole_dirty = 0;
+        if (g_s.master && g_s.mode == MODE_PAPER)
+            for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
+    }
+    /* the settings window floats above the veil (the veil used to swallow
+       it, which is what made the sliders feel laggy and unreadable). */
+    if (g_dlg) {
+        SetWindowPos(g_dlg, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
+
+    if (!logged) {
+        logged = 1;
+        L("taskbars visible: %d", g_ntb);
+        for (j = 0; j < g_ntb; j++)
+            L("  tray %d: %ld,%ld %ldx%ld", j, g_tb[j].left, g_tb[j].top,
+              g_tb[j].right - g_tb[j].left, g_tb[j].bottom - g_tb[j].top);
+    }
+}
+
+/* ------------------------------------- latest-value paper worker ---
+ * UI publishes immutable snapshots under a lock; at most one pending job
+ * per monitor is retained. A busy worker never loses the final request.
+ * Preview completes without cancellation so dense mouse input cannot
+ * starve it. Full refinement cancels by row when a newer request arrives. */
+#define WM_APP_PAPER (WM_APP + 3)
+
+typedef struct {
+    int idx, w, h, preview, pending;
+    unsigned gen;
+    LONG epoch;
+    DWORD queued;
+    SETTINGS s;
+} PAPERJOB;
+
+typedef struct PaperDone {
+    int idx, w, h, preview;
+    unsigned gen;
+    DWORD queued, build_ms;
+    unsigned char *px;
+} PaperDone;
+
+static PAPERJOB g_pjob[MAX_MON];
+static SRWLOCK g_plock = SRWLOCK_INIT;
+static unsigned g_pgen, g_platest[MAX_MON], g_papplied[MAX_MON];
+static int g_pupload_ok;
+static HANDLE g_worker, g_pwake;
+
+static void FreePaperDone(PaperDone *d) {
+    free(d->px);
+    free(d);
+}
+
+static DWORD WINAPI PaperWorker(LPVOID unused) {
+    int next = 0;
+    for (;;) {
+        PAPERJOB job;
+        PaperDone *d;
+        DWORD began;
+        int i, found = 0, built;
+        if (InterlockedCompareExchange(&g_stop_thread, 0, 0)) break;
+        AcquireSRWLockExclusive(&g_plock);
+        for (i = 0; i < MAX_MON; i++) {
+            int idx = (next + i) % MAX_MON;
+            if (g_pjob[idx].pending) {
+                job = g_pjob[idx];
+                g_pjob[idx].pending = 0;
+                next = (idx + 1) % MAX_MON;
+                found = 1;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_plock);
+        if (!found) { WaitForSingleObject(g_pwake, INFINITE); continue; }
+        d = (PaperDone *)calloc(1, sizeof(*d));
+        if (!d) continue;
+        d->px = (unsigned char *)malloc((size_t)job.w * job.h * 4);
+        if (!d->px) { free(d); continue; }
+        began = GetTickCount();
+        built = job.preview ? BuildPaperPreview(d->px, job.w, job.h, &job.s)
+                            : BuildPaperFull(d->px, job.w, job.h, &job.s,
+                                             &g_pepoch[job.idx], job.epoch);
+        if (!built || InterlockedCompareExchange(&g_stop_thread, 0, 0)) {
+            FreePaperDone(d);
+            continue;
+        }
+        d->idx = job.idx; d->w = job.w; d->h = job.h;
+        d->gen = job.gen; d->preview = job.preview;
+        d->queued = job.queued; d->build_ms = GetTickCount() - began;
+        if (!PostMessageW(g_host, WM_APP_PAPER, 0, (LPARAM)d)) FreePaperDone(d);
+    }
+    return 0;
+}
+
+static int PaperWorkerStart(void) {
+    if (g_worker) return 1;
+    InterlockedExchange(&g_stop_thread, 0);
+    g_pwake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_pwake) return 0;
+    g_worker = CreateThread(NULL, 0, PaperWorker, NULL, 0, NULL);
+    if (!g_worker) { CloseHandle(g_pwake); g_pwake = NULL; return 0; }
+    return 1;  /* Normal priority: measured rendering cost, not starvation. */
+}
+
+static void PaperWorkerStop(void) {
+    int i;
+    MSG msg;
+    InterlockedExchange(&g_stop_thread, 1);
+    if (g_worker) {
+        SetEvent(g_pwake);
+        /* Row cancellation keeps this short. Never free a live worker's
+         * buffers on a timed-out wait (the old 1s timeout was unsafe). */
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker); CloseHandle(g_pwake);
+        g_worker = g_pwake = NULL;
+    }
+    AcquireSRWLockExclusive(&g_plock);
+    memset(g_pjob, 0, sizeof(g_pjob));
+    ReleaseSRWLockExclusive(&g_plock);
+    g_pgen++;
+    for (i = 0; i < MAX_MON; i++) {
+        InterlockedIncrement(&g_pepoch[i]);
+        g_platest[i] = g_papplied[i] = g_pgen;
+    }
+    if (g_host)
+        while (PeekMessageW(&msg, g_host, WM_APP_PAPER, WM_APP_PAPER, PM_REMOVE))
+            FreePaperDone((PaperDone *)msg.lParam);
+}
+
+static void QueuePaper(int preview) {
+    int i;
+    if (g_s.mode != MODE_PAPER || !g_s.master) return;
+    if (!PaperWorkerStart()) { L("paper worker unavailable: %lu", GetLastError()); return; }
+    g_pgen++;
+    AcquireSRWLockExclusive(&g_plock);
+    for (i = 0; i < g_n; i++) {
+        PAPERJOB *job = &g_pjob[i];
+        if (!g_ov[i].hwnd) continue;
+        job->idx = i; job->w = g_ov[i].w; job->h = g_ov[i].h;
+        job->s = g_s; job->gen = g_pgen; job->preview = preview;
+        job->epoch = InterlockedIncrement(&g_pepoch[i]);
+        job->queued = GetTickCount(); job->pending = 1;
+        g_platest[i] = g_pgen;
+    }
+    ReleaseSRWLockExclusive(&g_plock);
+    SetEvent(g_pwake);
+}
+
+static void RequestPaper(void) { QueuePaper(0); }
+static void RequestPaperPreview(void) { QueuePaper(1); }
+
+static void ApplyPaperResult(PaperDone *d) {
+    OVL *ov;
+    if (d->idx < 0 || d->idx >= g_n) { FreePaperDone(d); return; }
+    ov = &g_ov[d->idx];
+    if (ov->hwnd && ov->w == d->w && ov->h == d->h &&
+        d->gen >= g_papplied[d->idx] &&
+        (d->preview || d->gen == g_platest[d->idx]) &&
+        g_s.mode == MODE_PAPER && g_s.master) {
+        g_papplied[d->idx] = d->gen;
+        memcpy(ov->bits, d->px, (size_t)ov->w * ov->h * 4);
+        g_pupload_ok = ApplyLayered(ov);
+        L("paper %s monitor=%d gen=%u build=%lums request-to-upload=%lums uploaded=%d",
+          d->preview ? "preview" : "full", d->idx, d->gen, d->build_ms,
+          GetTickCount() - d->queued, g_pupload_ok);
+    }
+    FreePaperDone(d);
+}
+
+static void RepaintAll(void) {
+    int i;
+    PaperWorkerStop();  /* A mode/master/CLI change invalidates old snapshots. */
+    for (i = 0; i < g_n; i++) {
+        ApplyCaptureState(&g_ov[i]);
+        ShowOverlay(&g_ov[i], g_s.master);
+    }
+}
+
+/* ----------------------------------------------------------------- e-ink --- */
+
+#define MAX_OUT 8
+
+typedef struct {
+    IDXGIOutputDuplication *dup;
+    RECT r;                 /* rect inside the virtual-screen capture buffer */
+    ID3D11Texture2D *stage;
+    int stageW, stageH;
+    int swapRB;
+} OUTINFO;
+
+static ID3D11Device        *g_dev;
+static ID3D11DeviceContext *g_ctx;
+static OUTINFO g_out[MAX_OUT];
+static int g_nout;
+static int g_vsx, g_vsy, g_vsw, g_vsh;
+static unsigned char *g_cap;
+static unsigned char *g_proc;
+static int  g_dxgi = 0;        /* 0 uninit, 1 live, -1 failed (use GDI) */
+static int  g_gdi_only = 0;     /* duplication unavailable: BitBlt fallback */
+static DWORD g_dxgi_fail_at;
+static unsigned long g_gdi_hash;
+
+static const int BAYER4[4][4] = {
+    { 0,  8,  2, 10 },
+    { 12, 4, 14,  6 },
+    { 3, 11,  1,  9 },
+    { 15, 7, 13,  5 }
+};
+
+static void EinkEnsureBuffers(void) {
+    if (g_cap && g_proc) {
+        /* size may have changed */
+        int vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (vsw == g_vsw && vsh == g_vsh) return;
+    }
+    free(g_cap); free(g_proc);
+    g_vsx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    g_vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    g_vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (g_vsw <= 0 || g_vsh <= 0) { g_cap = g_proc = NULL; return; }
+    g_cap  = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
+    g_proc = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
+    memset(g_cap, 0x80, (size_t)g_vsw * g_vsh * 4);
+    memset(g_proc, 0xFF, (size_t)g_vsw * g_vsh * 4);
+    L("buffers %dx%d", g_vsw, g_vsh);
+}
+
+static void EinkFreeBuffers(void) {
+    free(g_cap); free(g_proc);
+    g_cap = g_proc = NULL;
+}
+
+void EinkShutdownCapture(void);
+
+static void EinkProcess(void) {
+    int w = g_vsw, h = g_vsh, x, y;
+    int levels = g_s.shades;
+    double gain = 0.6 + (g_s.contrast / 100.0) * 1.4;
+    double ds = g_s.dither / 100.0;
+    unsigned char *src = g_cap, *dst = g_proc;
+    double scale = (levels > 1) ? 255.0 / (levels - 1) : 0.0;
+
+    if (w <= 0 || h <= 0 || !src || !dst) return;
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            unsigned char *s = src + 4 * ((size_t)y * w + x);
+            unsigned char *d = dst + 4 * ((size_t)y * w + x);
+            double lum = 0.299 * s[2] + 0.587 * s[1] + 0.114 * s[0];
+            double v = (lum - 128.0) * gain + 128.0;
+            double off = (BAYER4[y & 3][x & 3] / 16.0 - 0.5) * ds;
+            int lvl, out;
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            lvl = (int)floor(v / 255.0 * (levels - 1) + 0.5 + off);
+            if (lvl < 0) lvl = 0;
+            if (lvl > levels - 1) lvl = levels - 1;
+            out = (int)(lvl * scale + 0.5);
+            d[0] = d[1] = d[2] = (unsigned char)out;
+            d[3] = 255;
+        }
+    }
+}
+
+static void PresentEinkRect(OVL *ov) {
+    int x0 = ov->rc.left - g_vsx, y0 = ov->rc.top - g_vsy, y;
+    if (!g_proc || x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
+        return;
+    for (y = 0; y < ov->h; y++)
+        memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
+               g_proc + 4 * ((size_t)(y0 + y) * g_vsw + x0),
+               (size_t)ov->w * 4);
+    {
+        int on, hx0, hy0, hx1, hy1, x;
+        LocalHole(ov, &on, &hx0, &hy0, &hx1, &hy1);
+        if (on)
+            for (y = hy0; y < hy1; y++) {
+                unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4;
+                for (x = hx0; x < hx1; x++) row[4 * x + 3] = 0;
+            }
+    }
+}
+
+static void DxgiShutdown(void) {
+    int i;
+    for (i = 0; i < g_nout; i++) {
+        if (g_out[i].stage) { g_out[i].stage->lpVtbl->Release(g_out[i].stage); g_out[i].stage = NULL; }
+        if (g_out[i].dup)   { g_out[i].dup->lpVtbl->Release(g_out[i].dup);     g_out[i].dup = NULL; }
+    }
+    g_nout = 0;
+    if (g_ctx) { g_ctx->lpVtbl->Release(g_ctx); g_ctx = NULL; }
+    if (g_dev) { g_dev->lpVtbl->Release(g_dev); g_dev = NULL; }
+}
+
+void EinkShutdownCapture(void) {
+    DxgiShutdown();
+    g_dxgi = 0;
+    g_gdi_only = 0;
+}
+
+static int DxgiInit(void) {
+    IDXGIFactory1 *factory = NULL;
+    IDXGIAdapter1 *adapters[8];
+    int nadapt = 0, a, o;
+
+    g_dxgi_fail_at = GetTickCount();
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)) || !factory)
+        return 0;
+    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+                                 D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx)) || !g_dev) {
+        L("d3d11 device failed");
+        factory->lpVtbl->Release(factory);
+        DxgiShutdown();
+        return 0;
+    }
+    for (a = 0; a < 8; a++) {
+        HRESULT hr = factory->lpVtbl->EnumAdapters1(factory, a, &adapters[a]);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hr)) break;
+        nadapt++;
+    }
+    for (a = 0; a < nadapt; a++) {
+        IDXGIOutput *out = NULL;
+        o = 0;
+        while (g_nout < MAX_OUT && adapters[a]->lpVtbl->EnumOutputs(adapters[a], o++, &out) != DXGI_ERROR_NOT_FOUND) {
+            IDXGIOutput1 *out1 = NULL;
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(out->lpVtbl->QueryInterface(out, &IID_IDXGIOutput1, (void **)&out1)) && out1) {
+                memset(&g_out[g_nout], 0, sizeof(OUTINFO));
+                if (SUCCEEDED(out1->lpVtbl->GetDesc(out1, &desc))) {
+                    RECT r = desc.DesktopCoordinates;
+                    g_out[g_nout].r.left   = r.left   - g_vsx;
+                    g_out[g_nout].r.top    = r.top    - g_vsy;
+                    g_out[g_nout].r.right  = r.right  - g_vsx;
+                    g_out[g_nout].r.bottom = r.bottom - g_vsy;
+                    if (SUCCEEDED(out1->lpVtbl->DuplicateOutput(out1, (IUnknown *)g_dev, &g_out[g_nout].dup)) &&
+                        g_out[g_nout].dup) {
+                        g_nout++;
+                    }
+                }
+                out1->lpVtbl->Release(out1);
+            }
+            out->lpVtbl->Release(out);
+            out = NULL;
+        }
+        adapters[a]->lpVtbl->Release(adapters[a]);
+    }
+    factory->lpVtbl->Release(factory);
+    if (g_nout == 0) {
+        L("dxgi: no duplication outputs");
+        DxgiShutdown();
+    } else {
+        L("dxgi: %d duplication output(s)", g_nout);
+    }
+    return g_nout > 0;
+}
+
+/* returns 1 when at least one output produced a new frame */
+static int DxgiPoll(void) {
+    int i, got = 0;
+    for (i = 0; i < g_nout; i++) {
+        DXGI_OUTDUPL_FRAME_INFO fi;
+        IDXGIResource *res = NULL;
+        ID3D11Texture2D *tex = NULL;
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_MAPPED_SUBRESOURCE m;
+        HRESULT hr;
+        BYTE *srow, *drow;
+        long x, y;
+        UINT pitch;
+
+        hr = g_out[i].dup->lpVtbl->AcquireNextFrame(g_out[i].dup, 0, &fi, &res);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED || hr == DXGI_ERROR_INVALID_CALL) {
+            L("dxgi: access lost, re-init later");
+            if (res) res->lpVtbl->Release(res);
+            EinkShutdownCapture();
+            return 0;
+        }
+        if (FAILED(hr)) { if (res) res->lpVtbl->Release(res); continue; }
+
+        if (FAILED(res->lpVtbl->QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex)) || !tex) {
+            res->lpVtbl->Release(res);
+            g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
+            continue;
+        }
+        res->lpVtbl->Release(res);
+        tex->lpVtbl->GetDesc(tex, &td);
+
+        if (!g_out[i].stage || g_out[i].stageW != (int)td.Width || g_out[i].stageH != (int)td.Height) {
+            D3D11_TEXTURE2D_DESC sd;
+            if (g_out[i].stage) { g_out[i].stage->lpVtbl->Release(g_out[i].stage); g_out[i].stage = NULL; }
+            memset(&sd, 0, sizeof sd);
+            sd.Width = td.Width; sd.Height = td.Height;
+            sd.MipLevels = 1; sd.ArraySize = 1;
+            sd.Format = td.Format;
+            sd.SampleDesc.Count = 1;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(g_dev->lpVtbl->CreateTexture2D(g_dev, &sd, NULL, &g_out[i].stage))) {
+                tex->lpVtbl->Release(tex);
+                g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
+                continue;
+            }
+            g_out[i].stageW = (int)td.Width;
+            g_out[i].stageH = (int)td.Height;
+            g_out[i].swapRB = (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+        }
+        g_ctx->lpVtbl->CopyResource(g_ctx, (ID3D11Resource *)g_out[i].stage, (ID3D11Resource *)tex);
+        if (FAILED(g_ctx->lpVtbl->Map(g_ctx, (ID3D11Resource *)g_out[i].stage, 0, D3D11_MAP_READ, 0, &m))) {
+            tex->lpVtbl->Release(tex);
+            g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
+            continue;
+        }
+        srow = (BYTE *)m.pData;
+        drow = g_cap + 4 * ((size_t)g_out[i].r.top * g_vsw + g_out[i].r.left);
+        pitch = m.RowPitch;
+        for (y = 0; y < (long)td.Height; y++) {
+            BYTE *s = srow + (size_t)y * pitch;
+            BYTE *d = drow + (size_t)y * g_vsw * 4;
+            if (g_out[i].swapRB) {
+                for (x = 0; x < (long)td.Width; x++) {
+                    BYTE *sp = s + 4 * x, *dp = d + 4 * x;
+                    dp[0] = sp[2]; dp[1] = sp[1]; dp[2] = sp[0]; dp[3] = 255;
+                }
+            } else {
+                memcpy(d, s, (size_t)td.Width * 4);
+            }
+        }
+        g_ctx->lpVtbl->Unmap(g_ctx, (ID3D11Resource *)g_out[i].stage, 0);
+        tex->lpVtbl->Release(tex);
+        g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
+        got = 1;
+    }
+    return got;
+}
+
+/* GDI fallback: grab the desktop at tick rate, skip work when nothing moved */
+static int GdiPoll(void) {
+    HDC screen, mem;
+    BITMAPINFO bi;
+    void *bits = NULL;
+    HBITMAP bmp;
+    int w = g_vsw, h = g_vsh, y;
+    unsigned long hsh = 5381;
+    int i;
+
+    if (w <= 0 || h <= 0) return 0;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    screen = GetDC(NULL);
+    mem = CreateCompatibleDC(screen);
+    bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp) { DeleteDC(mem); ReleaseDC(NULL, screen); return 0; }
+    SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, w, h, screen, g_vsx, g_vsy, SRCCOPY | CAPTUREBLT);
+    for (i = 0; i < w * h; i += 97)
+        hsh = ((hsh << 5) + hsh) + ((unsigned *)bits)[i];
+    if (hsh == g_gdi_hash) {
+        DeleteObject(bmp); DeleteDC(mem); ReleaseDC(NULL, screen);
+        return 0;
+    }
+    g_gdi_hash = hsh;
+    for (y = 0; y < h; y++)
+        memcpy(g_cap + (size_t)y * w * 4, (unsigned char *)bits + (size_t)y * w * 4, (size_t)w * 4);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(NULL, screen);
+    return 1;
+}
+
+static void EinkTick(void) {
+    int i, got;
+    static int nf;
+
+    if (!g_cap || !g_proc) return;
+    if (g_dxgi == 0) {
+        if (g_gdi_only) {
+            /* retry duplication occasionally in case the reason is gone */
+            if (GetTickCount() - g_dxgi_fail_at > 2000) {
+                if (DxgiInit()) {
+                    g_dxgi = 1;
+                    g_gdi_only = 0;
+                    L("eink: duplication recovered");
+                } else {
+                    g_dxgi_fail_at = GetTickCount();
+                }
+            }
+        } else if (DxgiInit()) {
+            g_dxgi = 1;
+            L("eink: dxgi duplication live");
+        } else {
+            g_gdi_only = 1;
+            L("eink: duplication unavailable, GDI fallback");
+            return;
+        }
+    }
+    if (g_dxgi == 1) {
+        int lost = 0;
+        got = DxgiPoll();
+        if (g_dxgi == 0) lost = 1;   /* DxgiPoll shut capture down */
+        if (lost) {
+            g_gdi_only = 1;
+            return;
+        }
+    } else {
+        got = GdiPoll();
+    }
+    if (got) {
+        if ((++nf % 25) == 0)
+            L("eink frame %d (dxgi=%d gdi_only=%d)", nf, g_dxgi, g_gdi_only);
+        EinkProcess();
+        for (i = 0; i < g_n; i++) {
+            PresentEinkRect(&g_ov[i]);
+            ApplyLayered(&g_ov[i]);
+        }
+    }
+}
+
+
+/* headless dump support (validation without touching the screen) */
+static void DumpBgra(const char *path, unsigned char *bgra, int w, int h) {
+    BITMAPFILEHEADER fh;
+    BITMAPINFOHEADER ih;
+    FILE *f;
+    int x, y;
+    int stride = ((w * 3 + 3) / 4) * 4;
+    unsigned char *row = (unsigned char *)malloc(stride);
+    memset(&fh, 0, sizeof fh);
+    memset(&ih, 0, sizeof ih);
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof fh + sizeof ih;
+    fh.bfSize = fh.bfOffBits + stride * h;
+    ih.biSize = sizeof ih;
+    ih.biWidth = w;
+    ih.biHeight = h;
+    ih.biPlanes = 1;
+    ih.biBitCount = 24;
+    ih.biCompression = BI_RGB;
+    f = fopen(path, "wb");
+    if (!f) { free(row); return; }
+    fwrite(&fh, 1, sizeof fh, f);
+    fwrite(&ih, 1, sizeof ih, f);
+    for (y = h - 1; y >= 0; y--) {          /* BMP is bottom-up */
+        for (x = 0; x < w; x++) {
+            unsigned char *s = bgra + 4 * ((size_t)y * w + x);
+            row[x * 3 + 0] = s[0];
+            row[x * 3 + 1] = s[1];
+            row[x * 3 + 2] = s[2];
+        }
+        fwrite(row, 1, stride, f);
+    }
+    fclose(f);
+    free(row);
+}
+
+/* composite the low-alpha veil over a stand-in app background (default light
+   gray) so the dump shows what the eye actually sees, not the raw bitmap */
+static int g_dump_bg = 235;
+static void CompositeOver(unsigned char *bgra, int w, int h, int bg) {
+    int i;
+    for (i = 0; i < w * h; i++) {
+        unsigned char *p = bgra + 4 * (size_t)i;
+        int a = p[3];
+        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
+        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
+        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
+        p[3] = 255;
+    }
+}
+
+static void DumpPaper(const char *path, int w, int h) {
+    OVL ov;
+    memset(&ov, 0, sizeof ov);
+    ov.w = w; ov.h = h;
+    ov.bits = malloc((size_t)w * h * 4);
+    BuildPaper(&ov);
+    CompositeOver((unsigned char *)ov.bits, w, h, 235);
+    DumpBgra(path, (unsigned char *)ov.bits, w, h);
+    free(ov.bits);
+}
+
+/* synthetic desktop: gradient, blocks, text-like lines -> exercises e-ink */
+static void DumpEink(const char *path, int w, int h) {
+    int x, y;
+    unsigned char *bgra;
+    g_vsw = w; g_vsh = h;
+    free(g_proc);
+    g_proc = (unsigned char *)malloc((size_t)w * h * 4);
+    if (!g_cap) g_cap = (unsigned char *)malloc((size_t)w * h * 4);
+    bgra = g_cap;
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            unsigned char *p = bgra + 4 * ((size_t)y * w + x);
+            int v = (int)(255.0 * x / w);
+            p[2] = (unsigned char)v;
+            p[1] = (unsigned char)(255 - v / 2);
+            p[0] = 128;
+            p[3] = 255;
+            if ((y / 24) % 2 == 0 && (x / 8) % 2 == 0) {   /* dither target grid */
+                p[2] = p[1] = p[0] = (unsigned char)((x / 8) % 2 ? 230 : 25);
+            }
+            if (y % 96 < 3 || x % 96 < 3) {                  /* rules */
+                p[2] = p[1] = p[0] = 10;
+            }
+        }
+    }
+    EinkProcess();
+    DumpBgra(path, g_proc, w, h);
+    free(g_proc);
+    g_proc = NULL;
+}
+
+
+
+/* ---------------------------------------------------------- settings UI --- */
+
+static HWND g_dlg;
+static HWND g_tb_intensity, g_tb_warmth, g_tb_grain, g_tb_fibre, g_tb_blotch;
+static HWND g_tb_shades, g_tb_contrast, g_tb_dither, g_btn_adv;
+static HWND g_chk_share;   /* settings-window mirror of the tray share toggle */
+static void ActivateMode(int mode);   /* defined in the commands section below */
+static HWND g_lb_strength, g_lb_warmth, g_lb_grain, g_lb_fibre, g_lb_blotch;
+static HWND g_lb_shades, g_lb_contrast, g_lb_dither;
+static int   g_advanced;
+static const WCHAR *SET_CLASS = L"MnPaperSettings";
+/* ---------------- on-demand help window (replaces hover tips) ------------- */
+
+static HWND g_helpwnd;          /* single "?" help window              */
+int g_test_headless = 0;        /* tests create the help window hidden */
+
+static const WCHAR HELP_TEXT[] =
+    L"mnPaper - how every control works\r\n"
+    L"\r\n"
+    L"MODE\r\n"
+    L"  Paper  - the everyday warm paper texture over everything.\r\n"
+    L"  E-ink  - the WHOLE screen becomes greyscale like a Kindle reader. "
+    L"Black and white, and it can shimmer while things move. You are asked "
+    L"to confirm first. Paper (or Ctrl+Alt+E) always switches back "
+    L"instantly.\r\n"
+    L"\r\n"
+    L"PAPER SLIDERS - applied the moment you move them\r\n"
+    L"  Strength - how strongly the texture is drawn over the screen. "
+    L"0 = off, 30 = default, 40 = heavy.\r\n"
+    L"  Warmth   - colour tint. 0 = cool bluish, 50 = neutral, 100 = aged "
+    L"amber. The ends are strong on purpose.\r\n"
+    L"  Grain    - size of the speckles. Low = fine film grain, high = "
+    L"coarse sand. While dragging you see a coarse preview; the exact "
+    L"grain refines right after you stop.\r\n"
+    L"  Advanced >>\r\n"
+    L"    Fibre  - long stringy streaks running through the paper, like "
+    L"real pulp fibres. 0 = smooth, 100 = clearly stringy.\r\n"
+    L"    Blotch - large soft patches of uneven tone, like handmade paper. "
+    L"0 = uniform, 100 = strong patchy shading.\r\n"
+    L"\r\n"
+    L"E-INK SLIDERS\r\n"
+    L"  Shades   - how many greyscale levels. 2 = stark black and white, "
+    L"4 = default, 16 = nearly smooth.\r\n"
+    L"  Contrast - distance between light and dark.\r\n"
+    L"  Dither   - pixel mixing that fakes extra greyscale levels.\r\n"
+    L"\r\n"
+    L"OTHER CONTROLS\r\n"
+    L"  Show texture in screenshots and screen shares\r\n"
+    L"    Unchecked (default): screenshots and screen shares see the clean "
+    L"desktop while you still see the texture. Checked: captures include "
+    L"the texture. E-ink is always hidden from captures.\r\n"
+    L"  ?        - this window.\r\n"
+    L"  Check for updates - compares your version with the published one. "
+    L"It never downloads or installs anything; it only offers to open the "
+    L"download page.\r\n"
+    L"  Close    - closes the window. Every change is applied and saved the "
+    L"moment you move a slider - there is no Save button.\r\n"
+    L"\r\n"
+    L"HOTKEYS\r\n"
+    L"  Ctrl+Alt+P  - turn the effect on/off.\r\n"
+    L"  Ctrl+Alt+E  - switch between Paper and E-ink.\r\n";
+
+static LRESULT CALLBACK HelpProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_SIZE: {
+        HWND e = GetWindow(h, GW_CHILD);
+        RECT rc;
+        GetClientRect(h, &rc);
+        if (e) MoveWindow(e, 0, 0, rc.right, rc.bottom, TRUE);
+        return 0;
+    }
+    case WM_DESTROY:
+        if (h == g_helpwnd) g_helpwnd = NULL;
+        break;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+/* Every path that makes the help window visible funnels through here:
+ * a headless run must never show a window or touch the foreground. */
+static void HelpPresent(HWND h) {
+    if (g_test_headless) return;
+    ShowWindow(h, SW_SHOW);
+    SetForegroundWindow(h);
+}
+
+static void OpenHelp(HWND owner) {
+    WNDCLASSW w;
+    RECT rc, cr;
+    HWND e;
+    HFONT f;
+    if (g_helpwnd && IsWindow(g_helpwnd)) {
+        HelpPresent(g_helpwnd);
+        return;
+    }
+    memset(&w, 0, sizeof w);
+    w.lpfnWndProc   = HelpProc;
+    w.hInstance     = GetModuleHandleW(NULL);
+    w.lpszClassName = L"MnPaperHelp";
+    w.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    w.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    RegisterClassW(&w);   /* re-registration after a close fails harmlessly */
+    rc.left = 0; rc.top = 0; rc.right = 470; rc.bottom = 580;
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    g_helpwnd = CreateWindowExW(0, L"MnPaperHelp", L"mnPaper help",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+        owner, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_helpwnd) return;
+    GetClientRect(g_helpwnd, &cr);   /* same rect WM_SIZE keeps the edit on */
+    e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", HELP_TEXT,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_LEFT,
+        0, 0, cr.right, cr.bottom,
+        g_helpwnd, NULL, GetModuleHandleW(NULL), NULL);
+    f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
+    HelpPresent(g_helpwnd);
+}
+
+/* ---------------------- update check (link-out, safe) -------------------- */
+
+static volatile LONG g_update_busy;   /* one check at a time */
+
+/* Parse "[v] 3.2.1 ..." -> 1 on success. Rejects empty/garbage feeds. */
+static int ParseVersionTriple(const char *s, int *ma, int *mi, int *pa) {
+    int n[3] = { 0, 0, 0 }, idx = 0, seen = 0;
+    const char *p = s;
+    while (*p && (*p == ' ' || *p == '\t' || *p == 'v' || *p == 'V')) p++;
+    while (*p) {
+        if (*p >= '0' && *p <= '9') {
+            seen = 1;
+            n[idx] = n[idx] * 10 + (*p - '0');
+            if (n[idx] > 9999) return 0;
+        } else if (*p == '.') {
+            if (!seen) return 0;
+            if (++idx > 2) return 0;
+            seen = 0;
+        } else break;
+        p++;
+    }
+    if (!seen || idx < 1) return 0;          /* need at least major.minor */
+    *ma = n[0]; *mi = n[1]; *pa = n[2];
+    return 1;
+}
+
+static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
+    if (a0 != b0) return a0 < b0 ? -1 : 1;
+    if (a1 != b1) return a1 < b1 ? -1 : 1;
+    if (a2 != b2) return a2 < b2 ? -1 : 1;
+    return 0;
+}
+
+#define UPT_NONE      0   /* unreachable / offline / feed not published */
+#define UPT_MALFORMED 1   /* feed answered but stated no version          */
+#define UPT_NEW       2   /* newer version available                      */
+#define UPT_SAME      3   /* already on the latest version                */
+
+/* Worker thread: HTTPS GET of UPDATE_URL (TLS + hostname validation are
+ * WinHTTP defaults - no ignored-certification flags anywhere). Reads at most
+ * 4 KB, compares numbers and posts a WM_APP_UPDATE to the host window, which
+ * lives for the whole process: the settings dialog that started the check can
+ * be closed (and its handle recycled) long before the answer arrives. It
+ * NEVER navigates to anything from the feed - the result opens the built-in
+ * PRODUCT_URL only. No user data leaves the machine (the request is a bare
+ * GET with a product user-agent). */
+static DWORD WINAPI UpdateCheckThread(LPVOID param) {
+    (void)param;   /* the host window receives the result, not the caller */
+    WCHAR host[256] = L"", path[512] = L"", ua[32];
+    URL_COMPONENTSW uc = { sizeof(uc) };
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    int result = UPT_NONE;
+    WCHAR *found = NULL;
+    _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
+    if (!WinHttpCrackUrl(UPDATE_URL, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
+        goto done;
+    ses = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) goto done;
+    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 10000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con) goto done;
+    req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                             WINHTTP_FLAG_SECURE);
+    if (!req) goto done;
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req, NULL))
+        goto done;
+    {
+        char body[4097];
+        DWORD got = 0, total = 0, status = 0, stlen = sizeof status;
+        if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &stlen,
+                                 WINHTTP_NO_HEADER_INDEX) || status != 200)
+            goto done;
+        while (total < 4096 &&
+               WinHttpQueryDataAvailable(req, &got) && got &&
+               WinHttpReadData(req, body + total, 4096 - total, &got))
+            total += got;
+        body[total < 4096 ? total : 4096] = 0;
+        {
+            int ma, mi, pa;
+            if (!ParseVersionTriple(body, &ma, &mi, &pa)) {
+                result = UPT_MALFORMED;   /* answered, but stated no version */
+            } else if (CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR,
+                                      MNVER_PATCH) > 0) {
+                result = UPT_NEW;
+                found = (WCHAR *)malloc(64 * sizeof(WCHAR));
+                if (found)
+                    _snwprintf(found, 64, L"%d.%d.%d", ma, mi, pa);
+            } else {
+                result = UPT_SAME;        /* same or older: already current */
+            }
+        }
+    }
+done:
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    PostMessageW(g_host, WM_APP_UPDATE, (WPARAM)result, (LPARAM)found);
+    InterlockedExchange(&g_update_busy, 0);
+    return 0;
+}
+
+static void StartUpdateCheck(void) {
+    HANDLE t;
+    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
+        return;   /* a check is already running */
+    t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
+    if (!t) {
+        InterlockedExchange(&g_update_busy, 0);
+        return;
+    }
+    CloseHandle(t);   /* the busy flag clears in the thread */
+}
+
+/* Results land on the host window's thread. Any "open page" action uses ONLY
+ * the built-in PRODUCT_URL - never a string received from the network. */
+static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
+    WCHAR *found = (WCHAR *)lp;
+    int open = 0;
+    if (dlg && !IsWindow(dlg)) dlg = NULL;
+    if (result == UPT_NEW && found) {
+        WCHAR msg[160];
+        _snwprintf(msg, 160,
+            L"Version %s of mnPaper is available.\n\nOpen the download page now?",
+            found);
+        open = MessageBoxW(dlg, msg, L"mnPaper - update available",
+                           MB_YESNO | MB_ICONINFORMATION) == IDYES;
+    } else if (result == UPT_SAME) {
+        MessageBoxW(dlg, L"You are running the latest version of mnPaper.",
+                    L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
+    } else if (result == UPT_MALFORMED) {
+        open = MessageBoxW(dlg,
+            L"The update feed answered, but its contents could not be read as a "
+            L"version number.\n\nOpen the mnPaper download page anyway?",
+            L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+    } else {
+        open = MessageBoxW(dlg,
+            L"Could not reach the update feed (offline, or the feed is not "
+            L"published yet).\n\nOpen the mnPaper download page anyway?",
+            L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+    }
+    if (found) free(found);
+    if (open)
+        ShellExecuteW(dlg, L"open", PRODUCT_URL, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static HWND MkTrack(HWND parent, int id, int lo, int hi, int pos, int x, int y, int w, int h) {
+    HWND t = CreateWindowExW(0, L"msctls_trackbar32", NULL,
+        WS_CHILD | WS_VISIBLE | TBS_HORZ,
+        x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    SendMessageW(t, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
+    SendMessageW(t, TBM_SETPOS, TRUE, pos);
+    return t;
+}
+
+static HWND MkLabel(HWND parent, const WCHAR *text, int x, int y, int w, int h) {
+    return CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+        x, y, w, h, parent, NULL, GetModuleHandleW(NULL), NULL);
+}
+
+static int TbVal(HWND t) {
+    return t ? (int)SendMessageW(t, TBM_GETPOS, 0, 0) : 0;
+}
+
+/* numeric readout next to each slider: the veil change can be subtle, the
+   number always responds */
+static HWND g_val[8];   /* by control id - 100 */
+
+static void UpdateVals(HWND dlg) {
+    static const int ids[8] = { 100, 101, 102, 103, 104, 105, 106, 107 };
+    WCHAR buf[16];
+    int k;
+    if (!dlg) dlg = g_dlg;
+    if (!dlg) return;
+    for (k = 0; k < 8; k++) {
+        if (!g_val[k]) continue;
+        wsprintfW(buf, L"%d", TbVal(GetDlgItem(dlg, ids[k])));
+        SetWindowTextW(g_val[k], buf);
+    }
+}
+
+static void DlgLayout(void) {
+    /* hide/show whole rows: label + trackbar + numeric readout.  Both control
+     * sets are created at the same client positions, so a set left visible
+     * paints on top of the active one (wrong names and values on screen). */
+    int paper = (g_s.mode == MODE_PAPER);
+    int adv = paper && g_advanced;
+    ShowWindow(g_lb_strength,  paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_tb_intensity, paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_val[0],       paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_lb_warmth,    paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_tb_warmth,    paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_val[1],       paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_lb_grain,     paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_tb_grain,     paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_val[2],       paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_btn_adv,      paper ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_lb_fibre,     adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_tb_fibre,     adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_val[3],       adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_lb_blotch,    adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_tb_blotch,    adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_val[4],       adv ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_lb_shades,    paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_tb_shades,    paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_val[5],       paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_lb_contrast,  paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_tb_contrast,  paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_val[6],       paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_lb_dither,    paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_tb_dither,    paper ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_val[7],       paper ? SW_HIDE : SW_SHOW);
+}
+
+static void DlgSyncBars(void) {
+    SendMessageW(g_tb_intensity, TBM_SETPOS, TRUE, g_s.intensity);
+    SendMessageW(g_tb_warmth,    TBM_SETPOS, TRUE, g_s.warmth);
+    SendMessageW(g_tb_grain,     TBM_SETPOS, TRUE, g_s.grain);
+    SendMessageW(g_tb_fibre,     TBM_SETPOS, TRUE, g_s.fibre);
+    SendMessageW(g_tb_blotch,    TBM_SETPOS, TRUE, g_s.blotch);
+    SendMessageW(g_tb_shades,    TBM_SETPOS, TRUE, g_s.shades);
+    SendMessageW(g_tb_contrast,  TBM_SETPOS, TRUE, g_s.contrast);
+    SendMessageW(g_tb_dither,    TBM_SETPOS, TRUE, g_s.dither);
+    DlgLayout();
+}
+
+static void ReadBarsToSettings(void) {
+    if (g_s.mode == MODE_PAPER) {
+        g_s.intensity = TbVal(g_tb_intensity);
+        g_s.warmth    = TbVal(g_tb_warmth);
+        g_s.grain     = TbVal(g_tb_grain);
+        g_s.fibre     = TbVal(g_tb_fibre);
+        g_s.blotch    = TbVal(g_tb_blotch);
+    } else {
+        g_s.shades    = TbVal(g_tb_shades);
+        g_s.contrast  = TbVal(g_tb_contrast);
+        g_s.dither    = TbVal(g_tb_dither);
+    }
+    ClampSettings();
+}
+
+static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        int y = 14;
+        g_val[0] = MkLabel(hwnd, L"30", 302, y + 4, 44, 20); g_tb_intensity = MkTrack(hwnd, 100, 0, 40,  g_s.intensity, 106, y, 190, 26);
+        g_lb_strength = MkLabel(hwnd, L"Strength", 14, y + 4, 92, 20);
+        y += 34;
+        g_val[1] = MkLabel(hwnd, L"45", 302, y + 4, 44, 20); g_tb_warmth    = MkTrack(hwnd, 101, 0, 100, g_s.warmth, 106, y, 190, 26);
+        g_lb_warmth = MkLabel(hwnd, L"Warmth",   14, y + 4, 92, 20);
+        y += 34;
+        g_val[2] = MkLabel(hwnd, L"4",  302, y + 4, 44, 20); g_tb_grain     = MkTrack(hwnd, 102, 2, 12, g_s.grain, 106, y, 190, 26);
+        g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
+        y += 34;
+        g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+        y += 34;
+        g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
+        g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
+        y += 34;
+        g_val[4] = MkLabel(hwnd, L"30", 302, y + 4, 44, 20); g_tb_blotch    = MkTrack(hwnd, 104, 0, 100, g_s.blotch, 106, y, 190, 26);
+        g_lb_blotch = MkLabel(hwnd, L"Blotch",   14, y + 4, 92, 20);
+        g_val[5] = MkLabel(hwnd, L"4",  302, 14 + 4, 44, 20); g_tb_shades    = MkTrack(hwnd, 105, 2, 16, g_s.shades, 106, 14, 190, 26);
+        g_lb_shades = MkLabel(hwnd, L"Shades",   14, 14 + 4, 92, 20);
+        g_val[6] = MkLabel(hwnd, L"50", 302, 48 + 4, 44, 20); g_tb_contrast  = MkTrack(hwnd, 106, 0, 100, g_s.contrast, 106, 48, 190, 26);
+        g_lb_contrast = MkLabel(hwnd, L"Contrast", 14, 48 + 4, 92, 20);
+        g_val[7] = MkLabel(hwnd, L"75", 302, 82 + 4, 44, 20); g_tb_dither    = MkTrack(hwnd, 107, 0, 100, g_s.dither, 106, 82, 190, 26);
+        g_lb_dither = MkLabel(hwnd, L"Dither",   14, 82 + 4, 92, 20);
+        CreateWindowExW(0, L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 278, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+        /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
+         * morphs (SetMode refreshes rows in place). */
+        CreateWindowExW(0, L"BUTTON", L"Paper",
+            WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
+            GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"E-ink",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
+            GetModuleHandleW(NULL), NULL);
+        CheckRadioButton(hwnd, 114, 115, g_s.mode == MODE_PAPER ? 114 : 115);
+        /* Same setting as the tray's share toggle. Grayed in e-ink mode:
+         * that mode is always capture-excluded (feedback white-out). */
+        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 252, 352, 20, hwnd, (HMENU)113,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
+        /* "?" circle: explanations open only when pressed (captain asked to
+         * replace the hover popups). Owner-drawn round button, id 116. */
+        CreateWindowExW(0, L"BUTTON", L"?",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 14, 278, 26, 24, hwnd, (HMENU)116,
+            GetModuleHandleW(NULL), NULL);
+        /* link-out update check: compares version numbers, offers the page */
+        CreateWindowExW(0, L"BUTTON", L"Check for updates",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 304, 110, 24, hwnd, (HMENU)117,
+            GetModuleHandleW(NULL), NULL);
+        DlgLayout();
+        UpdateVals(hwnd);
+
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp;
+        if (wp == 116 && d) {
+            RECT rc = d->rcItem;
+            HBRUSH bg = CreateSolidBrush(RGB(245, 245, 245));
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(110, 110, 110));
+            HGDIOBJ ob = SelectObject(d->hDC, bg), op = SelectObject(d->hDC, pen);
+            Ellipse(d->hDC, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(d->hDC, op);
+            SelectObject(d->hDC, ob);
+            DeleteObject(pen);
+            DeleteObject(bg);
+            SetBkMode(d->hDC, TRANSPARENT);
+            SetTextColor(d->hDC, RGB(40, 40, 40));
+            DrawTextW(d->hDC, L"?", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_HSCROLL: {
+        /* Every change publishes the newest value. The worker coalesces
+         * pending snapshots, rather than dropping updates while busy. */
+        ReadBarsToSettings();
+        UpdateVals(hwnd);
+        if (g_s.mode == MODE_PAPER && g_s.master)
+            RequestPaperPreview();
+        else
+            RepaintAll();
+        SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, NULL);
+        return 0;
+    }
+    case WM_TIMER:
+        if (wp == TIMER_DEBOUNCE) {
+            KillTimer(hwnd, TIMER_DEBOUNCE);
+            ReadBarsToSettings();
+            SaveSettings();
+            if (g_s.mode == MODE_PAPER && g_s.master)
+                RequestPaper();          /* refine the already-visible preview */
+            else
+                RepaintAll();
+        }
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == 110) {
+            g_advanced = !g_advanced;
+            SetWindowTextW(g_btn_adv, g_advanced ? L"<< Advanced" : L"Advanced >>");
+            DlgLayout();
+        } else if (LOWORD(wp) == 113) {
+            g_s.share = IsDlgButtonChecked(hwnd, 113) == BST_CHECKED;
+            SaveSettings();
+            RepaintAll();   /* re-applies the capture exclusion live */
+            L("share=%d", g_s.share);
+        } else if (LOWORD(wp) == 114 || LOWORD(wp) == 115) {
+            int mode = (LOWORD(wp) == 114) ? MODE_PAPER : MODE_EINK;
+            if (g_s.mode != mode) {
+                if (mode == MODE_EINK) {
+                    /* E-ink is dramatic and easy to stumble into. Confirm in
+                     * plain words first; Paper always switches instantly so
+                     * this dialog doubles as the escape hatch. */
+                    if (MessageBoxW(hwnd,
+                        L"E-ink turns your ENTIRE screen into a black-and-white, Kindle-style reader view. "
+                        L"On a normal laptop screen it looks harsh and can shimmer while content moves. "
+                        L"It is for occasional reading, not everyday work.\n\n"
+                        L"You can always click Paper here (or press Ctrl+Alt+E) to come back instantly.\n\n"
+                        L"Switch to E-ink now?",
+                        L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                        CheckRadioButton(hwnd, 114, 115, 114);   /* snap back */
+                        return 0;
+                    }
+                }
+                ActivateMode(mode);   /* turns the effect on, saves, repaints */
+            }
+            CheckRadioButton(hwnd, 114, 115, mode == MODE_PAPER ? 114 : 115);
+        } else if (LOWORD(wp) == 116) {
+            OpenHelp(hwnd);   /* explanations on demand, never on hover */
+        } else if (LOWORD(wp) == 117) {
+            StartUpdateCheck();
+        } else if (LOWORD(wp) == IDCANCEL) {
+            SendMessageW(hwnd, WM_TIMER, TIMER_DEBOUNCE, 0);
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        SendMessageW(hwnd, WM_TIMER, TIMER_DEBOUNCE, 0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_dlg = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenSettings(void) {
+    RECT rc;
+    WNDCLASSEXW wc;
+    L("open settings");
+    if (g_dlg) {
+        SetForegroundWindow(g_dlg);
+        return;
+    }
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = DlgProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = SET_CLASS;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    RegisterClassExW(&wc);
+    g_advanced = 0;
+    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 340;
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    g_dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, SET_CLASS,
+        L"mnPaper settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+        NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (g_dlg) {
+        DlgSyncBars();
+        ShowWindow(g_dlg, SW_SHOW);
+        UpdateWindow(g_dlg);
+    }
+}
+
+#define CMD_TOGGLE   1
+#define CMD_ON       2
+#define CMD_OFF      3
+#define CMD_PAPER    4
+#define CMD_EINK     5
+#define CMD_SETTINGS 6
+#define CMD_QUIT     7
+#define CMD_SYNC     8      /* push parsed settings to the running instance */
+
+/* ------------------------------------------------------------ commands --- */
+
+static void SetMaster(int on) {
+    on = on ? 1 : 0;
+    if (g_s.master == on) return;
+    g_s.master = on;
+    RepaintAll();
+    SaveSettings();
+    L("master=%d", on);
+}
+
+static void SetMode(int mode) {
+    if (g_s.mode == mode) return;
+    g_s.mode = mode;
+    if (mode == MODE_EINK)
+        EinkEnsureBuffers();
+    SaveSettings();
+    if (g_dlg && IsWindow(g_dlg)) {
+        /* Morph the dialog in place rather than closing it: re-read bar
+         * ranges for the new mode, then re-show rows and values. */
+        DlgSyncBars();
+        DlgLayout();
+        UpdateVals(g_dlg);
+        CheckRadioButton(g_dlg, 114, 115, mode == MODE_PAPER ? 114 : 115);
+        EnableWindow(g_chk_share, mode == MODE_PAPER);
+    }
+    if (g_s.master)
+        RepaintAll();
+    L("mode=%s", mode == MODE_PAPER ? "paper" : "eink");
+}
+
+static void ActivateMode(int mode) {         /* also turns master on */
+    EinkEnsureBuffers();
+    g_s.master = 1;
+    SetMode(mode);
+    RepaintAll();
+    SaveSettings();
+}
+
+static NOTIFYICONDATAW g_nid;
+
+static const int STRENGTH_STEPS[4] = { 10, 20, 30, 40 };
+static const WCHAR *STRENGTH_NAMES[4] = { L"Subtle (10)", L"Soft (20)", L"Medium (30)", L"Strong (40)" };
+
+static void TrayMenu(void) {
+    HMENU m = CreatePopupMenu();
+    HMENU sub = CreatePopupMenu();
+    POINT pt;
+    int i;
+    for (i = 0; i < 4; i++)
+        AppendMenuW(sub, MF_STRING | (g_s.intensity == STRENGTH_STEPS[i] ? MF_CHECKED : 0),
+                    IDM_STRENGTH + i, STRENGTH_NAMES[i]);
+    AppendMenuW(m, MF_STRING | (g_s.master ? MF_CHECKED : 0), IDM_MASTER, L"Paper effect on");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Strength");
+    AppendMenuW(m, MF_STRING | (g_s.mode == MODE_PAPER ? MF_CHECKED : 0), IDM_PAPER, L"Paper texture");
+    AppendMenuW(m, MF_STRING | (g_s.mode == MODE_EINK  ? MF_CHECKED : 0), IDM_EINK,  L"E-ink");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (g_s.share ? MF_CHECKED : 0), IDM_SHARE,
+                L"Texture in shares/screenshots");
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"Settings...");
+    AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_host);
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_host, NULL);
+    DestroyMenu(sub);
+    DestroyMenu(m);
+}
+
+/* one-shot self check on a live desktop: styles, click-through, taskbar, guard */
+static void SelfCheck(void) {
+    DWORD aff;
+    int i;
+    for (i = 0; i < g_n; i++) {
+        OVL *ov = &g_ov[i];
+        LONG ex;
+        RECT rc;
+        POINT c;
+        HWND hit;
+        WCHAR cls[128] = L"?";
+        LRESULT ht;
+        if (!ov->hwnd) continue;
+        GetWindowRect(ov->hwnd, &rc);
+        ex = GetWindowLongW(ov->hwnd, GWL_EXSTYLE);
+        L("overlay %d: %dx%d rect=(%ld,%ld)-(%ld,%ld)", ov->idx, ov->w, ov->h, rc.left, rc.top, rc.right, rc.bottom);
+        L("  exstyle=%08lx LAYERED=%ld TRANSPARENT=%ld TOOLWINDOW=%ld NOACTIVATE=%ld TOPMOST=%ld",
+          (unsigned long)ex, (long)((ex & WS_EX_LAYERED) != 0), (long)((ex & WS_EX_TRANSPARENT) != 0),
+          (long)((ex & WS_EX_TOOLWINDOW) != 0), (long)((ex & WS_EX_NOACTIVATE) != 0),
+          (long)((ex & WS_EX_TOPMOST) != 0));
+        c.x = (rc.left + rc.right) / 2;
+        c.y = (rc.top + rc.bottom) / 2;
+        hit = WindowFromPoint(c);
+        if (hit) GetClassNameW(hit, cls, 128);
+        L("  WindowFromPoint(center)=%p class=%S -> %s", (void *)hit, cls,
+          hit == ov->hwnd ? "HIT OVERLAY (BAD)" : "fell through (click-through OK)");
+        ht = SendMessageW(ov->hwnd, WM_NCHITTEST, 0, MAKELPARAM(c.x - rc.left, c.y - rc.top));
+        L("  WM_NCHITTEST=%ld (DefWindowProc does not implement the style, informational)", (long)ht);
+        aff = 0;
+        if (GetWindowDisplayAffinity(ov->hwnd, &aff))
+            L("  capture: hidden=%d (share=%d eink=%d force=%d actual_affinity=%d)",
+              CaptureHidden(), g_s.share, g_s.mode == MODE_EINK, g_force_capture_show, aff);
+    }
+    CollectTaskbars();
+    for (i = 0; i < g_ntb; i++)
+        L("selfcheck: taskbar %d at %ld,%ld %ldx%ld", i, g_tb[i].left, g_tb[i].top,
+          g_tb[i].right - g_tb[i].left, g_tb[i].bottom - g_tb[i].top);
+}
+
+static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        return 0;
+    case WM_TIMER:
+        if (wp == 3) {
+            KillTimer(hwnd, 3);
+            SelfCheck();
+        } else if (wp == TIMER_TICK) {
+            Housekeeping();
+            if (g_s.master && g_s.mode == MODE_EINK)
+                EinkTick();
+        }
+        return 0;
+    case WM_HOTKEY:
+        if (wp == HOTKEY_MASTER)
+            SetMaster(!g_s.master);
+        else if (wp == HOTKEY_EINK)
+            ActivateMode(g_s.mode == MODE_PAPER ? MODE_EINK : MODE_PAPER);
+        return 0;
+    case WM_DISPLAYCHANGE:
+        L("display change");
+        PaperWorkerStop();
+        EinkShutdownCapture();
+        EinkFreeBuffers();
+        EinkEnsureBuffers();
+        SyncOverlays();
+        RepaintAll();
+        return 0;
+    case WM_APP_UPDATE:
+        UpdateResult(g_dlg, wp, lp);   /* may outlive the dialog that asked */
+        return 0;
+    case WM_APP_PAPER:
+        ApplyPaperResult((PaperDone *)lp);
+        return 0;
+    case WM_APP + 1:
+        L("cmd %d", (int)wp);
+        switch (wp) {
+        case CMD_TOGGLE: SetMaster(!g_s.master); break;
+        case CMD_ON:     SetMaster(1); break;
+        case CMD_OFF:    SetMaster(0); break;
+        case CMD_PAPER:  ActivateMode(MODE_PAPER); break;
+        case CMD_EINK:   ActivateMode(MODE_EINK); break;
+        case CMD_SETTINGS: OpenSettings(); break;
+        case CMD_QUIT:   L("quit"); SaveSettings(); DestroyWindow(hwnd); break;
+        }
+        return 0;
+    case WM_COPYDATA: {
+        COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
+        if (cd && cd->dwData == CMD_SYNC && cd->cbData == sizeof(SETTINGS)) {
+            g_s = *(SETTINGS *)cd->lpData;
+            ClampSettings();
+            SaveSettings();
+            if (g_s.mode == MODE_EINK)
+                EinkEnsureBuffers();
+            RepaintAll();
+            if (g_dlg)
+                PostMessageW(g_dlg, WM_CLOSE, 0, 0);
+            L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
+        }
+        return TRUE;
+    }
+    case WM_APP_TRAY:
+        if (LOWORD(lp) == WM_RBUTTONUP)
+            TrayMenu();
+        else if (LOWORD(lp) == WM_LBUTTONUP)
+            OpenSettings();
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDM_MASTER:    SetMaster(!g_s.master); break;
+        case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
+        case IDM_EINK:      ActivateMode(MODE_EINK); break;
+        case IDM_SETTINGS:  OpenSettings(); break;
+        case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
+        case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
+            g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
+            SaveSettings();
+            if (g_s.master && g_s.mode == MODE_PAPER)
+                RequestPaper();
+            else
+                RepaintAll();
+            L("strength=%d", g_s.intensity);
+            break;
+        case IDM_SHARE:
+            g_s.share = g_s.share ? 0 : 1;
+            SaveSettings();
+            RepaintAll();   /* re-applies the capture exclusion state */
+            if (g_dlg && g_chk_share)
+                SendMessageW(g_chk_share, BM_SETCHECK,
+                             g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+            L("share=%d", g_s.share);
+            break;
+        case IDM_AUTOSTART:
+            g_s.autostart = g_s.autostart ? 0 : 1;
+            SaveSettings();
+            L("autostart=%d", g_s.autostart);
+            break;
+        case IDM_EXIT:
+            SaveSettings();
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+    case WM_DESTROY:
+        PaperWorkerStop();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* --------------------------------------------------------- second instance --- */
+
+
+static int  g_cmd;
+static int  g_has_set;
+static SETTINGS g_cli_settings;
+
+static WCHAR g_sets[16][80];
+static int    g_nsets;
+static int g_selfcheck;
+static const WCHAR *g_dump_tex;
+static const WCHAR *g_dump_eink;
+static int g_dump_w = 960, g_dump_h = 600;
+
+static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
+    const WCHAR *eq = wcschr(arg, L'=');
+    WCHAR key[64];
+    int v;
+    if (!eq || eq - arg >= 64) return 0;
+    wcsncpy(key, arg, (size_t)(eq - arg));
+    key[eq - arg] = 0;
+    v = _wtoi(eq + 1);
+    if (!_wcsicmp(key, L"intensity")) s->intensity = v;
+    else if (!_wcsicmp(key, L"warmth")) s->warmth = v;
+    else if (!_wcsicmp(key, L"grain")) s->grain = v;
+    else if (!_wcsicmp(key, L"fibre")) s->fibre = v;
+    else if (!_wcsicmp(key, L"blotch")) s->blotch = v;
+    else if (!_wcsicmp(key, L"shades")) s->shades = v;
+    else if (!_wcsicmp(key, L"contrast")) s->contrast = v;
+    else if (!_wcsicmp(key, L"dither")) s->dither = v;
+    else if (!_wcsicmp(key, L"mode")) s->mode = v ? MODE_EINK : MODE_PAPER;
+    else if (!_wcsicmp(key, L"autostart")) s->autostart = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"share")) s->share = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"master")) s->master = v ? 1 : 0;
+    else return 0;
+    g_has_set = 1;
+    return 1;
+}
+
+static void ApplySets(SETTINGS *s) {
+    int i;
+    for (i = 0; i < g_nsets; i++) {
+        WCHAR buf[80];
+        wcsncpy(buf, g_sets[i], 79);
+        buf[79] = 0;
+        SetKeyValue(s, buf);
+    }
+    ClampSettingsOf(s);
+}
+
+static int SendToRunning(void) {
+    HWND h = FindWindowW(L"MnPaperHost", NULL);
+    COPYDATASTRUCT cd;
+    if (!h) {
+        L("send: host window not found");
+        return 0;
+    }
+    L("send: host %p", (void *)h);
+    if (g_has_set) {
+        cd.dwData = CMD_SYNC;
+        cd.cbData = sizeof(SETTINGS);
+        cd.lpData = &g_cli_settings;
+        SendMessageW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd);
+    }
+    if (g_cmd)
+        PostMessageW(h, WM_APP + 1, (WPARAM)g_cmd, 0);
+    return 1;
+}
+
+/* ---------------------------------------------------------------- main --- */
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
+    SetUnhandledExceptionFilter(CrashDump);
+    WNDCLASSEXW wc;
+    MSG msg;
+    HANDLE mutex;
+    int i;
+    int argc = 0;
+    LPWSTR *argv;
+
+    argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (i = 1; i < argc; i++) {
+            if (!_wcsicmp(argv[i], L"--log") && i + 1 < argc) {
+                g_log = _wfopen(argv[++i], L"a");
+                L("=== mnPaper start ===");
+            } else if (!_wcsicmp(argv[i], L"--dump-tex") && i + 2 < argc) {
+                g_dump_tex  = argv[++i];
+                g_dump_w    = _wtoi(argv[++i]);
+                g_dump_h    = _wtoi(argv[++i]);
+                if (i + 1 < argc && argv[i + 1][0] != L'-')
+                    g_dump_bg = _wtoi(argv[++i]);
+            } else if (!_wcsicmp(argv[i], L"--dump-eink") && i + 2 < argc) {
+                g_dump_eink = argv[++i];
+                g_dump_w    = _wtoi(argv[++i]);
+                g_dump_h    = _wtoi(argv[++i]);
+            } else if (!_wcsicmp(argv[i], L"--no-exclude")) {
+                g_force_capture_show = 1;
+            } else if (!_wcsicmp(argv[i], L"--capture") && i + 1 < argc) {
+                /* friendly alias for --set share=1|0 : texture visible in
+                   screenshots and screen shares */
+                i++;
+                if (g_nsets < 16)
+                    wcsncpy(g_sets[g_nsets++],
+                            !_wcsicmp(argv[i], L"on") ? L"share=1" : L"share=0", 79);
+            } else if (!_wcsicmp(argv[i], L"--selfcheck")) {
+                g_selfcheck = 1;
+            } else if (!_wcsicmp(argv[i], L"--toggle")) g_cmd = CMD_TOGGLE;
+            else if (!_wcsicmp(argv[i], L"--on"))     g_cmd = CMD_ON;
+            else if (!_wcsicmp(argv[i], L"--off"))    g_cmd = CMD_OFF;
+            else if (!_wcsicmp(argv[i], L"--paper"))  g_cmd = CMD_PAPER;
+            else if (!_wcsicmp(argv[i], L"--eink"))   g_cmd = CMD_EINK;
+            else if (!_wcsicmp(argv[i], L"--settings")) g_cmd = CMD_SETTINGS;
+            else if (!_wcsicmp(argv[i], L"--quit"))   g_cmd = CMD_QUIT;
+            else if (!_wcsicmp(argv[i], L"--set") && i + 1 < argc) {
+                i++;
+                while (i < argc && g_nsets < 16 && wcschr(argv[i], L'=')) {
+                    wcsncpy(g_sets[g_nsets++], argv[i], 79);
+                    g_sets[g_nsets - 1][79] = 0;
+                    i++;
+                }
+                i--;
+            }
+        }
+        LocalFree(argv);
+    }
+
+    if (g_dump_tex || g_dump_eink) {
+        LoadSettings();
+        if (g_nsets)
+            ApplySets(&g_s);
+        L("dump path: nsets=%d intensity=%d warmth=%d grain=%d fibre=%d blotch=%d",
+          g_nsets, g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch);
+        if (g_dump_tex) {
+            char p[512];
+            WideCharToMultiByte(CP_UTF8, 0, g_dump_tex, -1, p, sizeof p, NULL, NULL);
+            DumpPaper(p, g_dump_w, g_dump_h);
+        } else {
+            char p[512];
+            WideCharToMultiByte(CP_UTF8, 0, g_dump_eink, -1, p, sizeof p, NULL, NULL);
+            DumpEink(p, g_dump_w, g_dump_h);
+        }
+        if (g_log) fclose(g_log);
+        return 0;
+    }
+
+    mutex = CreateMutexW(NULL, TRUE, L"mnPaper-single-instance");
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        LoadSettings();                       /* registry mirrors the live app */
+        if (g_nsets) {
+            g_cli_settings = g_s;
+            ApplySets(&g_cli_settings);
+        }
+        SendToRunning();
+        if (g_log) fclose(g_log);
+        return 0;
+    }
+
+    LoadSettings();
+    if (g_nsets) {                             /* fresh launch with --set */
+        ApplySets(&g_s);
+        SaveSettings();
+    }
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    InitCommonControls();
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = HostProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"MnPaperHost";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassExW(&wc);
+
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = OvlProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"MnPaperOverlay";
+    wc.hbrBackground = NULL;
+    RegisterClassExW(&wc);
+
+    g_host = CreateWindowExW(0, L"MnPaperHost", L"mnPaper", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 320, 200, NULL, NULL, hInst, NULL);
+    ShowWindow(g_host, SW_HIDE);
+
+    memset(&g_nid, 0, sizeof g_nid);
+    g_nid.cbSize = sizeof g_nid;
+    g_nid.hWnd = g_host;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    lstrcpyW(g_nid.szTip, L"mnPaper");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    if (!RegisterHotKey(g_host, HOTKEY_MASTER, MOD_CONTROL | MOD_ALT, 'P'))
+        g_hotkey_failed = 1;
+    if (!RegisterHotKey(g_host, HOTKEY_EINK, MOD_CONTROL | MOD_ALT, 'E'))
+        g_hotkey_failed = 1;
+    if (g_hotkey_failed)
+        L("hotkey registration failed (another app owns it?)");
+
+    SetTimer(g_host, TIMER_TICK, TICK_MS, NULL);
+    if (g_selfcheck)
+        SetTimer(g_host, 3, 1500, NULL);
+
+    SyncOverlays();
+    if (g_s.mode == MODE_EINK)
+        EinkEnsureBuffers();
+    RepaintAll();
+    L("ready master=%d mode=%s monitors=%d strips/mon=%d", g_s.master,
+      g_s.mode == MODE_PAPER ? "paper" : "eink", g_n,
+      g_n > 0 ? g_ov[0].n_strips : 0);
+
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        if (g_dlg && IsDialogMessageW(g_dlg, &msg))
+            continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    for (i = 0; i < g_n; i++)
+        DestroyOverlay(&g_ov[i]);
+    EinkShutdownCapture();
+    EinkFreeBuffers();
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    SaveSettings();
+    if (g_log) fclose(g_log);
+    return 0;
+}
