@@ -33,6 +33,13 @@ Covered:
   real `WDA_EXCLUDEFROMCAPTURE` affinity on the hidden overlay strip.
 - Mode radios (id 114/115): SetMode morphs the open dialog in place (rows
   swap, radios reflect, share checkbox greys in e-ink) and persists `mode`.
+- The Texture-on checkbox (id 118) reflects the current master state on open;
+  unchecking it runs the real handler in the HIDE direction only (master=0),
+  the show direction is never fired through the handler (so no strips are
+  painted), and state is restored by save.
+- The Start-with-Windows checkbox (id 119) persists autostart and drives the
+  isolated Run key via ApplyAutostart: checking it gains the mnPaper entry,
+  unchecking removes it - the real HKCU Run key is never touched.
 - The ? button (id 116) opens one shared help window; in headless mode it is
   created but never shown, re-click reuses it, closing clears it.
 - Version parsing/comparison for the update check as pure functions, plus

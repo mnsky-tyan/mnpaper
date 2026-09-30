@@ -58,8 +58,8 @@ SetCursorPos bypasses WH_MOUSE_LL while SendInput traverses it),
 ## Where things live
 
 - Source: `mnPaper.c` (this directory). PoC: `probes/poc.c`.
-- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (still the pre-2.6.0 build:
-  200,192 bytes, release /O2 /W3 without /Zi, no version resource yet).
+- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (a release /O2 /W3 build;
+  the source now ships a 2.7.0 VERSIONINFO and the app icon via `mnPaper.rc`).
   Settings live in `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the
   `mnPaper` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - Tuning samples: `samples/` (paper at intensity 20 and 30, e-ink at 2/4/16
@@ -332,7 +332,7 @@ ShowWindow so hidden tests never flash a window on the desktop.
 ## Release readiness (2026-09-30)
 
 - **Versioning**: `MNVER_MAJOR/MINOR/PATCH` in mnPaper.c + `mnPaper.rc`
-  VERSIONINFO (2.6.0). Bump BOTH on every release; the rc is compiled in via
+  VERSIONINFO (2.7.0). Bump BOTH on every release; the rc is compiled in via
   `rc /nologo mnPaper.rc` then `cl mnPaper.c mnPaper.res` (cl does not compile
   .rc itself - passing it to cl directly fails with LNK1107).
 - **Update check = link-out, never an auto-updater** (deliberate): button 117
@@ -349,8 +349,8 @@ ShowWindow so hidden tests never flash a window on the desktop.
   github.com/mnsky-app/mnpaper (which does not exist yet - the button then
   shows the offline fallback and offers the page anyway).
 - **Known accepted gaps**: no code-signing certificate (SmartScreen warning
-  until the captain buys one); no icon asset; e-ink shimmer at shades=4
-  documented, needs consent to tune live; update feed not published.
+  until the captain buys one); e-ink shimmer at shades=4 documented, needs
+  consent to tune live; update feed not published.
 - Repo: github.com/mnsky-tyan/mnpaper (private), default branch
   `release-readiness`, validated through the no-mistakes pipeline on feature
   branches.
