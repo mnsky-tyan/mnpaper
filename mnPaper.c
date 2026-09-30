@@ -1904,6 +1904,20 @@ static void ReadBarsToSettings(void) {
     ClampSettings();
 }
 
+/* Check the mode radio and keep BOTH radios tab stops. Windows' radio-group
+ * management moves the group's single tab stop onto the checked button, so a
+ * bare CheckRadioButton would leave the inactive mode radio (E-ink in paper
+ * mode) unreachable by Tab; re-assert it on both after every check change. */
+static void SyncModeRadios(HWND dlg, int id) {
+    HWND a, b;
+    if (!dlg || !IsWindow(dlg)) return;
+    CheckRadioButton(dlg, 114, 115, id);
+    a = GetDlgItem(dlg, 114);
+    b = GetDlgItem(dlg, 115);
+    if (a) SetWindowLongW(a, GWL_STYLE, GetWindowLongW(a, GWL_STYLE) | WS_TABSTOP);
+    if (b) SetWindowLongW(b, GWL_STYLE, GetWindowLongW(b, GWL_STYLE) | WS_TABSTOP);
+}
+
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1939,7 +1953,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"E-ink",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
-        CheckRadioButton(hwnd, 114, 115, g_s.mode == MODE_PAPER ? 114 : 115);
+        SyncModeRadios(hwnd, g_s.mode == MODE_PAPER ? 114 : 115);
         /* Texture on/off: hide the veil without quitting the app (same as the
          * tray's master toggle and Ctrl+Alt+P). */
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
@@ -2044,13 +2058,13 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         L"You can always click Paper here (or press Ctrl+Alt+E) to come back instantly.\n\n"
                         L"Switch to E-ink now?",
                         L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-                        CheckRadioButton(hwnd, 114, 115, 114);   /* snap back */
+                        SyncModeRadios(hwnd, 114);   /* snap back */
                         return 0;
                     }
                 }
                 ActivateMode(mode);   /* turns the effect on, saves, repaints */
             }
-            CheckRadioButton(hwnd, 114, 115, mode == MODE_PAPER ? 114 : 115);
+            SyncModeRadios(hwnd, mode == MODE_PAPER ? 114 : 115);
         } else if (LOWORD(wp) == 118) {
             SetMaster(IsDlgButtonChecked(hwnd, 118) == BST_CHECKED);
         } else if (LOWORD(wp) == 119) {
@@ -2148,7 +2162,7 @@ static void SetMode(int mode) {
         DlgSyncBars();
         DlgLayout();
         UpdateVals(g_dlg);
-        CheckRadioButton(g_dlg, 114, 115, mode == MODE_PAPER ? 114 : 115);
+        SyncModeRadios(g_dlg, mode == MODE_PAPER ? 114 : 115);
         EnableWindow(g_chk_share, mode == MODE_PAPER);
     }
     if (g_s.master)
@@ -2295,8 +2309,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_dlg && IsWindow(g_dlg)) {
                 DlgSyncBars();
                 UpdateVals(g_dlg);
-                CheckRadioButton(g_dlg, 114, 115,
-                                 g_s.mode == MODE_PAPER ? 114 : 115);
+                SyncModeRadios(g_dlg, g_s.mode == MODE_PAPER ? 114 : 115);
                 EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
                 SendMessageW(g_chk_share, BM_SETCHECK,
                              g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
