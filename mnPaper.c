@@ -1635,6 +1635,7 @@ static void OpenHelp(HWND owner) {
     w.lpszClassName = L"MnPaperHelp";
     w.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     w.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    w.hIcon         = LoadIconW(w.hInstance, MAKEINTRESOURCEW(1));
     RegisterClassW(&w);   /* re-registration after a close fails harmlessly */
     rc.left = 0; rc.top = 0; rc.right = 470; rc.bottom = 580;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
@@ -2090,6 +2091,8 @@ static void OpenSettings(void) {
     wc.lpszClassName = SET_CLASS;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+    wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     g_advanced = 0;
     rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 380;
@@ -2537,7 +2540,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP_TRAY;
-    g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    g_nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpyW(g_nid.szTip, L"mnPaper");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 

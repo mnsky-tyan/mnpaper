@@ -99,6 +99,12 @@ See `tests/README.md` for what the suite covers.
 - The exe is not code-signed yet: the first run may show a SmartScreen
   warning ("More info" -> "Run anyway").
 
+## Icon
+
+`mnPaper.ico` is generated from choice 7 of the captain's icon sheet
+(`icon_7th_preview.png` keeps the 820px master): layered paper waves with
+rounded-corner transparency, packed at 16-256 px.
+
 ## Status
 
 Version 2.7.0. Internal engineering notes live in `AGENTS.md`; historical
