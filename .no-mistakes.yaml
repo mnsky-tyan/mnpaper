@@ -1,0 +1,4 @@
+# mnPaper has no CI system configured (no GitHub Actions workflows).
+# Declaring this lets the no-mistakes gate treat an empty check list as
+# green instead of waiting for checks that will never register.
+no_ci: true
