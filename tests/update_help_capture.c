@@ -156,7 +156,7 @@ int main(void) {
     }
     wc.lpfnWndProc = DlgProc; wc.lpszClassName = SET_CLASS;
     RegisterClassW(&wc);
-    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 340,
+    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 380,
                             NULL, NULL, wc.hInstance, NULL);
     Check(g_dlg != NULL && !IsWindowVisible(g_dlg), "settings target stays hidden");
     Check(IsWindow(GetDlgItem(g_dlg, 116)), "? help button exists (id 116)");
@@ -249,7 +249,7 @@ int main(void) {
         dwc.hInstance = GetModuleHandleW(NULL);
         dwc.lpfnWndProc = DlgProc; dwc.lpszClassName = SET_CLASS;
         RegisterClassW(&dwc);
-        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 340,
+        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 380,
                                 NULL, NULL, dwc.hInstance, NULL);
     }
     hbtn = GetDlgItem(g_dlg, 117);

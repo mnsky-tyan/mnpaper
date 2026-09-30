@@ -94,7 +94,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
     previous_hash = PixelHash(g_ov[0].bits, (size_t)rc.right * rc.bottom * 4);
     wc.lpfnWndProc = DlgProc; wc.lpszClassName = SET_CLASS;
     RegisterClassW(&wc);
-    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED,0,0,380,340,NULL,NULL,wc.hInstance,NULL);
+    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED,0,0,380,380,NULL,NULL,wc.hInstance,NULL);
     Check(g_dlg != NULL && !IsWindowVisible(g_dlg), "settings target stays hidden");
     started = GetTickCount();
     /* A slow enough step stream to mimic dragging without ever moving the cursor. */
@@ -206,7 +206,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         dwc.hInstance = GetModuleHandleW(NULL);
         dwc.lpfnWndProc = DlgProc; dwc.lpszClassName = SET_CLASS;
         RegisterClassW(&dwc);
-        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED,0,0,380,340,NULL,NULL,dwc.hInstance,NULL);
+        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED,0,0,380,380,NULL,NULL,dwc.hInstance,NULL);
         bars[0] = g_tb_warmth; bars[1] = g_tb_grain;
         bars[2] = g_tb_fibre; bars[3] = g_tb_blotch;
         for (i = 0; i < 4; i++) {
