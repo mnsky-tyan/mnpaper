@@ -20,7 +20,7 @@ executable: no installer, no account, no telemetry.
 
 ## Requirements
 
-- Windows 10 (1903+) or Windows 11, x64.
+- Windows 10 (version 2004+) or Windows 11, x64.
 - No admin rights, no runtime dependencies.
 
 ## Install and run

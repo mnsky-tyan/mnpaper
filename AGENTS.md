@@ -8,8 +8,7 @@ Windows (119, autostart), the share-capture checkbox (113), the ? help
 button (116), and Check for updates (117, link-out); SetMode morphs the
 dialog in place. Inactive rows hide their labels, controls and values
 together. The captain's live preferences (autostart=1, autostart Run key in
-place) must never be reset by tests. Inactive rows hide their labels,
-controls and values together.
+place) must never be reset by tests.
 
 **Earlier latency claims were wrong.** A 15ms measurement only timed the
 launch of a GUI executable, not its completion. Waiting for the renderer's
@@ -122,7 +121,7 @@ The timings and tooltip/subclass design in this historical section were not
 reliable evidence of actual screen updates. Current implementation and measured
 regression coverage are described at the top of this file.
 
-Three complaints, three fixes (all verified live by `dlgtest.c`/`cmptest.c`):
+Three complaints, three fixes (all verified live by `probes/dlgtest.c`/`probes/cmptest.c`):
 
 1. **Live slider preview.** The old handler sat in a 160ms debounce that
    every WM_HSCROLL reset - during a drag NOTHING was applied - and
@@ -147,7 +146,7 @@ Three complaints, three fixes (all verified live by `dlgtest.c`/`cmptest.c`):
 Dialog-test traps: a DPI-aware probe measuring "the screen" must sample a
 region AWAY from the settings window (own windows sit above the veil, so a
 region under the dialog measures dialog pixels and shows flat values for
-veiled/held/released - cmptest.c first "failed" because of exactly this);
+veiled/held/released - probes/cmptest.c first "failed" because of exactly this);
 and after `--settings` arrives via the CLI channel, give the window a beat
 before FindWindowW (races report "not open").
 
@@ -222,13 +221,13 @@ visible seams; selfcheck 5 style bits per strip + click-through; idle CPU
   stale bit, poisoning a whole bisection round ("width threshold moved!",
   false). Recovery: click the desktop (or anything else). If raise results
   look too good, CHECK the taskbar is actually parking between trials
-  (`tbstate.c`: rect.top back to 899 = parked, fg != Shell_TrayWnd).
-- The first width bisection (tbtest3-5, "69% passes / 80% fails") was run in
+  (`probes/tbstate.c`: rect.top back to 899 = parked, fg != Shell_TrayWnd).
+- The first width bisection (probes/tbtest3-5, "69% passes / 80% fails") was run in
   a contaminated session; the clean-session width control (2000x1800)
   SUPPRESSED. Do not trust the width numbers across sessions; the height
   result (clean, repeated, control-tested) is the load-bearing one.
 - `SetCursorPos` does NOT traverse `WH_MOUSE_LL` hooks (only `SendInput`
-  does - hooktest.c/hooktest2.c); LL-hook `pt` is UNCLAMPED (real user
+  does - probes/hooktest.c/probes/hooktest2.c); LL-hook `pt` is UNCLAMPED (real user
   flicks arrive beyond the monitor rect). Both mattered only to the dead
   dance, but remember them for any future hook work.
 - A DPI-unaware probe reads the strips as 1440x225-logical tiles while the

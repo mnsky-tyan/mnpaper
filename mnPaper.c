@@ -2119,12 +2119,19 @@ static void OpenSettings(void) {
 
 /* ------------------------------------------------------------ commands --- */
 
+static void SyncMasterCheckbox(void) {   /* mirror g_s.master into control 118 */
+    if (g_dlg && IsWindow(g_dlg))
+        SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
+                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 static void SetMaster(int on) {
     on = on ? 1 : 0;
     if (g_s.master == on) return;
     g_s.master = on;
     RepaintAll();
     SaveSettings();
+    SyncMasterCheckbox();
     L("master=%d", on);
 }
 
@@ -2151,6 +2158,7 @@ static void SetMode(int mode) {
 static void ActivateMode(int mode) {         /* also turns master on */
     EinkEnsureBuffers();
     g_s.master = 1;
+    SyncMasterCheckbox();
     SetMode(mode);
     RepaintAll();
     SaveSettings();
@@ -2299,9 +2307,6 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDM_MASTER:
             SetMaster(!g_s.master);
-            if (g_dlg && IsWindow(g_dlg))
-                SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
-                             g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
             break;
         case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
         case IDM_EINK:      ActivateMode(MODE_EINK); break;
