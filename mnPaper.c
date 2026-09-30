@@ -80,13 +80,13 @@
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.6.0") and
+ * plain-text file whose first line is the latest version ("2.7.0") and
  * PRODUCT_URL at the page users download from (GitHub Releases recommended:
  * free TLS hosting, the release itself is the artifact). The update check
  * NEVER downloads or replaces code: it compares version numbers and links
  * out, so a hostile or offline feed can at worst show a wrong message. */
 #define MNVER_MAJOR 2
-#define MNVER_MINOR 6
+#define MNVER_MINOR 7
 #define MNVER_PATCH 0
 #define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-app/mnpaper/main/version.txt"
 #define PRODUCT_URL L"https://github.com/mnsky-app/mnpaper/releases"
@@ -144,7 +144,9 @@ static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0 };
 static int g_hotkey_failed;
 
 static const WCHAR *REG_KEY = L"Software\\mnPaper";
-static const WCHAR *REG_RUN = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/* The Run key path is a writable buffer so the hidden regression can redirect
+ * it into its isolated scratch hive; production always keeps the default. */
+static WCHAR g_run_key[160] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static FILE *g_log;
 static void L(const char *fmt, ...) {
@@ -176,7 +178,7 @@ static void ClampSettings(void) {
 
 static void ApplyAutostart(void) {
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
         return;
     if (g_s.autostart) {
         WCHAR path[MAX_PATH];
@@ -234,7 +236,7 @@ static void LoadSettings(void) {
         RegCloseKey(k);
     }
     /* autostart mirrors the Run key so an external edit stays honest */
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &k) == ERROR_SUCCESS) {
         WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
         DWORD sz = sizeof(path), t = 0;
         if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
@@ -1543,6 +1545,7 @@ static const WCHAR *SET_CLASS = L"MnPaperSettings";
 
 static HWND g_helpwnd;          /* single "?" help window              */
 int g_test_headless = 0;        /* tests create the help window hidden */
+static void SetMaster(int on);  /* defined in the commands section below */
 
 static const WCHAR HELP_TEXT[] =
     L"mnPaper - how every control works\r\n"
@@ -1575,6 +1578,9 @@ static const WCHAR HELP_TEXT[] =
     L"  Dither   - pixel mixing that fakes extra greyscale levels.\r\n"
     L"\r\n"
     L"OTHER CONTROLS\r\n"
+    L"  Texture on - uncheck to hide the texture instantly; mnPaper keeps "
+    L"running in the tray (Ctrl+Alt+P does the same).\r\n"
+    L"  Start with Windows - launch mnPaper automatically at login.\r\n"
     L"  Show texture in screenshots and screen shares\r\n"
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
@@ -1615,7 +1621,7 @@ static void HelpPresent(HWND h) {
 }
 
 static void OpenHelp(HWND owner) {
-    WNDCLASSW w;
+    WNDCLASSEXW w;
     RECT rc, cr;
     HWND e;
     HFONT f;
@@ -1624,12 +1630,15 @@ static void OpenHelp(HWND owner) {
         return;
     }
     memset(&w, 0, sizeof w);
+    w.cbSize        = sizeof w;
     w.lpfnWndProc   = HelpProc;
     w.hInstance     = GetModuleHandleW(NULL);
     w.lpszClassName = L"MnPaperHelp";
     w.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     w.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    RegisterClassW(&w);   /* re-registration after a close fails harmlessly */
+    w.hIcon         = LoadIconW(w.hInstance, MAKEINTRESOURCEW(1));
+    w.hIconSm       = w.hIcon;
+    RegisterClassExW(&w);   /* re-registration after a close fails harmlessly */
     rc.left = 0; rc.top = 0; rc.right = 470; rc.bottom = 580;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_helpwnd = CreateWindowExW(0, L"MnPaperHelp", L"mnPaper help",
@@ -1801,7 +1810,7 @@ static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
 
 static HWND MkTrack(HWND parent, int id, int lo, int hi, int pos, int x, int y, int w, int h) {
     HWND t = CreateWindowExW(0, L"msctls_trackbar32", NULL,
-        WS_CHILD | WS_VISIBLE | TBS_HORZ,
+        WS_CHILD | WS_VISIBLE | TBS_HORZ | WS_TABSTOP,
         x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
     SendMessageW(t, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
     SendMessageW(t, TBM_SETPOS, TRUE, pos);
@@ -1895,6 +1904,20 @@ static void ReadBarsToSettings(void) {
     ClampSettings();
 }
 
+/* Check the mode radio and keep BOTH radios tab stops. Windows' radio-group
+ * management moves the group's single tab stop onto the checked button, so a
+ * bare CheckRadioButton would leave the inactive mode radio (E-ink in paper
+ * mode) unreachable by Tab; re-assert it on both after every check change. */
+static void SyncModeRadios(HWND dlg, int id) {
+    HWND a, b;
+    if (!dlg || !IsWindow(dlg)) return;
+    CheckRadioButton(dlg, 114, 115, id);
+    a = GetDlgItem(dlg, 114);
+    b = GetDlgItem(dlg, 115);
+    if (a) SetWindowLongW(a, GWL_STYLE, GetWindowLongW(a, GWL_STYLE) | WS_TABSTOP);
+    if (b) SetWindowLongW(b, GWL_STYLE, GetWindowLongW(b, GWL_STYLE) | WS_TABSTOP);
+}
+
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1909,7 +1932,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
         y += 34;
         g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
         y += 34;
         g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
         g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
@@ -1922,32 +1945,45 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_contrast = MkLabel(hwnd, L"Contrast", 14, 48 + 4, 92, 20);
         g_val[7] = MkLabel(hwnd, L"75", 302, 82 + 4, 44, 20); g_tb_dither    = MkTrack(hwnd, 107, 0, 100, g_s.dither, 106, 82, 190, 26);
         g_lb_dither = MkLabel(hwnd, L"Dither",   14, 82 + 4, 92, 20);
-        CreateWindowExW(0, L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 278, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
          * morphs (SetMode refreshes rows in place). */
         CreateWindowExW(0, L"BUTTON", L"Paper",
-            WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"E-ink",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
-        CheckRadioButton(hwnd, 114, 115, g_s.mode == MODE_PAPER ? 114 : 115);
+        SyncModeRadios(hwnd, g_s.mode == MODE_PAPER ? 114 : 115);
+        /* Texture on/off: hide the veil without quitting the app (same as the
+         * tray's master toggle and Ctrl+Alt+P). */
+        CreateWindowExW(0, L"BUTTON", L"&Texture on",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
+                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+        /* Autostart: mirrors the tray's Start-with-Windows item. */
+        CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(GetDlgItem(hwnd, 119), BM_SETCHECK,
+                     g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 252, 352, 20, hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* "?" circle: explanations open only when pressed (captain asked to
          * replace the hover popups). Owner-drawn round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 14, 278, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"&Close",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* link-out update check: compares version numbers, offers the page */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 304, 110, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 344, 110, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -1969,6 +2005,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetBkMode(d->hDC, TRANSPARENT);
             SetTextColor(d->hDC, RGB(40, 40, 40));
             DrawTextW(d->hDC, L"?", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (d->itemState & ODS_FOCUS)
+                DrawFocusRect(d->hDC, &rc);
             return TRUE;
         }
         break;
@@ -2020,13 +2058,19 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         L"You can always click Paper here (or press Ctrl+Alt+E) to come back instantly.\n\n"
                         L"Switch to E-ink now?",
                         L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-                        CheckRadioButton(hwnd, 114, 115, 114);   /* snap back */
+                        SyncModeRadios(hwnd, 114);   /* snap back */
                         return 0;
                     }
                 }
                 ActivateMode(mode);   /* turns the effect on, saves, repaints */
             }
-            CheckRadioButton(hwnd, 114, 115, mode == MODE_PAPER ? 114 : 115);
+            SyncModeRadios(hwnd, mode == MODE_PAPER ? 114 : 115);
+        } else if (LOWORD(wp) == 118) {
+            SetMaster(IsDlgButtonChecked(hwnd, 118) == BST_CHECKED);
+        } else if (LOWORD(wp) == 119) {
+            g_s.autostart = IsDlgButtonChecked(hwnd, 119) == BST_CHECKED;
+            SaveSettings();   /* SaveSettings applies the Run key */
+            L("autostart=%d", g_s.autostart);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
@@ -2062,9 +2106,11 @@ static void OpenSettings(void) {
     wc.lpszClassName = SET_CLASS;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+    wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     g_advanced = 0;
-    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 340;
+    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 380;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     g_dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, SET_CLASS,
         L"mnPaper settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
@@ -2088,12 +2134,19 @@ static void OpenSettings(void) {
 
 /* ------------------------------------------------------------ commands --- */
 
+static void SyncMasterCheckbox(void) {   /* mirror g_s.master into control 118 */
+    if (g_dlg && IsWindow(g_dlg))
+        SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
+                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 static void SetMaster(int on) {
     on = on ? 1 : 0;
     if (g_s.master == on) return;
     g_s.master = on;
     RepaintAll();
     SaveSettings();
+    SyncMasterCheckbox();
     L("master=%d", on);
 }
 
@@ -2109,7 +2162,7 @@ static void SetMode(int mode) {
         DlgSyncBars();
         DlgLayout();
         UpdateVals(g_dlg);
-        CheckRadioButton(g_dlg, 114, 115, mode == MODE_PAPER ? 114 : 115);
+        SyncModeRadios(g_dlg, mode == MODE_PAPER ? 114 : 115);
         EnableWindow(g_chk_share, mode == MODE_PAPER);
     }
     if (g_s.master)
@@ -2120,6 +2173,7 @@ static void SetMode(int mode) {
 static void ActivateMode(int mode) {         /* also turns master on */
     EinkEnsureBuffers();
     g_s.master = 1;
+    SyncMasterCheckbox();
     SetMode(mode);
     RepaintAll();
     SaveSettings();
@@ -2252,8 +2306,17 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_s.mode == MODE_EINK)
                 EinkEnsureBuffers();
             RepaintAll();
-            if (g_dlg)
-                PostMessageW(g_dlg, WM_CLOSE, 0, 0);
+            if (g_dlg && IsWindow(g_dlg)) {
+                DlgSyncBars();
+                UpdateVals(g_dlg);
+                SyncModeRadios(g_dlg, g_s.mode == MODE_PAPER ? 114 : 115);
+                EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
+                SendMessageW(g_chk_share, BM_SETCHECK,
+                             g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+                SyncMasterCheckbox();
+                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
+                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+            }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
         }
         return TRUE;
@@ -2266,13 +2329,19 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDM_MASTER:    SetMaster(!g_s.master); break;
+        case IDM_MASTER:
+            SetMaster(!g_s.master);
+            break;
         case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
         case IDM_EINK:      ActivateMode(MODE_EINK); break;
         case IDM_SETTINGS:  OpenSettings(); break;
         case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
             g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
+            if (g_dlg && IsWindow(g_dlg)) {
+                DlgSyncBars();
+                UpdateVals(g_dlg);
+            }
             SaveSettings();
             if (g_s.master && g_s.mode == MODE_PAPER)
                 RequestPaper();
@@ -2292,6 +2361,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_AUTOSTART:
             g_s.autostart = g_s.autostart ? 0 : 1;
             SaveSettings();
+            if (g_dlg && IsWindow(g_dlg))
+                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
+                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
             L("autostart=%d", g_s.autostart);
             break;
         case IDM_EXIT:
@@ -2501,7 +2573,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP_TRAY;
-    g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    g_nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpyW(g_nid.szTip, L"mnPaper");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 

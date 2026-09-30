@@ -1,15 +1,14 @@
 # mnPaper - whole-screen paper texture + e-ink overlay (Win32)
 
-Status 2026-09-30: **v2.5 slider-latency repair + GUI mode/share controls +
-grain preview fix + ? help window** (`mnPaper.c`, single-file native C,
-portable exe). The captain wants immediate full-screen feedback while
-dragging, not an A/B comparison button. That button is removed. The settings
-window now carries Paper/E-ink mode radios (114/115, e-ink confirms first),
-the share-capture checkbox (113), and a ? owner-drawn help button (116);
-SetMode morphs the dialog in place. Inactive rows hide their labels,
-controls and values together. Autostart is enabled in the captain's live
-profile - preserve his settings, do not reset them when tests have not
-touched them.
+Status 2026-09-30: **v2.7.0 release candidate** (`mnPaper.c` + version
+metadata in `mnPaper.rc` - bump both together on every release). The settings
+window carries: Paper/E-ink mode radios (114/115, e-ink confirms first),
+Texture on (118, the master toggle - hide without quitting), Start with
+Windows (119, autostart), the share-capture checkbox (113), the ? help
+button (116), and Check for updates (117, link-out); SetMode morphs the
+dialog in place. Inactive rows hide their labels, controls and values
+together. The captain's live preferences (autostart=1, autostart Run key in
+place) must never be reset by tests.
 
 **Earlier latency claims were wrong.** A 15ms measurement only timed the
 launch of a GUI executable, not its completion. Waiting for the renderer's
@@ -45,7 +44,7 @@ cool 0 = icy (highlight 200,254,255, shadow 105,121,158). Measured mean
 blue-minus-red over the composited texture: warm -4, cool +2 (old full range
 swung ~1). Tooltip notes the ends are strong on purpose.
 
-Probe helpers live in this directory: `zprobe.c` (window
+Probe helpers live in `probes/`: `zprobe.c` (window
 dump), `zorder3.c` (pids/rects/ranks), `zorder4.c` (rank race cadence),
 `tborder.c` (auto-hide taskbar reveal watch), `strip.c` (who covers the
 bottom strip, by rank), `tbwatch.c` (taskbar topmost bit + rank timeline
@@ -58,9 +57,13 @@ SetCursorPos bypasses WH_MOUSE_LL while SendInput traverses it),
 
 ## Where things live
 
-- Source: `mnPaper.c` (this directory). PoC: `poc.c`.
-- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (still the pre-2.6.0 build:
-  200,192 bytes, release /O2 /W3 without /Zi, no version resource yet).
+- Source: `mnPaper.c` (this directory). PoC: `probes/poc.c`.
+- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (a release /O2 /W3 build;
+  the source now ships a 2.7.0 VERSIONINFO and the app icon via `mnPaper.rc`).
+  The DEPLOYED exe may lag this merged source until the post-merge redeploy the
+  agent performs (currently a 2.6.0 build with no icon resource), so an agent
+  session must not assume the binary on disk carries the 118/119 GUI work or
+  the 2.7.0 VERSIONINFO.
   Settings live in `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the
   `mnPaper` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - Tuning samples: `samples/` (paper at intensity 20 and 30, e-ink at 2/4/16
@@ -73,6 +76,10 @@ pushd <workdir on C:>
 call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
 cl /nologo /O2 /W3 mnPaper.c
 ```
+
+That bare `cl` line builds the C only: it produces an exe with NO icon and NO
+version resource. A shippable build compiles the resource too - `rc /nologo
+mnPaper.rc` then `cl mnPaper.c mnPaper.res` (see Release readiness below).
 
 Links via pragmas: user32, gdi32, shell32, advapi32, comctl32, shcore,
 d3d11, dxgi, dxguid, ole32.
@@ -112,7 +119,8 @@ at deploy time.
 - All overlay windows get `WDA_EXCLUDEFROMCAPTURE` (never in screen shares).
 - Minimal UI: tray + one small settings window (paper: intensity/warmth/grain
   + Advanced disclosure for fibre/blotch; e-ink: shades/contrast/dither).
-  The settings window is topmost but only while open; it closes on mode change.
+  The settings window is topmost but only while open; switching mode morphs it
+  in place instead of closing it.
 - No cache files, no installer, no update mechanism, no video optimisation in
   e-ink mode (video is best-effort by design).
 
@@ -122,7 +130,7 @@ The timings and tooltip/subclass design in this historical section were not
 reliable evidence of actual screen updates. Current implementation and measured
 regression coverage are described at the top of this file.
 
-Three complaints, three fixes (all verified live by `dlgtest.c`/`cmptest.c`):
+Three complaints, three fixes (all verified live by `probes/dlgtest.c`/`probes/cmptest.c`):
 
 1. **Live slider preview.** The old handler sat in a 160ms debounce that
    every WM_HSCROLL reset - during a drag NOTHING was applied - and
@@ -147,7 +155,7 @@ Three complaints, three fixes (all verified live by `dlgtest.c`/`cmptest.c`):
 Dialog-test traps: a DPI-aware probe measuring "the screen" must sample a
 region AWAY from the settings window (own windows sit above the veil, so a
 region under the dialog measures dialog pixels and shows flat values for
-veiled/held/released - cmptest.c first "failed" because of exactly this);
+veiled/held/released - probes/cmptest.c first "failed" because of exactly this);
 and after `--settings` arrives via the CLI channel, give the window a beat
 before FindWindowW (races report "not open").
 
@@ -222,13 +230,13 @@ visible seams; selfcheck 5 style bits per strip + click-through; idle CPU
   stale bit, poisoning a whole bisection round ("width threshold moved!",
   false). Recovery: click the desktop (or anything else). If raise results
   look too good, CHECK the taskbar is actually parking between trials
-  (`tbstate.c`: rect.top back to 899 = parked, fg != Shell_TrayWnd).
-- The first width bisection (tbtest3-5, "69% passes / 80% fails") was run in
+  (`probes/tbstate.c`: rect.top back to 899 = parked, fg != Shell_TrayWnd).
+- The first width bisection (probes/tbtest3-5, "69% passes / 80% fails") was run in
   a contaminated session; the clean-session width control (2000x1800)
   SUPPRESSED. Do not trust the width numbers across sessions; the height
   result (clean, repeated, control-tested) is the load-bearing one.
 - `SetCursorPos` does NOT traverse `WH_MOUSE_LL` hooks (only `SendInput`
-  does - hooktest.c/hooktest2.c); LL-hook `pt` is UNCLAMPED (real user
+  does - probes/hooktest.c/probes/hooktest2.c); LL-hook `pt` is UNCLAMPED (real user
   flicks arrive beyond the monitor rect). Both mattered only to the dead
   dance, but remember them for any future hook work.
 - A DPI-unaware probe reads the strips as 1440x225-logical tiles while the
@@ -250,7 +258,7 @@ Why: the mascot `C:\Users\tyanw\Downloads\Little-Remielle-win\...\小蕾米.exe`
 LAYERED|TOPMOST) re-asserts topmost roughly every 2s and otherwise sits above
 the veil; ChatGPT's `CodexComputerUseSwiftOverlay` is the same class of
 problem. Measured duty cycle after the fix: the mascot is above at most
-~50 ms every ~2s (40-rank probe, zorder4.c).
+~50 ms every ~2s (40-rank probe, probes/zorder4.c).
 
 Taskbar policy (two rounds of captain feedback, final): state-based. Every
 tick, for each `Shell_TrayWnd` / `SecondaryTrayWnd`, the on-screen height is
@@ -258,7 +266,7 @@ measured: parked as a thin sliver (<= 16 px on screen) it drops UNDER the
 veil so the paper covers the screen uniformly to the bottom edge; while
 revealed on hover (or docked and always visible) it is re-asserted
 `HWND_TOPMOST` so it floats cleanly on the paper and can never sink behind
-it. Both states verified live with tborder.c (tray rect parks at `0,899
+it. Both states verified live with probes/tborder.c (tray rect parks at `0,899
 1440x52` logical, reveals to `0,848 1440x52` when the cursor touches the
 edge) and bottom-strip captures.
 
@@ -275,10 +283,31 @@ Also settable with `--capture on|off` or `--set share=1|0`.
 
 **Mode radios in the settings window (id 114 Paper / 115 E-ink).** Switching
 mode from the GUI keeps the dialog OPEN: `SetMode()` now morphs the dialog in
-place (DlgSyncBars + DlgLayout + UpdateVals + CheckRadioButton + share
-checkbox enable) instead of the old `PostMessageW(WM_CLOSE)`. The share
-checkbox is disabled (grey) while in e-ink because e-ink is always
+place (DlgSyncBars + DlgLayout + UpdateVals + SyncModeRadios + share
+checkbox enable) instead of the old `PostMessageW(WM_CLOSE)`. SyncModeRadios is
+CheckRadioButton plus a WS_TABSTOP re-assert on BOTH radios, because Windows
+moves a radio group's single tab stop onto the checked button, so a bare
+CheckRadioButton would drop the E-ink radio out of Tab order in paper mode.
+The share checkbox is disabled (grey) while in e-ink because e-ink is always
 capture-excluded.
+
+**Texture on (118) / Start with Windows (119) checkboxes (captain request,
+2026-09-30).** 118 drives `SetMaster` (hide without quitting; the SHOW
+direction is never fired by the hidden tests - it would make the strips
+visible on the user's desktop; tests verify the hide direction and restore
+by state + save). 119 toggles `g_s.autostart` + `SaveSettings`, which applies
+the Run key via `ApplyAutostart`. `g_run_key` is a writable buffer (default
+`Software\...\Run`) that the hidden regression redirects into its scratch
+hive - ApplyAutostart runs on EVERY SaveSettings, so without the redirect a
+test save with autostart=0 would delete the captain's real autostart entry.
+Checkbox 118 stays truthful on every master change with no per-path re-assert:
+`SyncMasterCheckbox` runs from `SetMaster` and `ActivateMode`, and every
+master change (Ctrl+Alt+P, Ctrl+Alt+E, CLI --on/--off/--toggle/--paper/--eink,
+tray, mode radios) funnels through those two; a CMD_SYNC (`--set master=`)
+also re-syncs it (it no longer closes the dialog). 119 is written by the tray
+IDM_AUTOSTART and the checkbox handler (both re-assert the control), by
+`SetKeyValue`'s autostart arm (`--set autostart=1`, delivered by CMD_SYNC's
+re-sync), and by LoadSettings' Run-key mirror (runs before any dialog exists).
 
 **E-ink radio asks first (captain got trapped, 2026-09-30).** A single click
 on E-ink flipped his whole screen to opaque greyscale and he found the laptop
@@ -317,7 +346,7 @@ ShowWindow so hidden tests never flash a window on the desktop.
 ## Release readiness (2026-09-30)
 
 - **Versioning**: `MNVER_MAJOR/MINOR/PATCH` in mnPaper.c + `mnPaper.rc`
-  VERSIONINFO (2.6.0). Bump BOTH on every release; the rc is compiled in via
+  VERSIONINFO (2.7.0). Bump BOTH on every release; the rc is compiled in via
   `rc /nologo mnPaper.rc` then `cl mnPaper.c mnPaper.res` (cl does not compile
   .rc itself - passing it to cl directly fails with LNK1107).
 - **Update check = link-out, never an auto-updater** (deliberate): button 117
@@ -334,10 +363,10 @@ ShowWindow so hidden tests never flash a window on the desktop.
   github.com/mnsky-app/mnpaper (which does not exist yet - the button then
   shows the offline fallback and offers the page anyway).
 - **Known accepted gaps**: no code-signing certificate (SmartScreen warning
-  until the captain buys one); no icon asset; e-ink shimmer at shades=4
-  documented, needs consent to tune live; update feed not published.
+  until the captain buys one); e-ink shimmer at shades=4 documented, needs
+  consent to tune live; update feed not published.
 - Repo: github.com/mnsky-tyan/mnpaper (private), default branch
-  `release-readiness`, validated through the no-mistakes pipeline on feature
+  `main`, validated through the no-mistakes pipeline on feature
   branches.
 
 E-ink flicker (not yet fixed, needs consent to test live): the render math is
@@ -387,7 +416,8 @@ so the mode hard-forces exclusion.
   warmth 99, fibre 80, intensity 40 were all leftovers from validation.
   Reset the keys to the defaults before handing the app back:
   intensity 30, warmth 45, grain 4, fibre 40, blotch 30,
-  shades 4, contrast 50, dither 75, master 1, mode 0, share 0, autostart 0.
+  shades 4, contrast 50, dither 75, master 1, mode 0, share 0, autostart 1
+  (his live value - never write autostart 0, that deletes his Run key).
 - `WM_APP + 2` was already taken (`WM_APP_TRAY`); the async build message
   had to become `WM_APP + 3`. Check existing defines before adding a
   message. Tray command ids: 9001-9004, 9005-9006, strength 9007-9010, so
@@ -425,14 +455,14 @@ so the mode hard-forces exclusion.
   (the running process holds the file). `Stop-Process` first.
 - `EnumWindows` order is top-of-z-order first, and a `printf` with two
   `Cls()` calls shares ONE static buffer (the second overwrites the first):
-  print classes one per line in probes (zorder3.c does it right, zorder2.c
-  does not).
+  print classes one per line in probes (`probes/zorder3.c` does it right,
+  `probes/zorder2.c` does not).
 - Capturing from WSL PowerShell: `CopyFromScreen(0,0,0,0,(1440,900))` takes
   the top-left PHYSICAL quarter of a 2880x1800 screen. To see the taskbar
   (bottom edge), capture `CopyFromScreen(0,1440,0,0,(1440,360))`.
 - Cursor-triggered tests (auto-hide reveal): one `SetCursorPos` to the edge
   may not latch the reveal; wiggle 3-4 positions then hold (mnlive8.ps1 /
-  tborder.c pattern).
+  probes/tborder.c pattern).
 - The mouse cursor is a hardware sprite drawn above the DWM composite: no
   window, no layered trick, no overlay can cover or texture it. Leave it
   crisp; do not try to "fix" this with a fake cursor.

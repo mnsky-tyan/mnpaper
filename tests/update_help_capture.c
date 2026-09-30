@@ -133,7 +133,7 @@ int main(void) {
     InitCommonControls();
     swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
-    REG_KEY = scratch; REG_RUN = run;
+    REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
 
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpfnWndProc = HostProc; wc.lpszClassName = L"MnPaperTestHost";
@@ -156,7 +156,7 @@ int main(void) {
     }
     wc.lpfnWndProc = DlgProc; wc.lpszClassName = SET_CLASS;
     RegisterClassW(&wc);
-    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 340,
+    g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 380,
                             NULL, NULL, wc.hInstance, NULL);
     Check(g_dlg != NULL && !IsWindowVisible(g_dlg), "settings target stays hidden");
     Check(IsWindow(GetDlgItem(g_dlg, 116)), "? help button exists (id 116)");
@@ -249,7 +249,7 @@ int main(void) {
         dwc.hInstance = GetModuleHandleW(NULL);
         dwc.lpfnWndProc = DlgProc; dwc.lpszClassName = SET_CLASS;
         RegisterClassW(&dwc);
-        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 340,
+        g_dlg = CreateWindowExW(0, SET_CLASS, L"", WS_OVERLAPPED, 0, 0, 380, 380,
                                 NULL, NULL, dwc.hInstance, NULL);
     }
     hbtn = GetDlgItem(g_dlg, 117);
