@@ -34,8 +34,6 @@
 #include <commctrl.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #include <d3d11.h>
@@ -78,8 +76,7 @@
 #define TICK_MS         50
 #define DEBOUNCE_MS     400     /* trailing registry save only; the live
                                  * preview itself applies immediately */
-#define WM_APP_RAW      (WM_APP + 4)   /* hold-to-compare: hide the veil */
-#define WM_APP_UPDATE   (WM_APP + 5)   /* update-check thread -> dialog */
+#define WM_APP_UPDATE   (WM_APP + 5)   /* update-check thread -> host window */
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
@@ -340,8 +337,8 @@ static int  g_force_capture_show;   /* --no-exclude validation flag, session onl
  * Duplication would capture the e-ink output itself and feed it back,
  * white-washing the screen within seconds. */
 static int CaptureHidden(void) {
+    if (g_s.mode == MODE_EINK) return 1;   /* before any flag: no capture feedback */
     if (g_force_capture_show) return 0;
-    if (g_s.mode == MODE_EINK) return 1;
     return g_s.share ? 0 : 1;
 }
 
@@ -1609,14 +1606,21 @@ static LRESULT CALLBACK HelpProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 
+/* Every path that makes the help window visible funnels through here:
+ * a headless run must never show a window or touch the foreground. */
+static void HelpPresent(HWND h) {
+    if (g_test_headless) return;
+    ShowWindow(h, SW_SHOW);
+    SetForegroundWindow(h);
+}
+
 static void OpenHelp(HWND owner) {
     WNDCLASSW w;
-    RECT rc;
+    RECT rc, cr;
     HWND e;
     HFONT f;
     if (g_helpwnd && IsWindow(g_helpwnd)) {
-        ShowWindow(g_helpwnd, SW_SHOW);
-        SetForegroundWindow(g_helpwnd);
+        HelpPresent(g_helpwnd);
         return;
     }
     memset(&w, 0, sizeof w);
@@ -1633,14 +1637,14 @@ static void OpenHelp(HWND owner) {
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
         owner, NULL, GetModuleHandleW(NULL), NULL);
     if (!g_helpwnd) return;
+    GetClientRect(g_helpwnd, &cr);   /* same rect WM_SIZE keeps the edit on */
     e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", HELP_TEXT,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_LEFT,
-        0, 0, rc.right - rc.left, rc.bottom - rc.top,
+        0, 0, cr.right, cr.bottom,
         g_helpwnd, NULL, GetModuleHandleW(NULL), NULL);
     f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
-    if (!g_test_headless)
-        ShowWindow(g_helpwnd, SW_SHOW);
+    HelpPresent(g_helpwnd);
 }
 
 /* ---------------------- update check (link-out, safe) -------------------- */
@@ -1676,18 +1680,21 @@ static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
     return 0;
 }
 
-#define UPT_NONE   0   /* unreachable / offline / feed not published */
-#define UPT_NEW    1   /* newer version available                    */
-#define UPT_SAME   2   /* already on the latest version              */
+#define UPT_NONE      0   /* unreachable / offline / feed not published */
+#define UPT_MALFORMED 1   /* feed answered but stated no version          */
+#define UPT_NEW       2   /* newer version available                      */
+#define UPT_SAME      3   /* already on the latest version                */
 
 /* Worker thread: HTTPS GET of UPDATE_URL (TLS + hostname validation are
  * WinHTTP defaults - no ignored-certification flags anywhere). Reads at most
- * 4 KB, compares numbers, posts a WM_APP_UPDATE to the dialog. It NEVER
- * navigates to anything from the feed - the dialog opens the built-in
+ * 4 KB, compares numbers and posts a WM_APP_UPDATE to the host window, which
+ * lives for the whole process: the settings dialog that started the check can
+ * be closed (and its handle recycled) long before the answer arrives. It
+ * NEVER navigates to anything from the feed - the result opens the built-in
  * PRODUCT_URL only. No user data leaves the machine (the request is a bare
  * GET with a product user-agent). */
 static DWORD WINAPI UpdateCheckThread(LPVOID param) {
-    HWND dlg = (HWND)param;
+    (void)param;   /* the host window receives the result, not the caller */
     WCHAR host[256] = L"", path[512] = L"", ua[32];
     URL_COMPONENTSW uc = { sizeof(uc) };
     HINTERNET ses = NULL, con = NULL, req = NULL;
@@ -1726,14 +1733,16 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
         body[total < 4096 ? total : 4096] = 0;
         {
             int ma, mi, pa;
-            if (ParseVersionTriple(body, &ma, &mi, &pa) &&
-                CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH) > 0) {
+            if (!ParseVersionTriple(body, &ma, &mi, &pa)) {
+                result = UPT_MALFORMED;   /* answered, but stated no version */
+            } else if (CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR,
+                                      MNVER_PATCH) > 0) {
                 result = UPT_NEW;
                 found = (WCHAR *)malloc(64 * sizeof(WCHAR));
                 if (found)
                     _snwprintf(found, 64, L"%d.%d.%d", ma, mi, pa);
-            } else if (total > 0) {
-                result = UPT_SAME;
+            } else {
+                result = UPT_SAME;        /* same or older: already current */
             }
         }
     }
@@ -1741,29 +1750,29 @@ done:
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
     if (ses) WinHttpCloseHandle(ses);
-    if (dlg && IsWindow(dlg))
-        PostMessageW(dlg, WM_APP_UPDATE, (WPARAM)result, (LPARAM)found);
-    else if (found)
-        free(found);
+    PostMessageW(g_host, WM_APP_UPDATE, (WPARAM)result, (LPARAM)found);
     InterlockedExchange(&g_update_busy, 0);
     return 0;
 }
 
-static void StartUpdateCheck(HWND dlg) {
+static void StartUpdateCheck(void) {
+    HANDLE t;
     if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
         return;   /* a check is already running */
-    if (!CreateThread(NULL, 0, UpdateCheckThread, dlg, 0, NULL)) {
+    t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
+    if (!t) {
         InterlockedExchange(&g_update_busy, 0);
         return;
     }
-    /* busy flag clears in the thread; no handle to keep (it self-releases) */
+    CloseHandle(t);   /* the busy flag clears in the thread */
 }
 
-/* Results land on the dialog thread. Any "open page" action uses ONLY the
- * built-in PRODUCT_URL - never a string received from the network. */
+/* Results land on the host window's thread. Any "open page" action uses ONLY
+ * the built-in PRODUCT_URL - never a string received from the network. */
 static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
     WCHAR *found = (WCHAR *)lp;
     int open = 0;
+    if (dlg && !IsWindow(dlg)) dlg = NULL;
     if (result == UPT_NEW && found) {
         WCHAR msg[160];
         _snwprintf(msg, 160,
@@ -1774,6 +1783,11 @@ static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
     } else if (result == UPT_SAME) {
         MessageBoxW(dlg, L"You are running the latest version of mnPaper.",
                     L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
+    } else if (result == UPT_MALFORMED) {
+        open = MessageBoxW(dlg,
+            L"The update feed answered, but its contents could not be read as a "
+            L"version number.\n\nOpen the mnPaper download page anyway?",
+            L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
     } else {
         open = MessageBoxW(dlg,
             L"Could not reach the update feed (offline, or the feed is not "
@@ -2016,14 +2030,11 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
-            StartUpdateCheck(hwnd);
+            StartUpdateCheck();
         } else if (LOWORD(wp) == IDCANCEL) {
             SendMessageW(hwnd, WM_TIMER, TIMER_DEBOUNCE, 0);
             DestroyWindow(hwnd);
         }
-        return 0;
-    case WM_APP_UPDATE:
-        UpdateResult(hwnd, wp, lp);
         return 0;
     case WM_CLOSE:
         SendMessageW(hwnd, WM_TIMER, TIMER_DEBOUNCE, 0);
@@ -2214,20 +2225,12 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SyncOverlays();
         RepaintAll();
         return 0;
+    case WM_APP_UPDATE:
+        UpdateResult(g_dlg, wp, lp);   /* may outlive the dialog that asked */
+        return 0;
     case WM_APP_PAPER:
         ApplyPaperResult((PaperDone *)lp);
         return 0;
-    case WM_APP_RAW: {
-        /* hold-to-compare: wp=1 hides the veil (raw screen), wp=0 brings
-         * it back. Purely visual - no setting, no registry write. */
-        int i, s;
-        for (i = 0; i < g_n; i++)
-            for (s = 0; s < g_ov[i].n_strips; s++)
-                if (g_ov[i].shwnd[s])
-                    ShowWindow(g_ov[i].shwnd[s],
-                               (wp && g_s.master) ? SW_HIDE : SW_SHOWNA);
-        return 0;
-    }
     case WM_APP + 1:
         L("cmd %d", (int)wp);
         switch (wp) {
