@@ -1810,7 +1810,7 @@ static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
 
 static HWND MkTrack(HWND parent, int id, int lo, int hi, int pos, int x, int y, int w, int h) {
     HWND t = CreateWindowExW(0, L"msctls_trackbar32", NULL,
-        WS_CHILD | WS_VISIBLE | TBS_HORZ,
+        WS_CHILD | WS_VISIBLE | TBS_HORZ | WS_TABSTOP,
         x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
     SendMessageW(t, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
     SendMessageW(t, TBM_SETPOS, TRUE, pos);
@@ -1931,45 +1931,45 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_contrast = MkLabel(hwnd, L"Contrast", 14, 48 + 4, 92, 20);
         g_val[7] = MkLabel(hwnd, L"75", 302, 82 + 4, 44, 20); g_tb_dither    = MkTrack(hwnd, 107, 0, 100, g_s.dither, 106, 82, 190, 26);
         g_lb_dither = MkLabel(hwnd, L"Dither",   14, 82 + 4, 92, 20);
-        CreateWindowExW(0, L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
          * morphs (SetMode refreshes rows in place). */
         CreateWindowExW(0, L"BUTTON", L"Paper",
-            WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"E-ink",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
         CheckRadioButton(hwnd, 114, 115, g_s.mode == MODE_PAPER ? 114 : 115);
-        /* Same setting as the tray's share toggle. Grayed in e-ink mode:
-         * that mode is always capture-excluded (feedback white-out). */
-        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
-            GetModuleHandleW(NULL), NULL);
-        SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
-        EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* Texture on/off: hide the veil without quitting the app (same as the
          * tray's master toggle and Ctrl+Alt+P). */
-        CreateWindowExW(0, L"BUTTON", L"Texture on",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
+        CreateWindowExW(0, L"BUTTON", L"&Texture on",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
                      g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Autostart: mirrors the tray's Start-with-Windows item. */
-        CreateWindowExW(0, L"BUTTON", L"Start with Windows",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
+        CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 119), BM_SETCHECK,
                      g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+        /* Same setting as the tray's share toggle. Grayed in e-ink mode:
+         * that mode is always capture-excluded (feedback white-out). */
+        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* "?" circle: explanations open only when pressed (captain asked to
          * replace the hover popups). Owner-drawn round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"&Close",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* link-out update check: compares version numbers, offers the page */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 344, 110, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 344, 110, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2051,9 +2051,6 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CheckRadioButton(hwnd, 114, 115, mode == MODE_PAPER ? 114 : 115);
         } else if (LOWORD(wp) == 118) {
             SetMaster(IsDlgButtonChecked(hwnd, 118) == BST_CHECKED);
-            /* reflect the authoritative state (SetMaster is a no-op if same) */
-            SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
-                         g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
         } else if (LOWORD(wp) == 119) {
             g_s.autostart = IsDlgButtonChecked(hwnd, 119) == BST_CHECKED;
             SaveSettings();   /* SaveSettings applies the Run key */
@@ -2293,8 +2290,18 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_s.mode == MODE_EINK)
                 EinkEnsureBuffers();
             RepaintAll();
-            if (g_dlg)
-                PostMessageW(g_dlg, WM_CLOSE, 0, 0);
+            if (g_dlg && IsWindow(g_dlg)) {
+                DlgSyncBars();
+                UpdateVals(g_dlg);
+                CheckRadioButton(g_dlg, 114, 115,
+                                 g_s.mode == MODE_PAPER ? 114 : 115);
+                EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
+                SendMessageW(g_chk_share, BM_SETCHECK,
+                             g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+                SyncMasterCheckbox();
+                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
+                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+            }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
         }
         return TRUE;

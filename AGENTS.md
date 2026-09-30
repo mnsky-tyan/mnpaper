@@ -291,9 +291,11 @@ test save with autostart=0 would delete the captain's real autostart entry.
 Checkbox 118 stays truthful on every master change with no per-path re-assert:
 `SyncMasterCheckbox` runs from `SetMaster` and `ActivateMode`, and every
 master change (Ctrl+Alt+P, Ctrl+Alt+E, CLI --on/--off/--toggle/--paper/--eink,
-tray, mode radios) funnels through those two. 119 has only two writers - the
-tray IDM_AUTOSTART and the checkbox handler - so those two re-assert it (the
-same live-sync as the share checkbox).
+tray, mode radios) funnels through those two; a CMD_SYNC (`--set master=`)
+also re-syncs it (it no longer closes the dialog). 119 is written by the tray
+IDM_AUTOSTART and the checkbox handler (both re-assert the control), by
+`SetKeyValue`'s autostart arm (`--set autostart=1`, delivered by CMD_SYNC's
+re-sync), and by LoadSettings' Run-key mirror (runs before any dialog exists).
 
 **E-ink radio asks first (captain got trapped, 2026-09-30).** A single click
 on E-ink flipped his whole screen to opaque greyscale and he found the laptop

@@ -105,7 +105,7 @@ See `tests/README.md` for what the suite covers.
 ## Icon
 
 `mnPaper.ico` is generated from choice 7 of the captain's icon sheet
-(`icon_7th_preview.png` keeps the 820px master): layered paper waves with
+(`assets/icon_7th_preview.png` keeps the 820px master): layered paper waves with
 rounded-corner transparency, packed at 16-256 px.
 
 ## Status
