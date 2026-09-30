@@ -6,11 +6,10 @@ portable exe). The captain wants immediate full-screen feedback while
 dragging, not an A/B comparison button. That button is removed. The settings
 window now carries Paper/E-ink mode radios (114/115, e-ink confirms first),
 the share-capture checkbox (113), and a ? owner-drawn help button (116);
-SetMode morphs the dialog in place.
-Tooltips are own `MnPaperTip` popups asserted above the dialog; inactive
-rows hide their labels, controls and values together. Autostart is enabled
-in the captain's live profile - preserve his settings, do not reset them
-when tests have not touched them.
+SetMode morphs the dialog in place. Inactive rows hide their labels,
+controls and values together. Autostart is enabled in the captain's live
+profile - preserve his settings, do not reset them when tests have not
+touched them.
 
 **Earlier latency claims were wrong.** A 15ms measurement only timed the
 launch of a GUI executable, not its completion. Waiting for the renderer's
@@ -60,10 +59,10 @@ SetCursorPos bypasses WH_MOUSE_LL while SendInput traverses it),
 ## Where things live
 
 - Source: `mnPaper.c` (this directory). PoC: `poc.c`.
-- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (v2.5, 199,168 bytes,
-  release /O2 /W3 without /Zi). Settings live in
-  `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the `mnPaper` value in
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (still the pre-2.6.0 build:
+  200,192 bytes, release /O2 /W3 without /Zi, no version resource yet).
+  Settings live in `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the
+  `mnPaper` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - Tuning samples: `samples/` (paper at intensity 20 and 30, e-ink at 2/4/16
   shades). All produced headlessly with `--dump-tex` / `--dump-eink`.
 
@@ -287,8 +286,8 @@ unusable and uncapturable (e-ink forces exclusion, so screenshots show
 nothing). Now the GUI radio path confirms with a plain-language MessageBox
 (defbutton = No) before `ActivateMode(MODE_EINK)`; declining snaps the radio
 back to Paper. Paper, the tray items and Ctrl+Alt+E stay instant - the escape
-hatch must never be gated. The hidden regression calls `SetMode()` directly,
-so it never hits the MessageBox.
+hatch must never be gated. The slider regression calls `SetMode()`
+directly, so it never hits the MessageBox.
 
 **Grain preview aliasing (captain: "grain lags behind").** The 8px preview
 sampled the true frequencies, so fine grain (8-10px features) aliased into a
@@ -296,7 +295,10 @@ near-flat smear: strength/warmth previews looked instant but grain seemed
 dead until the full refine landed. `PAPERPARAMS.fs` now scales all noise
 coordinates (fs = preview step, 1 for full builds): the preview shows the
 same character with step-x larger features, instantly. The refine still lands
-the exact texture. Regression asserts preview alpha-std > 2 at grain 8 and 64.
+the exact texture. Regression measures grain with fibre and blotch off, so
+only grain can move the statistic: alpha-std stays above 2 over the whole
+trackbar range (grain 2-12) and the pixel-level detail falls as the grain
+coarsens - the unscaled 8px preview ignored the grain slider entirely.
 
 **Fibre and blotch now add their own alpha modulation.** They used to only
 nudge the noise mix (captain: "don't seem to do much"). `PAPERPARAMS.fspread
@@ -334,8 +336,9 @@ ShowWindow so hidden tests never flash a window on the desktop.
 - **Known accepted gaps**: no code-signing certificate (SmartScreen warning
   until the captain buys one); no icon asset; e-ink shimmer at shades=4
   documented, needs consent to tune live; update feed not published.
-- Repo: github.com/mnsky-tyan/mnpaper (private), default branch `main`,
-  validated through the no-mistakes pipeline on feature branches.
+- Repo: github.com/mnsky-tyan/mnpaper (private), default branch
+  `release-readiness`, validated through the no-mistakes pipeline on feature
+  branches.
 
 E-ink flicker (not yet fixed, needs consent to test live): the render math is
 deterministic (static `BAYER4` dither), so the shimmer he saw is inherent

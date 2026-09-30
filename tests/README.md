@@ -46,6 +46,28 @@ Covered:
   points.
 - Test windows never become visible.
 
+`update_help_capture.c` is the companion hidden regression for the release
+paths: it drives the update-check result handler through the real message-only
+host window (so a late result still lands after the settings dialog is closed,
+and the version string is released exactly once), the help window's edit child
+sized to the parent client rect with a reachable scrollbar, and the
+capture-exclusion precedence (e-ink stays excluded from captures even with
+`--no-exclude` or `share=1`). It also clicks the real E-ink radio to cover
+the confirmation path: declining snaps the radio straight back to Paper, and
+the way back to Paper asks nothing. It parks its test strip outside every
+virtual screen and intercepts each `MessageBoxW` with a thread-local CBT hook,
+so validation paints nothing on the working desktop and starts no browser.
+
+Build it in a debug configuration to enable the heap-leak assertions
+(`_CrtMemDifference` is a no-op in release builds):
+
+```bat
+cl /nologo /Od /W3 /D_DEBUG /MDd tests\update_help_capture.c /Fetests\update_help_capture.exe
+```
+
+The live WinHTTP check is still deliberately NOT clicked by either test: it
+performs a real network request and its result opens a real box.
+
 Before the repair, the same slider regression recorded a 2469ms first update,
 one frame, a lost final request and an incorrect final bitmap. The repaired
 runs recorded 46-125ms first updates and 31-125ms preview request-to-upload latency.
