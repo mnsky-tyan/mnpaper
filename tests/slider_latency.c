@@ -248,45 +248,69 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         }
     }
     /* Grain, fibre and blotch must be visible in the PREVIEW itself - the
-     * old 8px preview aliased fine grain into a flat smear, so grain felt
-     * seconds behind strength/warmth (captain report 2026-09-30). */
+     * old 8px preview sampled the true frequencies on the coarse grid and
+     * aliased fine grain into a flat smear, so grain felt seconds behind
+     * strength/warmth (captain report 2026-09-30). */
     {
         int w = 640, h = 400;
         unsigned char *buf = malloc((size_t)w * h * 4);
         SETTINGS saved = g_s;
-        double sum, sum2, var, std, m_g8, m_g64, m_f0, m_f100, m_b0, m_b100;
-        int i, ok;
+        double sum, sum2, var, std, detail;
+        double gstd[11], gdetail[11], m_f0, m_f100, m_b0, m_b100, sd;
+        int i, ok, g, render_fail = 0, flat = 0, nonmono = 0;
 
-        #define PREVIEW_ALPHA_STD(gv, fv, bv, outstd) do { \
+        /* Two statistics over the preview alpha: its overall spread (std) and
+         * its pixel-to-pixel detail (mean neighbour difference). The detail
+         * figure is what an 8px grid can lose: bilinear expansion of a grid
+         * that sampled the true fine-grain frequencies carries almost no
+         * grain response at all. */
+        #define PREVIEW_ALPHA_STD(gv, fv, bv, outstd, outdetail) do { \
             g_s.grain = (gv); g_s.fibre = (fv); g_s.blotch = (bv); \
             g_s.intensity = 40; \
             ok = BuildPaperPreview(buf, w, h, &g_s); \
-            Check(ok, "preview renders for structure check"); \
-            sum = sum2 = 0; std = 0; \
+            if (!ok) render_fail++; \
+            sum = sum2 = 0; std = 0; detail = 0; \
             if (ok) { \
                 for (i = 0; i < w * h; i++) { double a = buf[4*i+3]; sum += a; sum2 += a*a; } \
                 var = sum2 / (w * h) - (sum / (w * h)) * (sum / (w * h)); \
                 std = var > 0 ? sqrt(var) : 0; \
+                for (i = 0; i < w * h; i += w) { \
+                    int k; \
+                    for (k = 1; k < w; k++) \
+                        detail += fabs((double)buf[4*(i+k)+3] - (double)buf[4*(i+k-1)+3]); \
+                } \
+                detail /= (double)(w - 1) * h; \
             } \
-            outstd = std; \
+            outstd = std; outdetail = detail; \
         } while (0)
 
-        PREVIEW_ALPHA_STD(8, 100, 0, m_g8);
-        printf("METRIC grain preview std (grain=8): %.2f\n", m_g8);
-        Check(m_g8 > 2.0, "preview shows fine grain structure instead of a flat smear");
-        PREVIEW_ALPHA_STD(64, 100, 0, m_g64);
-        printf("METRIC grain preview std (grain=64): %.2f\n", m_g64);
-        Check(m_g64 > 2.0, "preview shows coarse grain structure");
+        /* Grain measured with fibre and blotch off, so neither can lend the
+         * statistic structure of its own, across the whole reachable range
+         * (ClampSettingsOf caps grain at 12, the trackbar tops out at 12). */
+        for (g = 2; g <= 12; g++) {
+            PREVIEW_ALPHA_STD(g, 0, 0, gstd[g-2], gdetail[g-2]);
+            printf("METRIC grain=%d preview alpha-std %.2f detail %.3f\n",
+                   g, gstd[g-2], gdetail[g-2]);
+            if (gstd[g-2] <= 2.0) flat = 1;
+            if (g > 2 && gdetail[g-2] > gdetail[g-3] + 1e-9) nonmono = 1;
+        }
+        Check(!render_fail, "preview renders for every structure check");
+        Check(!flat, "grain-only preview keeps visible structure at every grain size");
+        /* The full-resolution build loses detail as the grain coarsens; the
+         * preview has to follow it, which it only does with the frequency
+         * scaling. Pre-fix the detail figure ignored the grain slider. */
+        Check(!nonmono && gdetail[10] < gdetail[0] * 0.5,
+              "preview grain detail falls as grain coarsens (no aliased smear)");
 
-        PREVIEW_ALPHA_STD(6, 0, 47, m_f0);
+        PREVIEW_ALPHA_STD(6, 0, 47, m_f0, sd);
         printf("METRIC fibre preview std (fibre=0): %.2f\n", m_f0);
-        PREVIEW_ALPHA_STD(6, 100, 47, m_f100);
+        PREVIEW_ALPHA_STD(6, 100, 47, m_f100, sd);
         printf("METRIC fibre preview std (fibre=100): %.2f\n", m_f100);
         Check(m_f100 > m_f0 * 1.15 + 0.5, "fibre=100 adds clearly more structure than fibre=0");
 
-        PREVIEW_ALPHA_STD(6, 100, 0, m_b0);
+        PREVIEW_ALPHA_STD(6, 100, 0, m_b0, sd);
         printf("METRIC blotch preview std (blotch=0): %.2f\n", m_b0);
-        PREVIEW_ALPHA_STD(6, 100, 100, m_b100);
+        PREVIEW_ALPHA_STD(6, 100, 100, m_b100, sd);
         printf("METRIC blotch preview std (blotch=100): %.2f\n", m_b100);
         Check(m_b100 > m_b0 * 1.15 + 0.5, "blotch=100 adds clearly more structure than blotch=0");
 
@@ -304,6 +328,8 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
               "? opens the help window (hidden in headless mode)");
         SendMessageW(hbtn, BM_CLICK, 0, 0);
         Check(g_helpwnd == h1, "pressing ? again reuses the same help window");
+        Check(h1 && !IsWindowVisible(h1),
+              "re-clicking ? reuses it without showing it in headless mode");
         if (h1 && IsWindow(h1)) DestroyWindow(h1);
         Check(g_helpwnd == NULL, "closing the help window clears it");
     }

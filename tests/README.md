@@ -38,9 +38,12 @@ Covered:
 - Version parsing/comparison for the update check as pure functions, plus
   button 117 existence. The live WinHTTP check is deliberately NOT exercised
   in tests (real network + a real MessageBox would disturb the working user).
-- Preview structure metrics: grain 8 and 64 both show alpha-std > 2 (no more
-  aliased flat smear), and fibre 0->100 / blotch 0->100 add clearly more
-  structure than their zero points.
+- Preview structure metrics: grain measured with fibre and blotch off keeps
+  alpha-std above 2 over the whole trackbar range (grain 2-12), and its
+  pixel-level detail falls as the grain coarsens - the full build does the
+  same, and the unscaled 8px preview ignored the grain slider entirely.
+  Fibre 0->100 / blotch 0->100 add clearly more structure than their zero
+  points.
 - Test windows never become visible.
 
 Before the repair, the same slider regression recorded a 2469ms first update,
