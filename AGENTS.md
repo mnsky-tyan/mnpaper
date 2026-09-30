@@ -312,6 +312,31 @@ and hotkey in plain language. Re-click brings it to front; g_helpwnd clears
 on destroy. `g_test_headless` (test sets it) creates the window without
 ShowWindow so hidden tests never flash a window on the desktop.
 
+## Release readiness (2026-09-30)
+
+- **Versioning**: `MNVER_MAJOR/MINOR/PATCH` in mnPaper.c + `mnPaper.rc`
+  VERSIONINFO (2.6.0). Bump BOTH on every release; the rc is compiled in via
+  `rc /nologo mnPaper.rc` then `cl mnPaper.c mnPaper.res` (cl does not compile
+  .rc itself - passing it to cl directly fails with LNK1107).
+- **Update check = link-out, never an auto-updater** (deliberate): button 117
+  runs `UpdateCheckThread` (WinHTTP, HTTPS-only, default cert validation,
+  5-10s timeouts, 4KB read cap), parses a numeric triple from a plain-text
+  manifest, compares with `CompareVersion`, and only ever OPENS the built-in
+  `PRODUCT_URL` constant. A network-supplied string is never executed or
+  navigated to. Hidden regression tests must not click button 117: the live
+  path makes a real network request and its result opens a real MessageBox -
+  both disturb the working captain. Tests cover ParseVersionTriple and
+  CompareVersion as pure functions plus button existence.
+- **Before publishing**: point `UPDATE_URL` (version.txt manifest, first line
+  = latest version) and `PRODUCT_URL` at the real repo. Placeholders point at
+  github.com/mnsky-app/mnpaper (which does not exist yet - the button then
+  shows the offline fallback and offers the page anyway).
+- **Known accepted gaps**: no code-signing certificate (SmartScreen warning
+  until the captain buys one); no icon asset; e-ink shimmer at shades=4
+  documented, needs consent to tune live; update feed not published.
+- Repo: github.com/mnsky-tyan/mnpaper (private), default branch `main`,
+  validated through the no-mistakes pipeline on feature branches.
+
 E-ink flicker (not yet fixed, needs consent to test live): the render math is
 deterministic (static `BAYER4` dither), so the shimmer he saw is inherent
 4-shade quantization sparkling on every captured frame at shades=4 /

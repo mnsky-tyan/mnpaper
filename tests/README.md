@@ -35,6 +35,9 @@ Covered:
   swap, radios reflect, share checkbox greys in e-ink) and persists `mode`.
 - The ? button (id 116) opens one shared help window; in headless mode it is
   created but never shown, re-click reuses it, closing clears it.
+- Version parsing/comparison for the update check as pure functions, plus
+  button 117 existence. The live WinHTTP check is deliberately NOT exercised
+  in tests (real network + a real MessageBox would disturb the working user).
 - Preview structure metrics: grain 8 and 64 both show alpha-std > 2 (no more
   aliased flat smear), and fibre 0->100 / blotch 0->100 add clearly more
   structure than their zero points.
