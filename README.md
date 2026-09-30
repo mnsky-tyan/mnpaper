@@ -93,8 +93,11 @@ See `tests/README.md` for what the suite covers.
   the login screen): Windows forbids drawing there by design.
 - The Start menu, search and notification center run in shell z-order bands
   ordinary apps cannot enter, so they stay untextured.
-- The taskbar is deliberately left untextured: the shell actively fights for
-  its z-order band and auto-hide behavior is fragile against overlays.
+- An auto-hidden taskbar is covered by the paper while it is parked, and
+  floats above the paper when you reveal it. The revealed taskbar itself is
+  not textured: mnPaper steps aside for it, because forcing the always-on-top
+  paper over a revealed taskbar makes Windows drop the taskbar's own topmost
+  state.
 - E-ink mode can shimmer on content-heavy screens at low shade counts.
 - The exe is not code-signed yet: the first run may show a SmartScreen
   warning ("More info" -> "Run anyway").

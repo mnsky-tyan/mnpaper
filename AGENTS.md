@@ -249,7 +249,7 @@ Why: the mascot `C:\Users\tyanw\Downloads\Little-Remielle-win\...\小蕾米.exe`
 LAYERED|TOPMOST) re-asserts topmost roughly every 2s and otherwise sits above
 the veil; ChatGPT's `CodexComputerUseSwiftOverlay` is the same class of
 problem. Measured duty cycle after the fix: the mascot is above at most
-~50 ms every ~2s (40-rank probe, zorder4.c).
+~50 ms every ~2s (40-rank probe, probes/zorder4.c).
 
 Taskbar policy (two rounds of captain feedback, final): state-based. Every
 tick, for each `Shell_TrayWnd` / `SecondaryTrayWnd`, the on-screen height is
@@ -257,7 +257,7 @@ measured: parked as a thin sliver (<= 16 px on screen) it drops UNDER the
 veil so the paper covers the screen uniformly to the bottom edge; while
 revealed on hover (or docked and always visible) it is re-asserted
 `HWND_TOPMOST` so it floats cleanly on the paper and can never sink behind
-it. Both states verified live with tborder.c (tray rect parks at `0,899
+it. Both states verified live with probes/tborder.c (tray rect parks at `0,899
 1440x52` logical, reveals to `0,848 1440x52` when the cursor touches the
 edge) and bottom-strip captures.
 
@@ -288,8 +288,12 @@ the Run key via `ApplyAutostart`. `g_run_key` is a writable buffer (default
 `Software\...\Run`) that the hidden regression redirects into its scratch
 hive - ApplyAutostart runs on EVERY SaveSettings, so without the redirect a
 test save with autostart=0 would delete the captain's real autostart entry.
-Tray IDM_MASTER / IDM_AUTOSTART re-assert checkboxes 118/119 when the dialog
-is open (same live-sync pattern as the share checkbox).
+Checkbox 118 stays truthful on every master change with no per-path re-assert:
+`SyncMasterCheckbox` runs from `SetMaster` and `ActivateMode`, and every
+master change (Ctrl+Alt+P, Ctrl+Alt+E, CLI --on/--off/--toggle/--paper/--eink,
+tray, mode radios) funnels through those two. 119 has only two writers - the
+tray IDM_AUTOSTART and the checkbox handler - so those two re-assert it (the
+same live-sync as the share checkbox).
 
 **E-ink radio asks first (captain got trapped, 2026-09-30).** A single click
 on E-ink flipped his whole screen to opaque greyscale and he found the laptop
@@ -398,7 +402,8 @@ so the mode hard-forces exclusion.
   warmth 99, fibre 80, intensity 40 were all leftovers from validation.
   Reset the keys to the defaults before handing the app back:
   intensity 30, warmth 45, grain 4, fibre 40, blotch 30,
-  shades 4, contrast 50, dither 75, master 1, mode 0, share 0, autostart 0.
+  shades 4, contrast 50, dither 75, master 1, mode 0, share 0, autostart 1
+  (his live value - never write autostart 0, that deletes his Run key).
 - `WM_APP + 2` was already taken (`WM_APP_TRAY`); the async build message
   had to become `WM_APP + 3`. Check existing defines before adding a
   message. Tray command ids: 9001-9004, 9005-9006, strength 9007-9010, so
@@ -443,7 +448,7 @@ so the mode hard-forces exclusion.
   (bottom edge), capture `CopyFromScreen(0,1440,0,0,(1440,360))`.
 - Cursor-triggered tests (auto-hide reveal): one `SetCursorPos` to the edge
   may not latch the reveal; wiggle 3-4 positions then hold (mnlive8.ps1 /
-  tborder.c pattern).
+  probes/tborder.c pattern).
 - The mouse cursor is a hardware sprite drawn above the DWM composite: no
   window, no layered trick, no overlay can cover or texture it. Leave it
   crisp; do not try to "fix" this with a fake cursor.

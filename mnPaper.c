@@ -1621,7 +1621,7 @@ static void HelpPresent(HWND h) {
 }
 
 static void OpenHelp(HWND owner) {
-    WNDCLASSW w;
+    WNDCLASSEXW w;
     RECT rc, cr;
     HWND e;
     HFONT f;
@@ -1630,13 +1630,15 @@ static void OpenHelp(HWND owner) {
         return;
     }
     memset(&w, 0, sizeof w);
+    w.cbSize        = sizeof w;
     w.lpfnWndProc   = HelpProc;
     w.hInstance     = GetModuleHandleW(NULL);
     w.lpszClassName = L"MnPaperHelp";
     w.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     w.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     w.hIcon         = LoadIconW(w.hInstance, MAKEINTRESOURCEW(1));
-    RegisterClassW(&w);   /* re-registration after a close fails harmlessly */
+    w.hIconSm       = w.hIcon;
+    RegisterClassExW(&w);   /* re-registration after a close fails harmlessly */
     rc.left = 0; rc.top = 0; rc.right = 470; rc.bottom = 580;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_helpwnd = CreateWindowExW(0, L"MnPaperHelp", L"mnPaper help",
