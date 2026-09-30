@@ -80,7 +80,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
     InitCommonControls();
     swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
-    REG_KEY = scratch; REG_RUN = run;
+    REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpfnWndProc = TestHost; wc.lpszClassName = L"MnPaperTestHost";
     RegisterClassW(&wc);
@@ -409,6 +409,52 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
               "paper radio reflects the mode");
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
         g_s.master = saved_master;
+    }
+    /* Texture-on checkbox (118) and autostart checkbox (119): same handlers
+     * as the tray items, fully isolated from the real Run key. */
+    {
+        HKEY key = NULL;
+        int saved_master = g_s.master, saved_auto = g_s.autostart, v;
+        DWORD t = 0, sz = 0;
+        Check(IsWindow(GetDlgItem(g_dlg, 118)) && IsWindow(GetDlgItem(g_dlg, 119)),
+              "texture-on and start-with-windows checkboxes exist");
+        Check(IsDlgButtonChecked(g_dlg, 118) == (g_s.master ? BST_CHECKED : BST_UNCHECKED) &&
+              IsDlgButtonChecked(g_dlg, 119) == (g_s.autostart ? BST_CHECKED : BST_UNCHECKED),
+              "new checkboxes reflect current settings on open");
+        /* master toggle: only the HIDE direction runs the real handler - the
+         * show direction would make the hidden strips visible on the user's
+         * desktop. Restore by state + save instead. */
+        SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(118, BN_CLICKED), (LPARAM)GetDlgItem(g_dlg, 118));
+        Pump(50);
+        Check(g_s.master == 0, "unchecking Texture on hides the veil (master=0)");
+        g_s.master = saved_master;
+        SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
+                     saved_master ? BST_CHECKED : BST_UNCHECKED, 0);
+        /* autostart: verify the isolated Run key gains and loses the value */
+        SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(119, BN_CLICKED), (LPARAM)GetDlgItem(g_dlg, 119));
+        Pump(50);
+        Check(g_s.autostart == 1, "checking Start with Windows persists autostart=1");
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+            WCHAR path[MAX_PATH] = L"";
+            sz = sizeof path;
+            Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS,
+                  "Run key carries the mnPaper entry when autostart is on");
+            RegCloseKey(key);
+        } else Check(0, "scratch Run key exists when autostart is on");
+        SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(119, BN_CLICKED), (LPARAM)GetDlgItem(g_dlg, 119));
+        Pump(50);
+        Check(g_s.autostart == 0, "unchecking Start with Windows persists autostart=0");
+        v = -1;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+            v = RegQueryValueExW(key, L"mnPaper", NULL, &t, NULL, &sz) == ERROR_SUCCESS;
+            RegCloseKey(key);
+        }
+        Check(v == 0, "Run key entry removed when autostart is off");
+        g_s.master = saved_master; g_s.autostart = saved_auto;
+        SaveSettings();   /* restore isolated-key state to pre-test values */
     }
     PaperWorkerStop();
     Pump(5);

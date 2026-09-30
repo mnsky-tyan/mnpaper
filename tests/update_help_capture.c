@@ -133,7 +133,7 @@ int main(void) {
     InitCommonControls();
     swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
-    REG_KEY = scratch; REG_RUN = run;
+    REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
 
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpfnWndProc = HostProc; wc.lpszClassName = L"MnPaperTestHost";

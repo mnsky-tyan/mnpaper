@@ -86,7 +86,7 @@
  * NEVER downloads or replaces code: it compares version numbers and links
  * out, so a hostile or offline feed can at worst show a wrong message. */
 #define MNVER_MAJOR 2
-#define MNVER_MINOR 6
+#define MNVER_MINOR 7
 #define MNVER_PATCH 0
 #define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-app/mnpaper/main/version.txt"
 #define PRODUCT_URL L"https://github.com/mnsky-app/mnpaper/releases"
@@ -144,7 +144,9 @@ static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0 };
 static int g_hotkey_failed;
 
 static const WCHAR *REG_KEY = L"Software\\mnPaper";
-static const WCHAR *REG_RUN = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/* The Run key path is a writable buffer so the hidden regression can redirect
+ * it into its isolated scratch hive; production always keeps the default. */
+static WCHAR g_run_key[160] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static FILE *g_log;
 static void L(const char *fmt, ...) {
@@ -176,7 +178,7 @@ static void ClampSettings(void) {
 
 static void ApplyAutostart(void) {
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
         return;
     if (g_s.autostart) {
         WCHAR path[MAX_PATH];
@@ -234,7 +236,7 @@ static void LoadSettings(void) {
         RegCloseKey(k);
     }
     /* autostart mirrors the Run key so an external edit stays honest */
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &k) == ERROR_SUCCESS) {
         WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
         DWORD sz = sizeof(path), t = 0;
         if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
@@ -1543,6 +1545,7 @@ static const WCHAR *SET_CLASS = L"MnPaperSettings";
 
 static HWND g_helpwnd;          /* single "?" help window              */
 int g_test_headless = 0;        /* tests create the help window hidden */
+static void SetMaster(int on);  /* defined in the commands section below */
 
 static const WCHAR HELP_TEXT[] =
     L"mnPaper - how every control works\r\n"
@@ -1575,6 +1578,9 @@ static const WCHAR HELP_TEXT[] =
     L"  Dither   - pixel mixing that fakes extra greyscale levels.\r\n"
     L"\r\n"
     L"OTHER CONTROLS\r\n"
+    L"  Texture on - uncheck to hide the texture instantly; mnPaper keeps "
+    L"running in the tray (Ctrl+Alt+P does the same).\r\n"
+    L"  Start with Windows - launch mnPaper automatically at login.\r\n"
     L"  Show texture in screenshots and screen shares\r\n"
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
@@ -1923,7 +1929,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_val[7] = MkLabel(hwnd, L"75", 302, 82 + 4, 44, 20); g_tb_dither    = MkTrack(hwnd, 107, 0, 100, g_s.dither, 106, 82, 190, 26);
         g_lb_dither = MkLabel(hwnd, L"Dither",   14, 82 + 4, 92, 20);
         CreateWindowExW(0, L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 278, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
          * morphs (SetMode refreshes rows in place). */
         CreateWindowExW(0, L"BUTTON", L"Paper",
@@ -1936,18 +1942,31 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 252, 352, 20, hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
+        /* Texture on/off: hide the veil without quitting the app (same as the
+         * tray's master toggle and Ctrl+Alt+P). */
+        CreateWindowExW(0, L"BUTTON", L"Texture on",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
+                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+        /* Autostart: mirrors the tray's Start-with-Windows item. */
+        CreateWindowExW(0, L"BUTTON", L"Start with Windows",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(GetDlgItem(hwnd, 119), BM_SETCHECK,
+                     g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* "?" circle: explanations open only when pressed (captain asked to
          * replace the hover popups). Owner-drawn round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 14, 278, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
         /* link-out update check: compares version numbers, offers the page */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 304, 110, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 135, 344, 110, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2027,6 +2046,15 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ActivateMode(mode);   /* turns the effect on, saves, repaints */
             }
             CheckRadioButton(hwnd, 114, 115, mode == MODE_PAPER ? 114 : 115);
+        } else if (LOWORD(wp) == 118) {
+            SetMaster(IsDlgButtonChecked(hwnd, 118) == BST_CHECKED);
+            /* reflect the authoritative state (SetMaster is a no-op if same) */
+            SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
+                         g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (LOWORD(wp) == 119) {
+            g_s.autostart = IsDlgButtonChecked(hwnd, 119) == BST_CHECKED;
+            SaveSettings();   /* SaveSettings applies the Run key */
+            L("autostart=%d", g_s.autostart);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
@@ -2064,7 +2092,7 @@ static void OpenSettings(void) {
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     RegisterClassExW(&wc);
     g_advanced = 0;
-    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 340;
+    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 380;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     g_dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, SET_CLASS,
         L"mnPaper settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
@@ -2266,7 +2294,12 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDM_MASTER:    SetMaster(!g_s.master); break;
+        case IDM_MASTER:
+            SetMaster(!g_s.master);
+            if (g_dlg && IsWindow(g_dlg))
+                SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
+                             g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+            break;
         case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
         case IDM_EINK:      ActivateMode(MODE_EINK); break;
         case IDM_SETTINGS:  OpenSettings(); break;
@@ -2292,6 +2325,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_AUTOSTART:
             g_s.autostart = g_s.autostart ? 0 : 1;
             SaveSettings();
+            if (g_dlg && IsWindow(g_dlg))
+                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
+                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
             L("autostart=%d", g_s.autostart);
             break;
         case IDM_EXIT:

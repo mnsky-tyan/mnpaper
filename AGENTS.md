@@ -1,15 +1,15 @@
 # mnPaper - whole-screen paper texture + e-ink overlay (Win32)
 
-Status 2026-09-30: **v2.5 slider-latency repair + GUI mode/share controls +
-grain preview fix + ? help window** (`mnPaper.c`, single-file native C,
-portable exe). The captain wants immediate full-screen feedback while
-dragging, not an A/B comparison button. That button is removed. The settings
-window now carries Paper/E-ink mode radios (114/115, e-ink confirms first),
-the share-capture checkbox (113), and a ? owner-drawn help button (116);
-SetMode morphs the dialog in place. Inactive rows hide their labels,
-controls and values together. Autostart is enabled in the captain's live
-profile - preserve his settings, do not reset them when tests have not
-touched them.
+Status 2026-09-30: **v2.7.0 release candidate** (`mnPaper.c` + version
+metadata in `mnPaper.rc` - bump both together on every release). The settings
+window carries: Paper/E-ink mode radios (114/115, e-ink confirms first),
+Texture on (118, the master toggle - hide without quitting), Start with
+Windows (119, autostart), the share-capture checkbox (113), the ? help
+button (116), and Check for updates (117, link-out); SetMode morphs the
+dialog in place. Inactive rows hide their labels, controls and values
+together. The captain's live preferences (autostart=1, autostart Run key in
+place) must never be reset by tests. Inactive rows hide their labels,
+controls and values together.
 
 **Earlier latency claims were wrong.** A 15ms measurement only timed the
 launch of a GUI executable, not its completion. Waiting for the renderer's
@@ -45,7 +45,7 @@ cool 0 = icy (highlight 200,254,255, shadow 105,121,158). Measured mean
 blue-minus-red over the composited texture: warm -4, cool +2 (old full range
 swung ~1). Tooltip notes the ends are strong on purpose.
 
-Probe helpers live in this directory: `zprobe.c` (window
+Probe helpers live in `probes/`: `zprobe.c` (window
 dump), `zorder3.c` (pids/rects/ranks), `zorder4.c` (rank race cadence),
 `tborder.c` (auto-hide taskbar reveal watch), `strip.c` (who covers the
 bottom strip, by rank), `tbwatch.c` (taskbar topmost bit + rank timeline
@@ -58,7 +58,7 @@ SetCursorPos bypasses WH_MOUSE_LL while SendInput traverses it),
 
 ## Where things live
 
-- Source: `mnPaper.c` (this directory). PoC: `poc.c`.
+- Source: `mnPaper.c` (this directory). PoC: `probes/poc.c`.
 - Staged exe: `C:\Users\tyanw\bin\mnPaper.exe` (still the pre-2.6.0 build:
   200,192 bytes, release /O2 /W3 without /Zi, no version resource yet).
   Settings live in `HKCU\Software\mnPaper` (REG_DWORDs); autostart is the
@@ -279,6 +279,18 @@ place (DlgSyncBars + DlgLayout + UpdateVals + CheckRadioButton + share
 checkbox enable) instead of the old `PostMessageW(WM_CLOSE)`. The share
 checkbox is disabled (grey) while in e-ink because e-ink is always
 capture-excluded.
+
+**Texture on (118) / Start with Windows (119) checkboxes (captain request,
+2026-09-30).** 118 drives `SetMaster` (hide without quitting; the SHOW
+direction is never fired by the hidden tests - it would make the strips
+visible on the user's desktop; tests verify the hide direction and restore
+by state + save). 119 toggles `g_s.autostart` + `SaveSettings`, which applies
+the Run key via `ApplyAutostart`. `g_run_key` is a writable buffer (default
+`Software\...\Run`) that the hidden regression redirects into its scratch
+hive - ApplyAutostart runs on EVERY SaveSettings, so without the redirect a
+test save with autostart=0 would delete the captain's real autostart entry.
+Tray IDM_MASTER / IDM_AUTOSTART re-assert checkboxes 118/119 when the dialog
+is open (same live-sync pattern as the share checkbox).
 
 **E-ink radio asks first (captain got trapped, 2026-09-30).** A single click
 on E-ink flipped his whole screen to opaque greyscale and he found the laptop
