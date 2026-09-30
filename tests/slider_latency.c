@@ -230,7 +230,6 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
             int w = 320, h = 200, warm_br = 0, cool_br = 0;
             unsigned char *buf = malloc((size_t)w * h * 4);
             SETTINGS saved = g_s;
-            double sum = 0;
             g_s.warmth = 100;
             Check(BuildPaperPreview(buf, w, h, &g_s), "warm preview renders");
             for (i = 0; i < w * h; i++)
@@ -257,7 +256,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         SETTINGS saved = g_s;
         double sum, sum2, var, std, detail;
         double gstd[11], gdetail[11], m_f0, m_f100, m_b0, m_b100, sd;
-        int i, ok, g, render_fail = 0, flat = 0, nonmono = 0;
+        int px, ok, g, render_fail = 0, flat = 0, nonmono = 0;
 
         /* Two statistics over the preview alpha: its overall spread (std) and
          * its pixel-to-pixel detail (mean neighbour difference). The detail
@@ -271,13 +270,13 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
             if (!ok) render_fail++; \
             sum = sum2 = 0; std = 0; detail = 0; \
             if (ok) { \
-                for (i = 0; i < w * h; i++) { double a = buf[4*i+3]; sum += a; sum2 += a*a; } \
+                for (px = 0; px < w * h; px++) { double a = buf[4*px+3]; sum += a; sum2 += a*a; } \
                 var = sum2 / (w * h) - (sum / (w * h)) * (sum / (w * h)); \
                 std = var > 0 ? sqrt(var) : 0; \
-                for (i = 0; i < w * h; i += w) { \
+                for (px = 0; px < w * h; px += w) { \
                     int k; \
                     for (k = 1; k < w; k++) \
-                        detail += fabs((double)buf[4*(i+k)+3] - (double)buf[4*(i+k-1)+3]); \
+                        detail += fabs((double)buf[4*(px+k)+3] - (double)buf[4*(px+k-1)+3]); \
                 } \
                 detail /= (double)(w - 1) * h; \
             } \

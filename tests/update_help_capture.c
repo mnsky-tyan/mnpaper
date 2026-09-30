@@ -119,11 +119,14 @@ int main(void) {
     SETTINGS before = g_s;
     int i;
     HWND hbtn, h1, edit;
-    /* Release builds compile the _CrtMem* macros to no-ops, leaving the
-     * state structs unreferenced; reference them so /W3 stays clean in both
-     * configurations (see the debug build recipe in tests/README.md). */
+    /* The heap-leak assertions below only mean anything when the CRT debug
+     * heap is really instrumented: without _DEBUG the _CrtMem* macros compile
+     * to no-ops, so the state structs would never be written and the check
+     * would read uninitialised memory. Skip the whole block in release
+     * instead (debug recipe: tests/README.md). */
+#ifdef _DEBUG
     _CrtMemState m0, m1, md;
-    (void)sizeof m0; (void)sizeof m1; (void)sizeof md;
+#endif
 
     g_test_headless = 1;   /* help + update windows must never become visible */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -198,6 +201,7 @@ int main(void) {
     /* The result must survive the settings dialog that asked for it: the host
      * window owns the delivery, so a late answer still reaches the user and
      * the version string is released exactly once. */
+#ifdef _DEBUG
     _CrtMemCheckpoint(&m0);
     {
         WCHAR *found = _wcsdup(L"9.9.9");
@@ -222,6 +226,21 @@ int main(void) {
     printf("METRIC heap delta after the second result: %ld block(s), %ld byte(s)\n",
            (long)md.lCounts[0], (long)md.lSizes[0]);
     Check(md.lCounts[0] == 0, "no heap block is leaked by a result without a dialog");
+#else
+    /* Same paths, no leak instrumentation: still prove the answer survives
+     * the dialog closing, just without the heap-difference assertion. */
+    {
+        WCHAR *found = _wcsdup(L"9.9.9");
+        DestroyWindow(g_dlg);          /* the dialog that clicked the button */
+        Pump(20);
+        Check(g_dlg == NULL, "settings dialog really closed before the answer");
+        Deliver(UPT_NEW, (WPARAM)found, IDNO, 2000);
+        Check(g_box_seen == 1 && TextHas(g_box_text, "9.9.9"),
+              "late update answer still reaches the user after the dialog closed");
+    }
+    Deliver(UPT_SAME, 0, IDOK, 2000);
+    Check(g_box_seen == 1, "a second result still arrives after the dialog closed");
+#endif
 
     /* A fresh dialog can ask again; while a check is in flight the busy guard
      * drops a second click instead of racing a second worker thread. */
