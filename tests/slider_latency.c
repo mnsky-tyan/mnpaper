@@ -418,8 +418,8 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         DWORD t = 0, sz = 0;
         Check(IsWindow(GetDlgItem(g_dlg, 118)) && IsWindow(GetDlgItem(g_dlg, 119)),
               "texture-on and start-with-windows checkboxes exist");
-        Check(IsDlgButtonChecked(g_dlg, 118) == (g_s.master ? BST_CHECKED : BST_UNCHECKED) &&
-              IsDlgButtonChecked(g_dlg, 119) == (g_s.autostart ? BST_CHECKED : BST_UNCHECKED),
+        Check((int)IsDlgButtonChecked(g_dlg, 118) == (g_s.master ? BST_CHECKED : BST_UNCHECKED) &&
+              (int)IsDlgButtonChecked(g_dlg, 119) == (g_s.autostart ? BST_CHECKED : BST_UNCHECKED),
               "new checkboxes reflect current settings on open");
         /* master toggle: only the HIDE direction runs the real handler - the
          * show direction would make the hidden strips visible on the user's

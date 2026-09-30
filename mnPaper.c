@@ -80,7 +80,7 @@
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.6.0") and
+ * plain-text file whose first line is the latest version ("2.7.0") and
  * PRODUCT_URL at the page users download from (GitHub Releases recommended:
  * free TLS hosting, the release itself is the artifact). The update check
  * NEVER downloads or replaces code: it compares version numbers and links

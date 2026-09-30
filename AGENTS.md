@@ -77,6 +77,10 @@ call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Buil
 cl /nologo /O2 /W3 mnPaper.c
 ```
 
+That bare `cl` line builds the C only: it produces an exe with NO icon and NO
+version resource. A shippable build compiles the resource too - `rc /nologo
+mnPaper.rc` then `cl mnPaper.c mnPaper.res` (see Release readiness below).
+
 Links via pragmas: user32, gdi32, shell32, advapi32, comctl32, shcore,
 d3d11, dxgi, dxguid, ole32.
 
@@ -115,7 +119,8 @@ at deploy time.
 - All overlay windows get `WDA_EXCLUDEFROMCAPTURE` (never in screen shares).
 - Minimal UI: tray + one small settings window (paper: intensity/warmth/grain
   + Advanced disclosure for fibre/blotch; e-ink: shades/contrast/dither).
-  The settings window is topmost but only while open; it closes on mode change.
+  The settings window is topmost but only while open; switching mode morphs it
+  in place instead of closing it.
 - No cache files, no installer, no update mechanism, no video optimisation in
   e-ink mode (video is best-effort by design).
 
@@ -278,9 +283,12 @@ Also settable with `--capture on|off` or `--set share=1|0`.
 
 **Mode radios in the settings window (id 114 Paper / 115 E-ink).** Switching
 mode from the GUI keeps the dialog OPEN: `SetMode()` now morphs the dialog in
-place (DlgSyncBars + DlgLayout + UpdateVals + CheckRadioButton + share
-checkbox enable) instead of the old `PostMessageW(WM_CLOSE)`. The share
-checkbox is disabled (grey) while in e-ink because e-ink is always
+place (DlgSyncBars + DlgLayout + UpdateVals + SyncModeRadios + share
+checkbox enable) instead of the old `PostMessageW(WM_CLOSE)`. SyncModeRadios is
+CheckRadioButton plus a WS_TABSTOP re-assert on BOTH radios, because Windows
+moves a radio group's single tab stop onto the checked button, so a bare
+CheckRadioButton would drop the E-ink radio out of Tab order in paper mode.
+The share checkbox is disabled (grey) while in e-ink because e-ink is always
 capture-excluded.
 
 **Texture on (118) / Start with Windows (119) checkboxes (captain request,
