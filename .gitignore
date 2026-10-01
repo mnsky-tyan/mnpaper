@@ -6,3 +6,5 @@
 tests/run-*
 tests/*.txt
 tests/*.err
+samples/
+tests/

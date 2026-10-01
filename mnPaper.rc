@@ -1,8 +1,8 @@
 // mnPaper version metadata (product identity for the installed exe).
 #include <winver.h>
 
-// Application icon (choice 7 from the captain's icon sheet): layered paper
-// waves. ID 1 = default icon Explorer uses for the exe.
+// Application icon: layered paper waves. ID 1 = default icon Explorer uses
+// for the exe.
 1 ICON "mnPaper.ico"
 
 VS_VERSION_INFO VERSIONINFO

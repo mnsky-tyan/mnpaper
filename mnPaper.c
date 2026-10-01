@@ -334,8 +334,8 @@ static HWND g_host;
 static int  g_force_capture_show;   /* --no-exclude validation flag, session only */
 
 /* Should the overlay be excluded from screenshots and screen shares?
- * Yes by default so the texture never leaks into a share. The captain can
- * toggle that at runtime. E-ink mode is always excluded: Desktop
+ * Yes by default so the texture never leaks into a share. Toggleable at
+ * runtime. E-ink mode is always excluded: Desktop
  * Duplication would capture the e-ink output itself and feed it back,
  * white-washing the screen within seconds. */
 static int CaptureHidden(void) {
@@ -382,7 +382,7 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int wb;
     /* Warmth spans cool -> neutral(50) -> aged amber. The old mapping only
      * moved endpoints by ~24/255 and never went below neutral, so 0-100
-     * looked identical on screen (captain: "too calm"). Signed swing:
+     * looked identical on screen (user feedback: "too calm"). Signed swing:
      * cool reduces red and raises blue; warm raises red/brown and cuts blue. */
     int tw = sp->warmth * 2 - 100;          /* -100 cool .. +100 warm */
     int cool = tw < 0 ? -tw : 0;
@@ -404,8 +404,8 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     p.dg = 133 + warm / 10 - cool / 8;        /* shadow green */
     p.db = 108 - wb + cool / 2;               /* shadow blue  */
     p.bias = sp->intensity / 4; p.spread = sp->intensity * 3 / 4;
-    /* Fibre and blotch used to only nudge the noise mix (captain: "they
-     * don't seem to do much"). They now add their own alpha modulation on
+    /* Fibre and blotch used to only nudge the noise mix (early feedback:
+     * "they don't seem to do much"). They now add their own alpha modulation on
      * top of the mix, scaled with the strength slider, so the endpoints are
      * unmistakable and 0 still means off. */
     p.fspread = p.spread * 13 * sp->fibre / 10 / 100;   /* up to +1.3x spread */
@@ -417,8 +417,8 @@ static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
     /* fs scales ALL noise frequencies at once: the 8px preview grid samples
      * a coarser paper (same character, 8x larger features) instead of
      * aliasing fine grain into a flat smear - the old preview made grain
-     * changes look dead until the full refine landed (captain: "grain lags
-     * behind"). */
+     * changes look dead until the full refine landed (user feedback: "grain
+     * lags behind"). */
     float u = (float)x / p->fs, v = (float)y / p->fs;
     float grain = fbm(u / (float)p->s.grain, v / (float)p->s.grain, p->pg);
     float fibre = fbm(u / 2.f, v / 12.f, p->pf);
@@ -719,8 +719,8 @@ static void SyncOverlays(void) {
  * (Live2D mascots, computer-use overlays) re-assert WS_EX_TOPMOST
  * themselves and end up ABOVE the veil. A periodic
  * SetWindowPos(HWND_TOPMOST) re-claims the top of the topmost band; when
- * the order is already correct the call is a no-op. The captain wants the
- * whole screen textured, so the veil never withdraws - not even where the
+ * the order is already correct the call is a no-op. The whole screen is
+ * supposed to stay textured, so the veil never withdraws - not even where the
  * taskbar reveals. */
 #define TB_MAX 4
 static RECT g_tb[TB_MAX];
@@ -758,8 +758,8 @@ static void CollectTaskbars(void) {
 }
 
 static HWND g_dlg;   /* settings window, declared below */
-/* Hover tooltips RETIRED 2026-09-30 (captain: "the information window is
- * bad"): hover popups replaced by a ? button that opens a help window only
+/* Hover tooltips RETIRED 2026-09-30 (user feedback: "the information window
+ * is bad"): hover popups replaced by a ? button that opens a help window only
  * when pressed. The comctl32 tooltip had crashed; the own tip popup worked
  * but popped unprompted while dragging. */
 
@@ -803,7 +803,7 @@ static void ComputeHoles(void) {
          * missing: the shell never clears WS_EX_TOPMOST on park, so after
          * the first cycle the bit is permanently set and a bit-gated raise
          * never fires again - the taskbar then re-reveals at its parked
-         * rank, BEHIND our topmost strips (captain-visible sinking a few
+         * rank, BEHIND our topmost strips (sank a few
          * minutes after launch). SetWindowPos(HWND_TOPMOST) is idempotent
          * and lifts the window to the top of the topmost band; repeated
          * raises while revealed are harmless and we still never demote. */
@@ -1974,8 +1974,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
-        /* "?" circle: explanations open only when pressed (captain asked to
-         * replace the hover popups). Owner-drawn round button, id 116. */
+        /* "?" circle: explanations open only when pressed. Owner-drawn
+         * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);

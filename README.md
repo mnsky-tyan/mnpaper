@@ -55,16 +55,7 @@ rc /nologo mnPaper.rc
 cl /nologo /O2 /W3 mnPaper.c mnPaper.res /FemnPaper.exe
 ```
 
-The build produces `mnPaper.exe` in the repo root. To also run the hidden
-regression suite (windowless, never injects input, uses an isolated
-registry hive - safe to run while working):
-
-```bat
-cl /nologo /O2 /W3 tests\slider_latency.c /Feslider_latency.exe
-slider_latency.exe        REM exit 0 and "RESULT 0 failure(s)" = pass
-```
-
-See `tests/README.md` for what the suite covers.
+The build produces `mnPaper.exe` in the repo root.
 
 ## Known limitations
 
