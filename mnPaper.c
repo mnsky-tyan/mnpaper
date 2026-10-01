@@ -81,6 +81,7 @@
 #define DEBOUNCE_MS     400     /* trailing registry save only; the live
                                  * preview itself applies immediately */
 #define WM_APP_UPDATE   (WM_APP + 5)   /* update-check thread -> host window */
+#define WM_APP_INSTALL  (WM_APP + 6)   /* self-update worker thread -> host window */
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
@@ -1947,36 +1948,171 @@ static void UpdBalloon(const WCHAR *ver) {
  * overwritten but it CAN be renamed: current -> .old, new -> current, and
  * the .old is swept on the next start. The fresh process must not race our
  * single-instance mutex, so it is started by a short cmd chain after we are
- * gone. Settings live in the registry and are untouched by any of this. */
-static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
-    WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8];
+ * gone. Settings live in the registry and are untouched by any of this.
+ * The download and the hash can take minutes on a throttled link, so they
+ * run on the host's worker thread exactly like the update check: the same
+ * busy flag keeps one network operation at a time, and the outcome arrives
+ * as WM_APP_INSTALL. The swap is two local renames - fast - so it stays on
+ * the host thread together with every dialog and the relaunch. */
+#define UPD_DL_NET      0   /* fetch failed: offline or the release is gone   */
+#define UPD_DL_MISMATCH 1   /* fetched, but not the published fingerprint     */
+#define UPD_DL_OK       2   /* fetched and verified: install it               */
+
+typedef struct {
+    int result;
+    unsigned char *buf;      /* the verified bytes; freed by InstallResult */
+    DWORD len;
+    WCHAR hash[65];          /* the pin this download was checked against   */
+} InstInfo;
+
+static DWORD WINAPI SelfUpdateThread(LPVOID param);
+
+static void StartSelfUpdate(const WCHAR *hash_hex) {
+    HANDLE t;
+    InstInfo *in;
+    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
+        return;   /* a check, or another install, is already running */
+    in = (InstInfo *)calloc(1, sizeof *in);
+    if (!in) {
+        InterlockedExchange(&g_update_busy, 0);
+        return;
+    }
+    lstrcpynW(in->hash, hash_hex, 65);
+    t = CreateThread(NULL, 0, SelfUpdateThread, in, 0, NULL);
+    if (!t) {
+        free(in);
+        InterlockedExchange(&g_update_busy, 0);
+        return;
+    }
+    CloseHandle(t);   /* the busy flag clears in the thread */
+}
+
+static DWORD WINAPI SelfUpdateThread(LPVOID param) {
+    InstInfo *in = (InstInfo *)param;
     unsigned char *buf = NULL;
     DWORD len = 0;
     WCHAR hex[65];
-    HANDLE f;
+    int result = UPD_DL_NET;
+    if (HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len)) {
+        if (len >= 65536 && Sha256Hex(buf, len, hex) &&
+            !_wcsnicmp(hex, in->hash, 64)) {
+            in->buf = buf;   /* handed to the host thread */
+            buf = NULL;      /* from here on the payload owns these bytes */
+            in->len = len;
+            result = UPD_DL_OK;
+        } else {
+            result = UPD_DL_MISMATCH;   /* discarded whole: nothing is written */
+        }
+    }
+    free(buf);
+    in->result = result;
+    PostMessageW(g_host, WM_APP_INSTALL, 0, (LPARAM)in);
+    InterlockedExchange(&g_update_busy, 0);
+    return 0;
+}
+
+/* A path that has to live inside a batch file, or on a cmd command line,
+ * must round-trip through the active code page: the file holds ANSI bytes
+ * and an unrepresentable character is silently written as '?'. */
+static int BatchSafePath(const WCHAR *p) {
+    char a[2 * MAX_PATH + 2];
+    WCHAR back[MAX_PATH + 2];
+    int n = WideCharToMultiByte(CP_ACP, 0, p, -1, a, sizeof a, NULL, NULL);
+    int m;
+    if (n <= 1) return 0;
+    m = MultiByteToWideChar(CP_ACP, 0, a, n - 1, back, MAX_PATH + 1);
+    if (m <= 0) return 0;
+    back[m] = 0;   /* an explicit-length conversion is not required to terminate */
+    return wcscmp(p, back) == 0;
+}
+
+/* Writes the temporary .cmd that starts the new exe once we are gone, and
+ * launches it after a short delay. The install path enters the batch file
+ * through its short (8.3) name, which is ASCII, so the path is data inside
+ * a file instead of a command line to parse. Returns 0 when the chain
+ * cannot be built safely. */
+static int RelaunchAfterSwap(const WCHAR *exe) {
+    WCHAR exe8[MAX_PATH], tdir[MAX_PATH], cmdf[MAX_PATH + 32], cmd8[MAX_PATH + 32];
+    WCHAR line[2 * MAX_PATH + 8], cmd[2 * MAX_PATH + 64];
+    char ansi[2 * MAX_PATH + 8];
+    int i, j = 0, n;
+    DWORD wrote;
+    HANDLE sf;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
-    if (!HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len)) {
-        MessageBoxW(owner,
-            L"The download failed (offline, or the release is not reachable).\n"
-            L"Nothing was changed. You can try again later or download manually from the releases page.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
-        return;
+    if (!GetShortPathNameW(exe, exe8, MAX_PATH) || !exe8[0] ||
+        !BatchSafePath(exe8))
+        return 0;
+    if (!GetTempPathW(MAX_PATH, tdir) || !tdir[0]) return 0;
+    _snwprintf(cmdf, MAX_PATH + 32, L"%smnpaper-upd.cmd", tdir);
+    line[j++] = L'@'; line[j++] = L'"';
+    for (i = 0; exe8[i] && j < 2 * MAX_PATH; i++) {
+        line[j++] = exe8[i];
+        if (exe8[i] == L'%') line[j++] = L'%';   /* % is special in a .cmd */
     }
-    if (len < 65536 || len > UPDATE_MAX_BYTES || !Sha256Hex(buf, len, hex) ||
-        _wcsnicmp(hex, hash_hex, 64)) {
-        free(buf);
+    line[j++] = L'"'; line[j++] = L'\r'; line[j++] = L'\n'; line[j] = 0;
+    n = WideCharToMultiByte(CP_ACP, 0, line, -1, ansi, sizeof ansi, NULL, NULL);
+    if (n <= 0) return 0;
+    sf = CreateFileW(cmdf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+    if (sf == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(sf, ansi, (DWORD)n - 1, &wrote, NULL)) {
+        CloseHandle(sf);
+        return 0;
+    }
+    CloseHandle(sf);
+    if (!GetShortPathNameW(cmdf, cmd8, MAX_PATH + 32) || !cmd8[0] ||
+        !BatchSafePath(cmd8))
+        return 0;
+    ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+    ZeroMemory(&pi, sizeof pi);
+    _snwprintf(cmd, 2 * MAX_PATH + 64, L"/c ping -n 3 127.0.0.1 >nul & \"%s\"", cmd8);
+    if (!CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
+}
+
+/* Runs on the host thread: every dialog, the write, the swap and the
+ * relaunch. Neither rename can fail for the running process (it may rename
+ * its own image), but a failure must never leave the user with no exe at
+ * all, and never destroy the only verified copy on disk. */
+static void InstallResult(InstInfo *in) {
+    WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8];
+    unsigned char *buf;
+    DWORD len, wrote;
+    HANDLE f;
+    HWND owner = (g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL;
+    if (!in) return;
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (in->result == UPD_DL_MISMATCH) {
+        free(in->buf);
+        free(in);
         MessageBoxW(owner,
             L"The downloaded file does not match the published fingerprint.\n"
             L"It was discarded and nothing was changed.",
             L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
         return;
     }
+    if (in->result != UPD_DL_OK) {
+        free(in->buf);
+        free(in);
+        MessageBoxW(owner,
+            L"The download failed (offline, or the release is not reachable).\n"
+            L"Nothing was changed. You can try again later or download manually from the releases page.",
+            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    buf = in->buf;
+    len = in->len;
+    free(in);
     lstrcpyW(newf, exe); lstrcpyW(newf + lstrlenW(newf), L".new");
-    f = CreateFileW(newf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE ||
-        !WriteFile(f, buf, len, &len, NULL)) {
+    f = CreateFileW(newf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE || !WriteFile(f, buf, len, &wrote, NULL) ||
+        wrote != len) {
         if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
         DeleteFileW(newf);
         free(buf);
@@ -1999,7 +2135,16 @@ static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
         return;
     }
     if (!MoveFileExW(newf, exe, MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* undo the swap */
+        if (!MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING)) {
+            /* the undo failed as well: .new is the only verified copy */
+            MessageBoxW(owner,
+                L"The update could not be applied, and the previous exe could not be "
+                L"restored either.\nThe new version is saved as mnPaper.exe.new next to "
+                L"mnPaper.exe - close mnPaper and rename it over mnPaper.exe, or "
+                L"download manually from the releases page.",
+                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+            return;
+        }
         DeleteFileW(newf);
         MessageBoxW(owner,
             L"The update could not be applied (the exe is locked). Nothing was changed - "
@@ -2007,55 +2152,11 @@ static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
             L"mnPaper - update", MB_OK | MB_ICONWARNING);
         return;
     }
-    /* The fresh process must not race our single-instance mutex, so it is
-     * started by a short delay after we are gone. The command is a temporary
-     * .cmd whose single line is the quoted exe path: the install path is then
-     * data inside a file, never part of a command line to parse. If it cannot
-     * be launched the user is told to start mnPaper by hand - the swap already
-     * succeeded, and relaunching straight from here would race the mutex. */
-    {
-        WCHAR tdir[MAX_PATH], cmdf[MAX_PATH + 32], cmd[2 * MAX_PATH + 64];
-        WCHAR line[2 * MAX_PATH + 8];
-        char ansi[2 * MAX_PATH + 8];
-        int i, j = 0, n, started = 0;
-        DWORD wrote;
-        HANDLE sf;
-        if (GetTempPathW(MAX_PATH, tdir) && tdir[0]) {
-            _snwprintf(cmdf, MAX_PATH + 32, L"%smnpaper-upd.cmd", tdir);
-            line[j++] = L'@'; line[j++] = L'"';
-            for (i = 0; exe[i] && j < 2 * MAX_PATH; i++) {
-                line[j++] = exe[i];
-                if (exe[i] == L'%') line[j++] = L'%';   /* % is special in a .cmd */
-            }
-            line[j++] = L'"'; line[j++] = L'\r'; line[j++] = L'\n'; line[j] = 0;
-            n = WideCharToMultiByte(CP_ACP, 0, line, -1, ansi, sizeof ansi, NULL, NULL);
-            if (n > 0) {
-                sf = CreateFileW(cmdf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                 FILE_ATTRIBUTE_NORMAL, NULL);
-                if (sf != INVALID_HANDLE_VALUE) {
-                    if (WriteFile(sf, ansi, (DWORD)n - 1, &wrote, NULL)) {
-                        ZeroMemory(&si, sizeof si); si.cb = sizeof si;
-                        ZeroMemory(&pi, sizeof pi);
-                        _snwprintf(cmd, 2 * MAX_PATH + 64,
-                                   L"/c ping -n 3 127.0.0.1 >nul & \"%s\"", cmdf);
-                        started = CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd,
-                                                 NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                                                 NULL, NULL, &si, &pi);
-                        if (started) {
-                            CloseHandle(pi.hThread);
-                            CloseHandle(pi.hProcess);
-                        }
-                    }
-                    CloseHandle(sf);
-                }
-            }
-        }
-        if (!started)
-            MessageBoxW(owner,
-                L"The update is installed, but mnPaper could not start itself again.\n"
-                L"Please start mnPaper from your shortcut or the Start menu.",
-                L"mnPaper - update", MB_OK | MB_ICONWARNING);
-    }
+    if (!RelaunchAfterSwap(exe))
+        MessageBoxW(owner,
+            L"The update is installed, but mnPaper could not start itself again.\n"
+            L"Please start mnPaper from your shortcut or the Start menu.",
+            L"mnPaper - update", MB_OK | MB_ICONWARNING);
     L("self-update: swapped and relaunching");
     if (g_dlg && IsWindow(g_dlg)) DestroyWindow(g_dlg);
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
@@ -2080,7 +2181,7 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
                     L"restarts into the new version.", u->ver);
                 if (MessageBoxW(dlg, msg, L"mnPaper - update available",
                                 MB_YESNO | MB_ICONINFORMATION) == IDYES)
-                    DoSelfUpdate(u->hash, dlg);
+                    StartSelfUpdate(u->hash);
             } else {
                 WCHAR msg[160];
                 _snwprintf(msg, 160,
@@ -2600,6 +2701,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_UPDATE:
         UpdateResult(g_dlg, (int)wp, (UpdInfo *)lp);   /* may outlive the dialog that asked */
+        return 0;
+    case WM_APP_INSTALL:
+        InstallResult((InstInfo *)lp);   /* may outlive the prompt that asked */
         return 0;
     case WM_APP_PAPER:
         ApplyPaperResult((PaperDone *)lp);
