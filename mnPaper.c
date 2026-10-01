@@ -757,6 +757,65 @@ static int  g_ntb;
 static int  g_tb_state[TB_MAX];   /* 0 unknown, 1 parked, 2 revealed */
 static int  g_housekeep_n;  /* (reserved for slow tick work) */
 
+/* Pills-only hole: on Windows 11 the taskbar WINDOW is a full-width strip
+ * while it only DRAWS three floating surfaces (Start button, icon pill,
+ * tray pill). Holing the full window rect wipes the paper off the whole
+ * bottom band and makes the empty gaps read as a dead strip. Union the
+ * visible child surfaces instead - verified live: the children carry real
+ * rects (Start, ReBarWindow32 icon area, TrayNotifyWnd tray pill) - and
+ * hole only that union (+6px margin), clipped to the band. If the children
+ * do not add up (older shells, future changes), fall back to the full
+ * band: holing more than needed is safe, holing less is not. */
+typedef struct { const WCHAR *want; RECT u; int have; } PillScan;
+
+static BOOL CALLBACK PillEnumProc(HWND hwnd, LPARAM lp) {
+    PillScan *s = (PillScan *)lp;
+    WCHAR cls[64];
+    RECT r;
+    GetClassNameW(hwnd, cls, 64);
+    if (lstrcmpW(cls, s->want) != 0) return TRUE;
+    if (!GetWindowRect(hwnd, &r)) return TRUE;
+    if (r.right <= r.left || r.bottom <= r.top) return TRUE;
+    if (!s->have) { s->u = r; s->have = 1; }
+    else {
+        if (r.left   < s->u.left)   s->u.left   = r.left;
+        if (r.top    < s->u.top)    s->u.top    = r.top;
+        if (r.right  > s->u.right)  s->u.right  = r.right;
+        if (r.bottom > s->u.bottom) s->u.bottom = r.bottom;
+    }
+    return TRUE;
+}
+
+static void RefinePillHole(HWND taskbar, RECT *hole) {
+    static const WCHAR *const pills[] = { L"Start", L"ReBarWindow32", L"TrayNotifyWnd" };
+    RECT u;
+    int have = 0, k;
+    const LONG m = 6;
+    u.left = u.right = u.top = u.bottom = 0;
+    for (k = 0; k < 3; k++) {
+        PillScan ps;
+        ps.want = pills[k];
+        ps.u.left = ps.u.right = ps.u.top = ps.u.bottom = 0;
+        ps.have = 0;
+        EnumChildWindows(taskbar, PillEnumProc, (LPARAM)&ps);
+        if (!ps.have) continue;
+        if (!have) { u = ps.u; have = 1; }
+        else {
+            if (ps.u.left   < u.left)   u.left   = ps.u.left;
+            if (ps.u.top    < u.top)    u.top    = ps.u.top;
+            if (ps.u.right  > u.right)  u.right  = ps.u.right;
+            if (ps.u.bottom > u.bottom) u.bottom = ps.u.bottom;
+        }
+    }
+    if (!have) return;                       /* keep the full band */
+    u.left -= m; u.top -= m; u.right += m; u.bottom += m;
+    if (u.left   < hole->left)   u.left   = hole->left;
+    if (u.top    < hole->top)    u.top    = hole->top;
+    if (u.right  > hole->right)  u.right  = hole->right;
+    if (u.bottom > hole->bottom) u.bottom = hole->bottom;
+    if (u.right > u.left && u.bottom > u.top) *hole = u;
+}
+
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     WCHAR cls[64];
     RECT r;
@@ -767,6 +826,7 @@ static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     if (!GetWindowRect(hwnd, &r)) return TRUE;
     if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
     g_tb[g_ntb] = r;
+    RefinePillHole(hwnd, &g_tb[g_ntb]);   /* hole the pills, keep the paper on the gaps */
     g_tbw[g_ntb] = hwnd;
     g_ntb++;
     return TRUE;
