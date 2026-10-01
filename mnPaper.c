@@ -2519,26 +2519,26 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 284, 352, 20, hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* daily self-check opt-out; the download itself is always manual */
         CreateWindowExW(0, L"BUTTON", L"Check for updates automatically (about once a day)",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 306, 352, 20, hwnd, (HMENU)120,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
                      g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 328, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 338, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"&Close",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 328, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 338, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 352, 160, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 364, 160, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2669,7 +2669,7 @@ static void OpenSettings(void) {
     wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     g_advanced = 0;
-    rc.left = 0; rc.top = 0; rc.right = 380; rc.bottom = 380;
+    rc.left = 0; rc.top = 0; rc.right = 402; rc.bottom = 402;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     g_dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, SET_CLASS,
         L"mnPaper settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
