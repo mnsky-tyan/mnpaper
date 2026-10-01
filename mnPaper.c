@@ -87,9 +87,9 @@
  * out, so a hostile or offline feed can at worst show a wrong message. */
 #define MNVER_MAJOR 2
 #define MNVER_MINOR 7
-#define MNVER_PATCH 0
-#define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-app/mnpaper/main/version.txt"
-#define PRODUCT_URL L"https://github.com/mnsky-app/mnpaper/releases"
+#define MNVER_PATCH 1
+#define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-tyan/mnpaper/main/version.txt"
+#define PRODUCT_URL L"https://github.com/mnsky-tyan/mnpaper/releases"
 
 #define MODE_PAPER 0
 #define MODE_EINK  1
@@ -1983,7 +1983,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* link-out update check: compares version numbers, offers the page */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 344, 110, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 344, 160, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
