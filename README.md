@@ -1,8 +1,10 @@
 # mnPaper
 
-A soft, generated paper texture that settles over your whole screen - like
-working on paper instead of glass. mnPaper is a single portable Windows
-executable: no installer, no account, no telemetry.
+A soft, generated paper texture that settles over your whole screen.
+currently windows only. local and free.
+example image 1
+example image 2
+the expected usage of ram: cpu: gpu: in e-ink/paper mode
 
 ## What it does
 
