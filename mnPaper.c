@@ -162,6 +162,7 @@ static const WCHAR *REG_KEY = L"Software\\mnPaper";
  * it into its isolated scratch hive; production always keeps the default. */
 static WCHAR g_run_key[160] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static ULONGLONG g_lastupd;          /* FILETIME of the last completed update check */
+static int g_upd_fails;              /* consecutive checks that could not read the feed */
 
 static FILE *g_log;
 static void L(const char *fmt, ...) {
@@ -225,7 +226,8 @@ static void SaveSettings(void) {
     RegSetValueExW(k, L"autostart", 0, REG_DWORD, (BYTE *)&g_s.autostart, sizeof(int));
     RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
     RegSetValueExW(k, L"autoupd",   0, REG_DWORD, (BYTE *)&g_s.autoupd,   sizeof(int));
-    RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,     sizeof(g_lastupd));
+    RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,    sizeof(g_lastupd));
+    RegSetValueExW(k, L"updfails",  0, REG_DWORD, (BYTE *)&g_upd_fails,  sizeof(g_upd_fails));
     RegCloseKey(k);
     ApplyAutostart();
 }
@@ -258,6 +260,7 @@ static void LoadSettings(void) {
             if (RegQueryValueExW(k, L"lastupd", NULL, &t, (BYTE *)&v64, &sz) == ERROR_SUCCESS && t == REG_QWORD)
                 g_lastupd = v64;
         }
+        g_upd_fails = GetDword(k, L"updfails", 0);
         RegCloseKey(k);
     }
     /* autostart mirrors the Run key so an external edit stays honest */
@@ -1943,20 +1946,43 @@ static ULONGLONG NowFT(void) {
     return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
-/* the lazy daily cadence: 24h target, 22h gate so jitter in wall time can
- * never push two checks closer than "about once a day" */
+/* the lazy daily cadence: 22h gate so jitter in wall time can never push
+ * two checks closer than "about once a day". A check that could not read
+ * the feed backs off instead of retrying every hour forever: an hour doubled
+ * per consecutive failure (so an hour, two, four ... sixteen), and the same
+ * 22h cap, because a backoff beyond a day is no backoff at all. */
 static int UpdDue(void) {
-    const ULONGLONG day = 22ULL * 3600ULL * 10000000ULL;
-    return g_lastupd == 0 || NowFT() - g_lastupd > day;
+    const ULONGLONG hour = 3600ULL * 10000000ULL, day = 22ULL * hour;
+    ULONGLONG wait = day;
+    if (g_upd_fails > 0) {
+        int f = g_upd_fails < 5 ? g_upd_fails : 5;   /* past the cap a bigger shift changes nothing */
+        wait = hour << f;
+        if (wait > day) wait = day;
+    }
+    return g_lastupd == 0 || NowFT() - g_lastupd > wait;
+}
+
+/* the stamp and the backoff belong together: a check that read the feed
+ * starts a fresh day, a check that could not doubles the wait */
+static void SaveUpdState(void) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(k, L"lastupd",  0, REG_QWORD, (BYTE *)&g_lastupd,   sizeof(g_lastupd));
+    RegSetValueExW(k, L"updfails", 0, REG_DWORD, (BYTE *)&g_upd_fails, sizeof(g_upd_fails));
+    RegCloseKey(k);
 }
 
 static void SaveLastUpdNow(void) {
-    HKEY k;
     g_lastupd = NowFT();
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
-        return;
-    RegSetValueExW(k, L"lastupd", 0, REG_QWORD, (BYTE *)&g_lastupd, sizeof(g_lastupd));
-    RegCloseKey(k);
+    g_upd_fails = 0;   /* the feed answered: the daily cadence is honest again */
+    SaveUpdState();
+}
+
+static void SaveUpdFailed(void) {
+    g_lastupd = NowFT();
+    if (g_upd_fails < 64) g_upd_fails++;   /* back off, but never grow without bound */
+    SaveUpdState();
 }
 
 static void UpdBalloon(const WCHAR *ver) {
@@ -1982,10 +2008,9 @@ static void UpdBalloon(const WCHAR *ver) {
  * the host thread together with every dialog and the relaunch. */
 #define UPD_DL_NET      0   /* fetch failed: offline or the release is gone   */
 #define UPD_DL_SHORT    1   /* fetched, but incomplete or shorter than a real exe */
-#define UPD_DL_HASHERR  2   /* fetched, but the fingerprint could not be computed */
-#define UPD_DL_MISMATCH 3   /* hashed and compared: not the published fingerprint */
-#define UPD_DL_OK       4   /* fetched and verified: install it               */
-#define UPD_DL_CAP      5   /* refused whole: the asset did not fit the cap    */
+#define UPD_DL_MISMATCH 2   /* the fingerprint could not be computed, or it is not the published one */
+#define UPD_DL_OK       3   /* fetched and verified: install it               */
+#define UPD_DL_CAP      4   /* refused whole: the asset did not fit the cap    */
 
 typedef struct {
     int result;
@@ -2030,10 +2055,8 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
     if (HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len, &too_big)) {
         if (len < 65536) {
             result = UPD_DL_SHORT;   /* a truncated body: never compared */
-        } else if (!Sha256Hex(buf, len, hex)) {
-            result = UPD_DL_HASHERR;   /* could not verify it at all */
-        } else if (_wcsnicmp(hex, in->hash, 64)) {
-            result = UPD_DL_MISMATCH;   /* hashed and compared: not the pin */
+        } else if (!Sha256Hex(buf, len, hex) || _wcsnicmp(hex, in->hash, 64)) {
+            result = UPD_DL_MISMATCH;   /* never verified, or not the published one */
         } else {
             in->buf = buf;   /* handed to the host thread */
             buf = NULL;      /* from here on the payload owns these bytes */
@@ -2143,15 +2166,6 @@ static void InstallResult(InstInfo *in) {
             L"mnPaper - update", MB_OK | MB_ICONWARNING);
         return;
     }
-    if (in->result == UPD_DL_HASHERR) {
-        free(in->buf);
-        free(in);
-        MessageBoxW(owner,
-            L"Could not compute the security fingerprint of the download.\n"
-            L"Nothing was changed.",
-            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
-        return;
-    }
     if (in->result == UPD_DL_CAP) {
         free(in->buf);
         free(in);
@@ -2233,9 +2247,12 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
     int result;
     if (dlg && !IsWindow(dlg)) dlg = NULL;
     result = u ? u->result : UPT_NONE;   /* a worker that could not answer posts no payload */
-    /* only a check that actually saw the feed consumes the daily slot */
+    /* only a check that actually saw the feed consumes the daily slot; one
+     * that could not is remembered, so the auto cadence backs off */
     if (result == UPT_SAME || result == UPT_NEW)
         SaveLastUpdNow();
+    else
+        SaveUpdFailed();
     if (result == UPT_NEW && u->ver[0]) {
         if (manual) {
             if (u->hash[0]) {
