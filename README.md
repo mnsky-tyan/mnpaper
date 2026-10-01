@@ -1,10 +1,19 @@
 # mnPaper
 
 A soft, generated paper texture that settles over your whole screen.
-currently windows only. local and free.
-example image 1
-example image 2
-the expected usage of ram: cpu: gpu: in e-ink/paper mode
+Currently Windows only. Local and free.
+
+![Paper texture over a YouTube page](assets/screenshot-youtube.png)
+
+![Editing a text file under the texture](assets/screenshot-editor.png)
+
+Expected usage: **paper mode** - about 25-50 MB of RAM, near-zero CPU when
+nothing is changing, no GPU (it draws with plain GDI, no Direct3D).
+**E-ink mode** - about 25-50 MB of RAM, near-zero CPU when nothing is
+changing, one small DirectX swapchain on the GPU.
+
+mnPaper is a single portable Windows executable: no installer, no account,
+no telemetry.
 
 ## What it does
 
@@ -103,14 +112,3 @@ See `tests/README.md` for what the suite covers.
 - E-ink mode can shimmer on content-heavy screens at low shade counts.
 - The exe is not code-signed yet: the first run may show a SmartScreen
   warning ("More info" -> "Run anyway").
-
-## Icon
-
-`mnPaper.ico` is generated from choice 7 of the captain's icon sheet
-(`assets/icon_7th_preview.png` keeps the 820px master): layered paper waves with
-rounded-corner transparency, packed at 16-256 px.
-
-## Status
-
-Version 2.7.0. Internal engineering notes live in `AGENTS.md`; historical
-screen-probing experiments are parked under `probes/`.
