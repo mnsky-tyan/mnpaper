@@ -54,10 +54,10 @@ the exe yourself (quit from the tray first).
 - No telemetry, no analytics, no accounts.
 - Outbound network is limited to updating: a version-file check about once
   a day (toggle in settings, or from the tray menu) plus whenever you press
-  **Check for updates**, and the exe download itself only when you press
-  **Update**. Downloads are fetched over HTTPS and verified against a
-  published fingerprint before anything is replaced. Everything else stays
-  on your machine.
+  **Check for updates**, and the exe download itself only happens after you
+  confirm the update prompt. Downloads are fetched over HTTPS and verified
+  against a published fingerprint before anything is replaced. Everything
+  else stays on your machine.
 - Settings live in `HKEY_CURRENT_USER\Software\mnPaper`.
 
 ## Building from source

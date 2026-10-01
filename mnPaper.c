@@ -150,7 +150,7 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0 };
+static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0, 1 };
 static int g_hotkey_failed;
 
 static const WCHAR *REG_KEY = L"Software\\mnPaper";
@@ -173,11 +173,12 @@ static void L(const char *fmt, ...) {
 static void ClampSettingsOf(SETTINGS *s) {
     int *vals[] = { &s->master, &s->mode, &s->intensity, &s->warmth,
                     &s->grain, &s->fibre, &s->blotch, &s->shades,
-                    &s->contrast, &s->dither, &s->autostart, &s->share };
-    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0 };
-    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1 };
+                    &s->contrast, &s->dither, &s->autostart, &s->share,
+                    &s->autoupd };
+    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0 };
+    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1, 1 };
     int i;
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 13; i++) {
         if (*vals[i] < mins[i]) *vals[i] = mins[i];
         if (*vals[i] > maxs[i]) *vals[i] = maxs[i];
     }
