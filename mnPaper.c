@@ -97,6 +97,7 @@
 /* self-update payload: stable redirect URL, not the rate-limited REST API */
 #define UPDATE_EXE_URL L"https://github.com/mnsky-tyan/mnpaper/releases/latest/download/mnPaper.exe"
 #define UPDATE_MAX_BYTES (8u * 1024u * 1024u)
+#define FEED_MAX_BYTES 4096   /* version.txt is two short lines; a bigger one is refused */
 
 #define MODE_PAPER 0
 #define MODE_EINK  1
@@ -1685,7 +1686,6 @@ static void OpenHelp(HWND owner) {
 
 static volatile LONG g_update_busy;   /* one check at a time */
 static int g_upd_manual;              /* does the pending check answer to a click? */
-static HWND g_chk_autoupd;
 static NOTIFYICONDATAW g_nid;
 
 /* Parse "[v] 3.2.1 ..." -> 1 on success. Rejects empty/garbage feeds. */
@@ -1728,19 +1728,29 @@ typedef struct {
     WCHAR hash[65];   /* 64 hex chars if the feed pins the exe    */
 } UpdInfo;
 
-/* Find a 64-hex-char sequence (the exe's SHA-256 pin) in the feed body. */
+/* Find a 64-hex-char sequence (the exe's SHA-256 pin) in the feed body.
+ * Only an exact run of 64 bounded by a non-hex byte is a pin; a longer run
+ * is rejected rather than read as the last 64 characters of itself. */
 static int FindHash64(const char *s, WCHAR *out) {
     const char *p = s;
     int run = 0, i;
     for (; *p; p++) {
         char c = *p;
         if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-            if (++run == 64) {
-                for (i = 0; i < 64; i++) out[i] = (WCHAR)p[i - 63];
+            if (++run > 64) return 0;
+        } else {
+            if (run == 64) {
+                for (i = 0; i < 64; i++) out[i] = (WCHAR)p[i - 64];
                 out[64] = 0;
                 return 1;
             }
-        } else run = 0;
+            run = 0;
+        }
+    }
+    if (run == 64) {
+        for (i = 0; i < 64; i++) out[i] = (WCHAR)p[i - 64];
+        out[64] = 0;
+        return 1;
     }
     return 0;
 }
@@ -1767,22 +1777,28 @@ static int Sha256Hex(const unsigned char *data, DWORD len, WCHAR *hex) {
 }
 
 /* Plain HTTPS GET of a URL into memory (TLS validation are WinHTTP defaults).
- * Returns malloc'd bytes or NULL; *out_len receives the byte count. */
-static unsigned char *DownloadToMem(const WCHAR *url, DWORD *out_len) {
+ * Reads at most max_bytes and hands the malloc'd buffer back through
+ * *out_buf with its length in *out_len; a response that does not fit is
+ * refused whole, never read past the allocation. recv_ms is the receive
+ * timeout: short for the version feed, long for the exe download. */
+static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
+                        unsigned char **out_buf, DWORD *out_len) {
     WCHAR host[256] = L"", path[512] = L"", ua[32];
     URL_COMPONENTSW uc = { sizeof(uc) };
     HINTERNET ses = NULL, con = NULL, req = NULL;
     unsigned char *buf = NULL, *nb;
     DWORD cap = 0, total = 0, got = 0, status = 0, stlen = sizeof status;
+    *out_buf = NULL;
+    *out_len = 0;
     _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
     if (!WinHttpCrackUrl(url, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
-        return NULL;
+        return 0;
     ses = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) return NULL;
-    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 30000);
+    if (!ses) return 0;
+    WinHttpSetTimeouts(ses, 5000, 5000, 5000, recv_ms);
     con = WinHttpConnect(ses, host, uc.nPort, 0);
     if (!con) goto done;
     req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
@@ -1796,92 +1812,64 @@ static unsigned char *DownloadToMem(const WCHAR *url, DWORD *out_len) {
                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &stlen,
                              WINHTTP_NO_HEADER_INDEX) || status != 200)
         goto done;
-    while (total < UPDATE_MAX_BYTES) {
+    while (total < max_bytes) {
         if (!WinHttpQueryDataAvailable(req, &got) || !got) break;
+        if (got > max_bytes - total) goto done;   /* too large: refuse it whole */
         if (total + got > cap) {
             cap = total + got;
             if (cap < 262144) cap = 262144;
-            if (cap > UPDATE_MAX_BYTES) cap = UPDATE_MAX_BYTES;
             nb = (unsigned char *)realloc(buf, cap);
-            if (!nb) { free(buf); buf = NULL; goto done; }
+            if (!nb) goto done;
             buf = nb;
         }
-        if (!WinHttpReadData(req, buf + total, got, &got)) { free(buf); buf = NULL; goto done; }
+        if (!WinHttpReadData(req, buf + total, got, &got)) goto done;
         total += got;
     }
-    if (buf && total) *out_len = total; else { free(buf); buf = NULL; }
+    if (buf && total) {
+        *out_buf = buf;
+        *out_len = total;
+        buf = NULL;
+    }
 done:
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
     if (ses) WinHttpCloseHandle(ses);
-    return buf;
+    free(buf);
+    return *out_buf != NULL;
 }
 
 /* Worker thread: HTTPS GET of UPDATE_URL (TLS + hostname validation are
  * WinHTTP defaults - no ignored-certification flags anywhere). Reads at most
- * 4 KB, compares numbers and posts a WM_APP_UPDATE to the host window, which
- * lives for the whole process: the settings dialog that started the check can
- * be closed (and its handle recycled) long before the answer arrives. It
- * NEVER navigates to anything from the feed - the result opens the built-in
- * PRODUCT_URL only. No user data leaves the machine (the request is a bare
- * GET with a product user-agent). */
+ * FEED_MAX_BYTES, compares numbers and posts a WM_APP_UPDATE to the host
+ * window, which lives for the whole process: the settings dialog that started
+ * the check can be closed (and its handle recycled) long before the answer
+ * arrives. It NEVER navigates to anything from the feed - the result opens the
+ * built-in PRODUCT_URL only. No user data leaves the machine (the request is
+ * a bare GET with a product user-agent). */
 static DWORD WINAPI UpdateCheckThread(LPVOID param) {
     (void)param;   /* the host window receives the result, not the caller */
-    WCHAR host[256] = L"", path[512] = L"", ua[32];
-    URL_COMPONENTSW uc = { sizeof(uc) };
-    HINTERNET ses = NULL, con = NULL, req = NULL;
     int result = UPT_NONE;
     UpdInfo *u = (UpdInfo *)calloc(1, sizeof *u);
+    unsigned char *body = NULL;
+    DWORD len = 0;
     int manual = g_upd_manual;
-    _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
-    uc.lpszHostName = host; uc.dwHostNameLength = 256;
-    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
-    if (!WinHttpCrackUrl(UPDATE_URL, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
-        goto done;
-    ses = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) goto done;
-    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 10000);
-    con = WinHttpConnect(ses, host, uc.nPort, 0);
-    if (!con) goto done;
-    req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
-                             WINHTTP_DEFAULT_ACCEPT_TYPES,
-                             WINHTTP_FLAG_SECURE);
-    if (!req) goto done;
-    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(req, NULL))
-        goto done;
-    {
-        char body[4097];
-        DWORD got = 0, total = 0, status = 0, stlen = sizeof status;
-        if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &stlen,
-                                 WINHTTP_NO_HEADER_INDEX) || status != 200)
-            goto done;
-        while (total < 4096 &&
-               WinHttpQueryDataAvailable(req, &got) && got &&
-               WinHttpReadData(req, body + total, 4096 - total, &got))
-            total += got;
-        body[total < 4096 ? total : 4096] = 0;
-        {
-            int ma, mi, pa;
-            if (!ParseVersionTriple(body, &ma, &mi, &pa)) {
-                result = UPT_MALFORMED;   /* answered, but stated no version */
-            } else if (CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR,
-                                      MNVER_PATCH) > 0) {
-                result = UPT_NEW;
-                _snwprintf(u->ver, 24, L"%d.%d.%d", ma, mi, pa);
-                FindHash64(body, u->hash);   /* optional pin; empty = no self-update */
-            } else {
-                result = UPT_SAME;        /* same or older: already current */
-            }
+    if (u && HttpGetToMem(UPDATE_URL, FEED_MAX_BYTES, 10000, &body, &len)) {
+        char text[FEED_MAX_BYTES + 1];
+        int ma, mi, pa;
+        memcpy(text, body, len);   /* the helper hands back at most the cap */
+        text[len] = 0;
+        free(body);
+        if (!ParseVersionTriple(text, &ma, &mi, &pa)) {
+            result = UPT_MALFORMED;   /* answered, but stated no version */
+        } else if (CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR,
+                                  MNVER_PATCH) > 0) {
+            result = UPT_NEW;
+            _snwprintf(u->ver, 24, L"%d.%d.%d", ma, mi, pa);
+            FindHash64(text, u->hash);   /* optional pin; empty = no self-update */
+        } else {
+            result = UPT_SAME;        /* same or older: already current */
         }
     }
-done:
-    if (req) WinHttpCloseHandle(req);
-    if (con) WinHttpCloseHandle(con);
-    if (ses) WinHttpCloseHandle(ses);
     if (!u) {
         InterlockedExchange(&g_update_busy, 0);
         return 0;
@@ -1898,8 +1886,13 @@ static int UpdDue(void);   /* defined below, before first use in the thread path
 static void StartUpdateCheck(int manual) {
     HANDLE t;
     static DWORD last_manual_tick;
+    static int seeded;
     if (manual) {
         DWORD now = GetTickCount();
+        if (!seeded) {   /* arm the debounce so the first real click is never dropped */
+            last_manual_tick = now - 60000;
+            seeded = 1;
+        }
         if (now - last_manual_tick < 5000) return;   /* double-click debounce */
         last_manual_tick = now;
     } else {
@@ -1956,16 +1949,15 @@ static void UpdBalloon(const WCHAR *ver) {
  * single-instance mutex, so it is started by a short cmd chain after we are
  * gone. Settings live in the registry and are untouched by any of this. */
 static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
-    WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8], cmd[MAX_PATH + 160];
-    unsigned char *buf;
+    WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8];
+    unsigned char *buf = NULL;
     DWORD len = 0;
     WCHAR hex[65];
     HANDLE f;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     GetModuleFileNameW(NULL, exe, MAX_PATH);
-    buf = DownloadToMem(UPDATE_EXE_URL, &len);
-    if (!buf) {
+    if (!HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len)) {
         MessageBoxW(owner,
             L"The download failed (offline, or the release is not reachable).\n"
             L"Nothing was changed. You can try again later or download manually from the releases page.",
@@ -1997,9 +1989,17 @@ static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     MessageBoxW(owner, L"Update verified. mnPaper will restart now.",
                 L"mnPaper - update", MB_OK | MB_ICONINFORMATION);
     lstrcpyW(old, exe); lstrcpyW(old + lstrlenW(old), L".old");
-    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING) ||
-        !MoveFileExW(newf, exe, MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* roll back */
+    DeleteFileW(old);   /* best effort: a leftover must never be renamed back */
+    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(newf);   /* nothing moved: the running exe is untouched */
+        MessageBoxW(owner,
+            L"The update could not be applied (the exe is locked). Nothing was changed - "
+            L"try again in a moment, or download manually from the releases page.",
+            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (!MoveFileExW(newf, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* undo the swap */
         DeleteFileW(newf);
         MessageBoxW(owner,
             L"The update could not be applied (the exe is locked). Nothing was changed - "
@@ -2007,16 +2007,55 @@ static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
             L"mnPaper - update", MB_OK | MB_ICONWARNING);
         return;
     }
-    ZeroMemory(&si, sizeof si); si.cb = sizeof si;
-    ZeroMemory(&pi, sizeof pi);
-    _snwprintf(cmd, MAX_PATH + 160,
-        L"/c ping -n 3 127.0.0.1 >nul & start \"\" \"%s\"", exe);
-    if (!CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CreateProcessW(exe, exe, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);   /* best effort */
+    /* The fresh process must not race our single-instance mutex, so it is
+     * started by a short delay after we are gone. The command is a temporary
+     * .cmd whose single line is the quoted exe path: the install path is then
+     * data inside a file, never part of a command line to parse. If it cannot
+     * be launched the user is told to start mnPaper by hand - the swap already
+     * succeeded, and relaunching straight from here would race the mutex. */
+    {
+        WCHAR tdir[MAX_PATH], cmdf[MAX_PATH + 32], cmd[2 * MAX_PATH + 64];
+        WCHAR line[2 * MAX_PATH + 8];
+        char ansi[2 * MAX_PATH + 8];
+        int i, j = 0, n, started = 0;
+        DWORD wrote;
+        HANDLE sf;
+        if (GetTempPathW(MAX_PATH, tdir) && tdir[0]) {
+            _snwprintf(cmdf, MAX_PATH + 32, L"%smnpaper-upd.cmd", tdir);
+            line[j++] = L'@'; line[j++] = L'"';
+            for (i = 0; exe[i] && j < 2 * MAX_PATH; i++) {
+                line[j++] = exe[i];
+                if (exe[i] == L'%') line[j++] = L'%';   /* % is special in a .cmd */
+            }
+            line[j++] = L'"'; line[j++] = L'\r'; line[j++] = L'\n'; line[j] = 0;
+            n = WideCharToMultiByte(CP_ACP, 0, line, -1, ansi, sizeof ansi, NULL, NULL);
+            if (n > 0) {
+                sf = CreateFileW(cmdf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+                if (sf != INVALID_HANDLE_VALUE) {
+                    if (WriteFile(sf, ansi, (DWORD)n - 1, &wrote, NULL)) {
+                        ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+                        ZeroMemory(&pi, sizeof pi);
+                        _snwprintf(cmd, 2 * MAX_PATH + 64,
+                                   L"/c ping -n 3 127.0.0.1 >nul & \"%s\"", cmdf);
+                        started = CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd,
+                                                 NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                                                 NULL, NULL, &si, &pi);
+                        if (started) {
+                            CloseHandle(pi.hThread);
+                            CloseHandle(pi.hProcess);
+                        }
+                    }
+                    CloseHandle(sf);
+                }
+            }
+        }
+        if (!started)
+            MessageBoxW(owner,
+                L"The update is installed, but mnPaper could not start itself again.\n"
+                L"Please start mnPaper from your shortcut or the Start menu.",
+                L"mnPaper - update", MB_OK | MB_ICONWARNING);
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     L("self-update: swapped and relaunching");
     if (g_dlg && IsWindow(g_dlg)) DestroyWindow(g_dlg);
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
@@ -2027,7 +2066,9 @@ static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
 static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
     int open = 0;
     if (dlg && !IsWindow(dlg)) dlg = NULL;
-    SaveLastUpdNow();   /* any completed check pushes the next auto check a day out */
+    /* only a check that actually saw the feed consumes the daily slot */
+    if (u->result == UPT_SAME || u->result == UPT_NEW)
+        SaveLastUpdNow();
     if (u->result == UPT_NEW && u->ver[0]) {
         if (manual) {
             if (u->hash[0]) {
@@ -2294,11 +2335,6 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
-        if (wp == TIMER_UPD) {
-            KillTimer(hwnd, TIMER_UPD);
-            /* the lazy daily check: 30s after start so launch never waits on it */
-            StartUpdateCheck(0);
-        }
         if (wp == TIMER_DEBOUNCE) {
             KillTimer(hwnd, TIMER_DEBOUNCE);
             ReadBarsToSettings();
@@ -2534,7 +2570,11 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         return 0;
     case WM_TIMER:
-        if (wp == 3) {
+        if (wp == TIMER_UPD) {
+            KillTimer(hwnd, TIMER_UPD);
+            /* the lazy daily check: 30s after start so launch never waits on it */
+            StartUpdateCheck(0);
+        } else if (wp == 3) {
             KillTimer(hwnd, 3);
             SelfCheck();
         } else if (wp == TIMER_TICK) {
@@ -2884,6 +2924,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         L("hotkey registration failed (another app owns it?)");
 
     SetTimer(g_host, TIMER_TICK, TICK_MS, NULL);
+    /* the daily update check: the host window lives for the whole process, the
+     * settings dialog does not */
+    SetTimer(g_host, TIMER_UPD, 30000, NULL);
     if (g_selfcheck)
         SetTimer(g_host, 3, 1500, NULL);
 
