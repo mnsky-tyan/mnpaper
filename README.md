@@ -40,9 +40,24 @@ Uninstall: quit from the tray and delete the exe. (Settings live in
 `HKEY_CURRENT_USER\Software\mnPaper`; delete that key too if you want a
 completely clean removal.)
 
+Updating: mnPaper reads a tiny version file about once a day (you can turn
+that off) and tells you in the tray when a new release exists. The
+**Check for updates** button then offers a one-click update: it downloads
+the new exe, verifies it against a published SHA-256 fingerprint, swaps it
+in place of the old one and restarts. Your settings are kept. If anything
+fails, nothing is changed - you can always download manually from the
+[Releases page](https://github.com/mnsky-tyan/mnpaper/releases) and replace
+the exe yourself (quit from the tray first).
+
 ## Privacy
 
 - No telemetry, no analytics, no accounts.
+- Outbound network is limited to updating: a version-file check about once
+  a day (toggle in settings, or from the tray menu) plus whenever you press
+  **Check for updates**, and the exe download itself only happens after you
+  confirm the update prompt. Downloads are fetched over HTTPS and verified
+  against a published fingerprint before anything is replaced. Everything
+  else stays on your machine.
 - Settings live in `HKEY_CURRENT_USER\Software\mnPaper`.
 
 ## Building from source
