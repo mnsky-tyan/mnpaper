@@ -76,7 +76,7 @@
 #define IDM_EXIT        9006
 #define TIMER_TICK      1
 #define TIMER_DEBOUNCE  2
-#define TIMER_UPD       4   /* one-shot: first automatic update check, 30s after start */
+#define TIMER_UPD       4   /* daily update check: 30s in, then hourly so UpdDue gates the fetch */
 #define TICK_MS         50
 #define DEBOUNCE_MS     400     /* trailing registry save only; the live
                                  * preview itself applies immediately */
@@ -2684,8 +2684,8 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == TIMER_UPD) {
-            KillTimer(hwnd, TIMER_UPD);
-            /* the lazy daily check: 30s after start so launch never waits on it */
+            /* hourly wakeup: UpdDue's 22h stamp decides if this one fetches */
+            SetTimer(hwnd, TIMER_UPD, 3600000, NULL);
             StartUpdateCheck(0);
         } else if (wp == 3) {
             KillTimer(hwnd, 3);
