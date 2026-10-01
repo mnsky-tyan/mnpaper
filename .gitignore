@@ -3,8 +3,8 @@
 *.res
 *.dmp
 *.log
-tests/run-*
-tests/*.txt
-tests/*.err
-samples/
 tests/
+samples/
+AGENTS.md
+.no-mistakes.yaml
+probes/
