@@ -36,6 +36,8 @@
 #pragma comment(lib, "dbghelp.lib")
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <stdio.h>
@@ -70,9 +72,11 @@
 #define IDM_STRENGTH    9007      /* + index: 10/20/30/40 */
 #define IDM_SHARE       9020
 #define IDM_AUTOSTART   9005
+#define IDM_AUTOUPD     9021
 #define IDM_EXIT        9006
 #define TIMER_TICK      1
 #define TIMER_DEBOUNCE  2
+#define TIMER_UPD       4   /* one-shot: first automatic update check, 30s after start */
 #define TICK_MS         50
 #define DEBOUNCE_MS     400     /* trailing registry save only; the live
                                  * preview itself applies immediately */
@@ -87,9 +91,12 @@
  * out, so a hostile or offline feed can at worst show a wrong message. */
 #define MNVER_MAJOR 2
 #define MNVER_MINOR 7
-#define MNVER_PATCH 1
+#define MNVER_PATCH 2
 #define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-tyan/mnpaper/main/version.txt"
 #define PRODUCT_URL L"https://github.com/mnsky-tyan/mnpaper/releases"
+/* self-update payload: stable redirect URL, not the rate-limited REST API */
+#define UPDATE_EXE_URL L"https://github.com/mnsky-tyan/mnpaper/releases/latest/download/mnPaper.exe"
+#define UPDATE_MAX_BYTES (8u * 1024u * 1024u)
 
 #define MODE_PAPER 0
 #define MODE_EINK  1
@@ -112,6 +119,7 @@ typedef struct {
     int dither;
     int autostart;
     int share;     /* 1 = the texture is visible in screenshots / screen shares */
+    int autoupd;   /* 1 = look for a new version about once a day (never auto-install) */
 } SETTINGS;
 
 static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
@@ -147,6 +155,7 @@ static const WCHAR *REG_KEY = L"Software\\mnPaper";
 /* The Run key path is a writable buffer so the hidden regression can redirect
  * it into its isolated scratch hive; production always keeps the default. */
 static WCHAR g_run_key[160] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static ULONGLONG g_lastupd;          /* FILETIME of the last completed update check */
 
 static FILE *g_log;
 static void L(const char *fmt, ...) {
@@ -208,6 +217,8 @@ static void SaveSettings(void) {
     RegSetValueExW(k, L"dither",    0, REG_DWORD, (BYTE *)&g_s.dither,    sizeof(int));
     RegSetValueExW(k, L"autostart", 0, REG_DWORD, (BYTE *)&g_s.autostart, sizeof(int));
     RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
+    RegSetValueExW(k, L"autoupd",   0, REG_DWORD, (BYTE *)&g_s.autoupd,   sizeof(int));
+    RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,     sizeof(g_lastupd));
     RegCloseKey(k);
     ApplyAutostart();
 }
@@ -233,6 +244,13 @@ static void LoadSettings(void) {
         g_s.contrast  = GetDword(k, L"contrast",  g_s.contrast);
         g_s.dither    = GetDword(k, L"dither",    g_s.dither);
         g_s.share     = GetDword(k, L"share",     g_s.share);
+        g_s.autoupd   = GetDword(k, L"autoupd",   1);   /* default: daily check on */
+        {
+            DWORD sz = sizeof(ULONGLONG), t = 0;
+            ULONGLONG v64 = 0;
+            if (RegQueryValueExW(k, L"lastupd", NULL, &t, (BYTE *)&v64, &sz) == ERROR_SUCCESS && t == REG_QWORD)
+                g_lastupd = v64;
+        }
         RegCloseKey(k);
     }
     /* autostart mirrors the Run key so an external edit stays honest */
@@ -1581,14 +1599,21 @@ static const WCHAR HELP_TEXT[] =
     L"  Texture on - uncheck to hide the texture instantly; mnPaper keeps "
     L"running in the tray (Ctrl+Alt+P does the same).\r\n"
     L"  Start with Windows - launch mnPaper automatically at login.\r\n"
+    L"  Check for updates automatically - the app reads a tiny version file "
+    L"about once a day and, only if a new version exists, shows a tray note. "
+    L"Unchecked, it checks only when you press the button.\r\n"
     L"  Show texture in screenshots and screen shares\r\n"
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
     L"the texture. E-ink is always hidden from captures.\r\n"
     L"  ?        - this window.\r\n"
     L"  Check for updates - compares your version with the published one. "
-    L"It never downloads or installs anything; it only offers to open the "
-    L"download page.\r\n"
+    L"If a new version exists it offers to download and install it: the "
+    L"download is verified against a published fingerprint (SHA-256) before "
+    L"anything changes, the swap happens next to the exe, and mnPaper "
+    L"restarts into the new version. Your settings are kept. If anything "
+    L"fails, nothing is modified and you can always download manually from "
+    L"the releases page.\r\n"
     L"  Close    - closes the window. Every change is applied and saved the "
     L"moment you move a slider - there is no Save button.\r\n"
     L"\r\n"
@@ -1659,6 +1684,9 @@ static void OpenHelp(HWND owner) {
 /* ---------------------- update check (link-out, safe) -------------------- */
 
 static volatile LONG g_update_busy;   /* one check at a time */
+static int g_upd_manual;              /* does the pending check answer to a click? */
+static HWND g_chk_autoupd;
+static NOTIFYICONDATAW g_nid;
 
 /* Parse "[v] 3.2.1 ..." -> 1 on success. Rejects empty/garbage feeds. */
 static int ParseVersionTriple(const char *s, int *ma, int *mi, int *pa) {
@@ -1694,6 +1722,101 @@ static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
 #define UPT_NEW       2   /* newer version available                      */
 #define UPT_SAME      3   /* already on the latest version                */
 
+typedef struct {
+    int result;
+    WCHAR ver[24];    /* "2.7.2" as published by the feed        */
+    WCHAR hash[65];   /* 64 hex chars if the feed pins the exe    */
+} UpdInfo;
+
+/* Find a 64-hex-char sequence (the exe's SHA-256 pin) in the feed body. */
+static int FindHash64(const char *s, WCHAR *out) {
+    const char *p = s;
+    int run = 0, i;
+    for (; *p; p++) {
+        char c = *p;
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            if (++run == 64) {
+                for (i = 0; i < 64; i++) out[i] = (WCHAR)p[i - 63];
+                out[64] = 0;
+                return 1;
+            }
+        } else run = 0;
+    }
+    return 0;
+}
+
+/* SHA-256 -> 64 lowercase hex chars via Windows' own bcrypt (no deps). */
+static int Sha256Hex(const unsigned char *data, DWORD len, WCHAR *hex) {
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE h = NULL;
+    unsigned char dig[32];
+    int i, ok = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) return 0;
+    if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
+        if (BCryptHashData(h, (PUCHAR)data, len, 0) == 0 &&
+            BCryptFinishHash(h, dig, sizeof dig, 0) == 0) {
+            for (i = 0; i < 32; i++)
+                _snwprintf(hex + i * 2, 3, L"%02x", dig[i]);
+            hex[64] = 0;
+            ok = 1;
+        }
+        BCryptDestroyHash(h);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+/* Plain HTTPS GET of a URL into memory (TLS validation are WinHTTP defaults).
+ * Returns malloc'd bytes or NULL; *out_len receives the byte count. */
+static unsigned char *DownloadToMem(const WCHAR *url, DWORD *out_len) {
+    WCHAR host[256] = L"", path[512] = L"", ua[32];
+    URL_COMPONENTSW uc = { sizeof(uc) };
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    unsigned char *buf = NULL, *nb;
+    DWORD cap = 0, total = 0, got = 0, status = 0, stlen = sizeof status;
+    _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
+        return NULL;
+    ses = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return NULL;
+    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 30000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con) goto done;
+    req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!req) goto done;
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req, NULL))
+        goto done;
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &stlen,
+                             WINHTTP_NO_HEADER_INDEX) || status != 200)
+        goto done;
+    while (total < UPDATE_MAX_BYTES) {
+        if (!WinHttpQueryDataAvailable(req, &got) || !got) break;
+        if (total + got > cap) {
+            cap = total + got;
+            if (cap < 262144) cap = 262144;
+            if (cap > UPDATE_MAX_BYTES) cap = UPDATE_MAX_BYTES;
+            nb = (unsigned char *)realloc(buf, cap);
+            if (!nb) { free(buf); buf = NULL; goto done; }
+            buf = nb;
+        }
+        if (!WinHttpReadData(req, buf + total, got, &got)) { free(buf); buf = NULL; goto done; }
+        total += got;
+    }
+    if (buf && total) *out_len = total; else { free(buf); buf = NULL; }
+done:
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    return buf;
+}
+
 /* Worker thread: HTTPS GET of UPDATE_URL (TLS + hostname validation are
  * WinHTTP defaults - no ignored-certification flags anywhere). Reads at most
  * 4 KB, compares numbers and posts a WM_APP_UPDATE to the host window, which
@@ -1708,7 +1831,8 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
     URL_COMPONENTSW uc = { sizeof(uc) };
     HINTERNET ses = NULL, con = NULL, req = NULL;
     int result = UPT_NONE;
-    WCHAR *found = NULL;
+    UpdInfo *u = (UpdInfo *)calloc(1, sizeof *u);
+    int manual = g_upd_manual;
     _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
@@ -1747,9 +1871,8 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
             } else if (CompareVersion(ma, mi, pa, MNVER_MAJOR, MNVER_MINOR,
                                       MNVER_PATCH) > 0) {
                 result = UPT_NEW;
-                found = (WCHAR *)malloc(64 * sizeof(WCHAR));
-                if (found)
-                    _snwprintf(found, 64, L"%d.%d.%d", ma, mi, pa);
+                _snwprintf(u->ver, 24, L"%d.%d.%d", ma, mi, pa);
+                FindHash64(body, u->hash);   /* optional pin; empty = no self-update */
             } else {
                 result = UPT_SAME;        /* same or older: already current */
             }
@@ -1759,15 +1882,33 @@ done:
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
     if (ses) WinHttpCloseHandle(ses);
-    PostMessageW(g_host, WM_APP_UPDATE, (WPARAM)result, (LPARAM)found);
+    if (!u) {
+        InterlockedExchange(&g_update_busy, 0);
+        return 0;
+    }
+    u->result = result;
+    PostMessageW(g_host, WM_APP_UPDATE, (WPARAM)manual, (LPARAM)u);
     InterlockedExchange(&g_update_busy, 0);
     return 0;
 }
 
-static void StartUpdateCheck(void) {
+static int UpdDue(void);   /* defined below, before first use in the thread path */
+/* manual = the user pressed the button (always runs); auto = the daily lazy
+ * check (gated by the autoupd setting and the once-a-day timestamp). */
+static void StartUpdateCheck(int manual) {
     HANDLE t;
+    static DWORD last_manual_tick;
+    if (manual) {
+        DWORD now = GetTickCount();
+        if (now - last_manual_tick < 5000) return;   /* double-click debounce */
+        last_manual_tick = now;
+    } else {
+        if (!g_s.autoupd || g_test_headless) return; /* tests never touch network */
+        if (!UpdDue()) return;                       /* checked within the last day */
+    }
     if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
         return;   /* a check is already running */
+    g_upd_manual = manual;
     t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
     if (!t) {
         InterlockedExchange(&g_update_busy, 0);
@@ -1776,34 +1917,157 @@ static void StartUpdateCheck(void) {
     CloseHandle(t);   /* the busy flag clears in the thread */
 }
 
+static ULONGLONG NowFT(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+/* the lazy daily cadence: 24h target, 22h gate so jitter in wall time can
+ * never push two checks closer than "about once a day" */
+static int UpdDue(void) {
+    const ULONGLONG day = 22ULL * 3600ULL * 10000000ULL;
+    return g_lastupd == 0 || NowFT() - g_lastupd > day;
+}
+
+static void SaveLastUpdNow(void) {
+    HKEY k;
+    g_lastupd = NowFT();
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(k, L"lastupd", 0, REG_QWORD, (BYTE *)&g_lastupd, sizeof(g_lastupd));
+    RegCloseKey(k);
+}
+
+static void UpdBalloon(const WCHAR *ver) {
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    lstrcpyW(n.szInfoTitle, L"mnPaper update");
+    _snwprintf(n.szInfo, 256,
+        L"Version %s is available. Open settings and press \"Check for updates\" to install it.", ver);
+    n.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+/* Self-update: download the published exe, verify it byte-for-byte against
+ * the feed's SHA-256 pin, then swap it in. A running exe cannot be
+ * overwritten but it CAN be renamed: current -> .old, new -> current, and
+ * the .old is swept on the next start. The fresh process must not race our
+ * single-instance mutex, so it is started by a short cmd chain after we are
+ * gone. Settings live in the registry and are untouched by any of this. */
+static void DoSelfUpdate(const WCHAR *hash_hex, HWND owner) {
+    WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8], cmd[MAX_PATH + 160];
+    unsigned char *buf;
+    DWORD len = 0;
+    WCHAR hex[65];
+    HANDLE f;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    buf = DownloadToMem(UPDATE_EXE_URL, &len);
+    if (!buf) {
+        MessageBoxW(owner,
+            L"The download failed (offline, or the release is not reachable).\n"
+            L"Nothing was changed. You can try again later or download manually from the releases page.",
+            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (len < 65536 || len > UPDATE_MAX_BYTES || !Sha256Hex(buf, len, hex) ||
+        _wcsnicmp(hex, hash_hex, 64)) {
+        free(buf);
+        MessageBoxW(owner,
+            L"The downloaded file does not match the published fingerprint.\n"
+            L"It was discarded and nothing was changed.",
+            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    lstrcpyW(newf, exe); lstrcpyW(newf + lstrlenW(newf), L".new");
+    f = CreateFileW(newf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE ||
+        !WriteFile(f, buf, len, &len, NULL)) {
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        DeleteFileW(newf);
+        free(buf);
+        MessageBoxW(owner, L"Could not write the update next to the exe. Nothing was changed.",
+                    L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    CloseHandle(f);
+    free(buf);
+    MessageBoxW(owner, L"Update verified. mnPaper will restart now.",
+                L"mnPaper - update", MB_OK | MB_ICONINFORMATION);
+    lstrcpyW(old, exe); lstrcpyW(old + lstrlenW(old), L".old");
+    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING) ||
+        !MoveFileExW(newf, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* roll back */
+        DeleteFileW(newf);
+        MessageBoxW(owner,
+            L"The update could not be applied (the exe is locked). Nothing was changed - "
+            L"try again in a moment, or download manually from the releases page.",
+            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+    ZeroMemory(&pi, sizeof pi);
+    _snwprintf(cmd, MAX_PATH + 160,
+        L"/c ping -n 3 127.0.0.1 >nul & start \"\" \"%s\"", exe);
+    if (!CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CreateProcessW(exe, exe, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);   /* best effort */
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    L("self-update: swapped and relaunching");
+    if (g_dlg && IsWindow(g_dlg)) DestroyWindow(g_dlg);
+    DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
+}
+
 /* Results land on the host window's thread. Any "open page" action uses ONLY
  * the built-in PRODUCT_URL - never a string received from the network. */
-static void UpdateResult(HWND dlg, WPARAM result, LPARAM lp) {
-    WCHAR *found = (WCHAR *)lp;
+static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
     int open = 0;
     if (dlg && !IsWindow(dlg)) dlg = NULL;
-    if (result == UPT_NEW && found) {
-        WCHAR msg[160];
-        _snwprintf(msg, 160,
-            L"Version %s of mnPaper is available.\n\nOpen the download page now?",
-            found);
-        open = MessageBoxW(dlg, msg, L"mnPaper - update available",
-                           MB_YESNO | MB_ICONINFORMATION) == IDYES;
-    } else if (result == UPT_SAME) {
-        MessageBoxW(dlg, L"You are running the latest version of mnPaper.",
-                    L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
-    } else if (result == UPT_MALFORMED) {
-        open = MessageBoxW(dlg,
-            L"The update feed answered, but its contents could not be read as a "
-            L"version number.\n\nOpen the mnPaper download page anyway?",
-            L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+    SaveLastUpdNow();   /* any completed check pushes the next auto check a day out */
+    if (u->result == UPT_NEW && u->ver[0]) {
+        if (manual) {
+            if (u->hash[0]) {
+                WCHAR msg[220];
+                _snwprintf(msg, 220,
+                    L"Version %s of mnPaper is available.\n\n"
+                    L"Download and install it now? The download is verified against a "
+                    L"published fingerprint before anything changes, and mnPaper "
+                    L"restarts into the new version.", u->ver);
+                if (MessageBoxW(dlg, msg, L"mnPaper - update available",
+                                MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                    DoSelfUpdate(u->hash, dlg);
+            } else {
+                WCHAR msg[160];
+                _snwprintf(msg, 160,
+                    L"Version %s of mnPaper is available.\n\nOpen the download page now?", u->ver);
+                open = MessageBoxW(dlg, msg, L"mnPaper - update available",
+                                   MB_YESNO | MB_ICONINFORMATION) == IDYES;
+            }
+        } else {
+            UpdBalloon(u->ver);   /* the daily check never opens dialogs */
+        }
+    } else if (u->result == UPT_SAME) {
+        if (manual)
+            MessageBoxW(dlg, L"You are running the latest version of mnPaper.",
+                        L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
+    } else if (u->result == UPT_MALFORMED) {
+        if (manual)
+            open = MessageBoxW(dlg,
+                L"The update feed answered, but its contents could not be read as a "
+                L"version number.\n\nOpen the mnPaper download page anyway?",
+                L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
     } else {
-        open = MessageBoxW(dlg,
-            L"Could not reach the update feed (offline, or the feed is not "
-            L"published yet).\n\nOpen the mnPaper download page anyway?",
-            L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+        if (manual)
+            open = MessageBoxW(dlg,
+                L"Could not reach the update feed (offline, or the feed is not "
+                L"published yet).\n\nOpen the mnPaper download page anyway?",
+                L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
     }
-    if (found) free(found);
+    free(u);
     if (open)
         ShellExecuteW(dlg, L"open", PRODUCT_URL, NULL, NULL, SW_SHOWNORMAL);
 }
@@ -1970,20 +2234,26 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 284, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
+        /* daily self-check opt-out; the download itself is always manual */
+        CreateWindowExW(0, L"BUTTON", L"Check for updates automatically (about once a day)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 306, 352, 20, hwnd, (HMENU)120,
+            GetModuleHandleW(NULL), NULL);
+        SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
+                     g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 318, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 328, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"&Close",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 318, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
-        /* link-out update check: compares version numbers, offers the page */
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 328, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+        /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 344, 160, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 352, 160, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2024,6 +2294,11 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_UPD) {
+            KillTimer(hwnd, TIMER_UPD);
+            /* the lazy daily check: 30s after start so launch never waits on it */
+            StartUpdateCheck(0);
+        }
         if (wp == TIMER_DEBOUNCE) {
             KillTimer(hwnd, TIMER_DEBOUNCE);
             ReadBarsToSettings();
@@ -2071,10 +2346,14 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_s.autostart = IsDlgButtonChecked(hwnd, 119) == BST_CHECKED;
             SaveSettings();   /* SaveSettings applies the Run key */
             L("autostart=%d", g_s.autostart);
+        } else if (LOWORD(wp) == 120) {
+            g_s.autoupd = IsDlgButtonChecked(hwnd, 120) == BST_CHECKED;
+            SaveSettings();
+            L("autoupd=%d", g_s.autoupd);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
-            StartUpdateCheck();
+            StartUpdateCheck(1);
         } else if (LOWORD(wp) == IDCANCEL) {
             SendMessageW(hwnd, WM_TIMER, TIMER_DEBOUNCE, 0);
             DestroyWindow(hwnd);
@@ -2179,8 +2458,6 @@ static void ActivateMode(int mode) {         /* also turns master on */
     SaveSettings();
 }
 
-static NOTIFYICONDATAW g_nid;
-
 static const int STRENGTH_STEPS[4] = { 10, 20, 30, 40 };
 static const WCHAR *STRENGTH_NAMES[4] = { L"Subtle (10)", L"Soft (20)", L"Medium (30)", L"Strong (40)" };
 
@@ -2202,6 +2479,8 @@ static void TrayMenu(void) {
                 L"Texture in shares/screenshots");
     AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"Settings...");
     AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
+    AppendMenuW(m, MF_STRING | (g_s.autoupd ? MF_CHECKED : 0), IDM_AUTOUPD,
+                L"Check for updates automatically");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
     GetCursorPos(&pt);
@@ -2280,7 +2559,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RepaintAll();
         return 0;
     case WM_APP_UPDATE:
-        UpdateResult(g_dlg, wp, lp);   /* may outlive the dialog that asked */
+        UpdateResult(g_dlg, (int)wp, (UpdInfo *)lp);   /* may outlive the dialog that asked */
         return 0;
     case WM_APP_PAPER:
         ApplyPaperResult((PaperDone *)lp);
@@ -2316,6 +2595,8 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SyncMasterCheckbox();
                 SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
                              g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+                SendMessageW(GetDlgItem(g_dlg, 120), BM_SETCHECK,
+                             g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
             }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
         }
@@ -2366,6 +2647,14 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
             L("autostart=%d", g_s.autostart);
             break;
+        case IDM_AUTOUPD:
+            g_s.autoupd = g_s.autoupd ? 0 : 1;
+            SaveSettings();
+            if (g_dlg && IsWindow(g_dlg))
+                SendMessageW(GetDlgItem(g_dlg, 120), BM_SETCHECK,
+                             g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
+            L("autoupd=%d", g_s.autoupd);
+            break;
         case IDM_EXIT:
             SaveSettings();
             DestroyWindow(hwnd);
@@ -2413,6 +2702,7 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
     else if (!_wcsicmp(key, L"mode")) s->mode = v ? MODE_EINK : MODE_PAPER;
     else if (!_wcsicmp(key, L"autostart")) s->autostart = v ? 1 : 0;
     else if (!_wcsicmp(key, L"share")) s->share = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"autoupd")) s->autoupd = v ? 1 : 0;
     else if (!_wcsicmp(key, L"master")) s->master = v ? 1 : 0;
     else return 0;
     g_has_set = 1;
@@ -2524,6 +2814,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         }
         if (g_log) fclose(g_log);
         return 0;
+    }
+
+    /* a completed self-update leaves the previous exe as .old - sweep it */
+    {
+        WCHAR exe[MAX_PATH], oldp[MAX_PATH + 8];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        lstrcpyW(oldp, exe); lstrcpyW(oldp + lstrlenW(oldp), L".old");
+        DeleteFileW(oldp);   /* best effort; may still be locked right after the swap */
     }
 
     mutex = CreateMutexW(NULL, TRUE, L"mnPaper-single-instance");
