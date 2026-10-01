@@ -1965,9 +1965,10 @@ static void UpdBalloon(const WCHAR *ver) {
  * as WM_APP_INSTALL. The swap is two local renames - fast - so it stays on
  * the host thread together with every dialog and the relaunch. */
 #define UPD_DL_NET      0   /* fetch failed: offline or the release is gone   */
-#define UPD_DL_SHORT    1   /* fetched, but shorter than a real release exe     */
-#define UPD_DL_MISMATCH 2   /* fetched, but not the published fingerprint     */
-#define UPD_DL_OK       3   /* fetched and verified: install it               */
+#define UPD_DL_SHORT    1   /* fetched, but incomplete or shorter than a real exe */
+#define UPD_DL_HASHERR  2   /* fetched, but the fingerprint could not be computed */
+#define UPD_DL_MISMATCH 3   /* hashed and compared: not the published fingerprint */
+#define UPD_DL_OK       4   /* fetched and verified: install it               */
 
 typedef struct {
     int result;
@@ -2009,13 +2010,15 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
     if (HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len)) {
         if (len < 65536) {
             result = UPD_DL_SHORT;   /* a truncated body: never compared */
-        } else if (Sha256Hex(buf, len, hex) && !_wcsnicmp(hex, in->hash, 64)) {
+        } else if (!Sha256Hex(buf, len, hex)) {
+            result = UPD_DL_HASHERR;   /* could not verify it at all */
+        } else if (_wcsnicmp(hex, in->hash, 64)) {
+            result = UPD_DL_MISMATCH;   /* hashed and compared: not the pin */
+        } else {
             in->buf = buf;   /* handed to the host thread */
             buf = NULL;      /* from here on the payload owns these bytes */
             in->len = len;
             result = UPD_DL_OK;
-        } else {
-            result = UPD_DL_MISMATCH;   /* hashed and compared: not the pin */
         }
     }
     free(buf);
@@ -2116,6 +2119,15 @@ static void InstallResult(InstInfo *in) {
         MessageBoxW(owner,
             L"The download was incomplete. Nothing was changed - please try again.",
             L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (in->result == UPD_DL_HASHERR) {
+        free(in->buf);
+        free(in);
+        MessageBoxW(owner,
+            L"Could not compute the fingerprint of the downloaded file.\n"
+            L"Nothing was changed.",
+            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
         return;
     }
     if (in->result != UPD_DL_OK) {
