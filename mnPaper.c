@@ -1883,6 +1883,12 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
 }
 
 static int UpdDue(void);   /* defined below, before first use in the thread path */
+
+static void UpdateBusyNotice(HWND owner) {
+    MessageBoxW(owner, L"An update is already in progress.",
+                L"mnPaper - update", MB_OK | MB_ICONINFORMATION);
+}
+
 /* manual = the user pressed the button (always runs); auto = the daily lazy
  * check (gated by the autoupd setting and the once-a-day timestamp). */
 static void StartUpdateCheck(int manual) {
@@ -1901,8 +1907,11 @@ static void StartUpdateCheck(int manual) {
         if (!g_s.autoupd || g_test_headless) return; /* tests never touch network */
         if (!UpdDue()) return;                       /* checked within the last day */
     }
-    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
+    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0) {
+        if (manual)
+            UpdateBusyNotice((g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL);
         return;   /* a check is already running */
+    }
     g_upd_manual = manual;
     t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
     if (!t) {
@@ -1968,11 +1977,13 @@ typedef struct {
 
 static DWORD WINAPI SelfUpdateThread(LPVOID param);
 
-static void StartSelfUpdate(const WCHAR *hash_hex) {
+static void StartSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     HANDLE t;
     InstInfo *in;
-    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0)
+    if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0) {
+        UpdateBusyNotice(owner);
         return;   /* a check, or another install, is already running */
+    }
     in = (InstInfo *)calloc(1, sizeof *in);
     if (!in) {
         InterlockedExchange(&g_update_busy, 0);
@@ -2182,7 +2193,7 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
                     L"restarts into the new version.", u->ver);
                 if (MessageBoxW(dlg, msg, L"mnPaper - update available",
                                 MB_YESNO | MB_ICONINFORMATION) == IDYES)
-                    StartSelfUpdate(u->hash);
+                    StartSelfUpdate(u->hash, dlg);
             } else {
                 WCHAR msg[160];
                 _snwprintf(msg, 160,
