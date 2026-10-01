@@ -7,75 +7,40 @@ Currently Windows only. Local and free.
 
 ![Editing a text file under the texture](assets/screenshot-editor.png)
 
+![Reading a PDF under the texture](assets/screenshot-pdf.png)
+
 Expected usage: **paper mode** - about 25-50 MB of RAM, near-zero CPU when
 nothing is changing, no GPU (it draws with plain GDI, no Direct3D).
 **E-ink mode** - about 25-50 MB of RAM, near-zero CPU when nothing is
 changing, one small DirectX swapchain on the GPU.
 
-mnPaper is a single portable Windows executable: no installer, no account,
-no telemetry.
-
-## What it does
+## Features
 
 - Lays a warm, procedurally generated paper texture over every monitor.
-  Your cursor, clicks and typing pass straight through it.
 - **E-ink mode** turns the entire screen into a greyscale, Kindle-style
-  reader view (shades / contrast / dither). It asks before switching and is
-  always hidden from screen captures.
-- Everything applies the moment you move a slider: coarse feedback while you
-  drag, full refinement right after you stop.
-- The texture is **hidden from screenshots and screen shares by default** -
-  other people see the clean desktop, you still see paper. One checkbox
-  includes it when you want that.
-- Autosaves every setting the moment it changes. There is no Save button.
+  reader view (shades / contrast / dither).
+- The texture can be shown or hidden from screenshots and screen shares.
 
 ## Requirements
 
 - Windows 10 (version 2004+) or Windows 11, x64.
-- No admin rights, no runtime dependencies.
 
 ## Install and run
 
-1. Copy `mnPaper.exe` anywhere in your user profile (for example
-   `C:\Users\you\bin`).
-2. Run it. A tray icon appears; the texture fades in.
-3. Optional: tick **Start with Windows** in the settings window, or run
-   `mnPaper.exe --set autostart=1`.
+Download `mnPaper.exe` from the
+[Releases page](https://github.com/mnsky-tyan/mnpaper/releases) and run it.
 
-Uninstalling: quit from the tray, delete the exe, and remove the
-`HKEY_CURRENT_USER\Software\mnPaper` registry key (settings) plus the
-`mnPaper` value under `HKCU\...\CurrentVersion\Run` if you enabled autostart.
+Prefer building from source? `git clone` this repo and follow
+[Building from source](#building-from-source) - the built exe lands in the
+repo root as `mnPaper.exe`.
 
-## Using it
-
-- **Settings window**: tray icon right-click, or run `mnPaper.exe --settings`.
-- **Ctrl+Alt+P** - show / hide the texture (the app keeps running in the tray).
-- **Ctrl+Alt+E** - switch between Paper and E-ink mode.
-- **Texture on** (checkbox) - hide the texture without quitting.
-- **Show texture in screenshots and screen shares** - off by default.
-- **Start with Windows** - launch at login.
-- **Check for updates** - compares your version with the published one and
-  offers to open the download page. It never downloads or installs anything.
-
-### Command line
-
-```
-mnPaper.exe --settings
-mnPaper.exe --set <setting>=<value>   (intensity, warmth, grain, fibre,
-                                       blotch, shades, contrast, dither,
-                                       master, mode, share, autostart)
-mnPaper.exe --capture on|off          (texture in captures)
-mnPaper.exe --on | --off | --toggle
-mnPaper.exe --quit
-mnPaper.exe --log <file>              (diagnostics; nothing is logged by default)
-```
+Uninstall: quit from the tray and delete the exe. (Settings live in
+`HKEY_CURRENT_USER\Software\mnPaper`; delete that key too if you want a
+completely clean removal.)
 
 ## Privacy
 
 - No telemetry, no analytics, no accounts.
-- The only outbound network request mnPaper ever makes is the **manual**
-  "Check for updates" button (a plain HTTPS GET of a version text file).
-  Everything else stays on your machine.
 - Settings live in `HKEY_CURRENT_USER\Software\mnPaper`.
 
 ## Building from source
@@ -84,11 +49,14 @@ mnPaper.exe --log <file>              (diagnostics; nothing is logged by default
 - No third-party dependencies.
 
 ```bat
+git clone https://github.com/mnsky-tyan/mnpaper.git
+cd mnpaper
 rc /nologo mnPaper.rc
 cl /nologo /O2 /W3 mnPaper.c mnPaper.res /FemnPaper.exe
 ```
 
-Hidden regression suite (windowless, never injects input, uses an isolated
+The build produces `mnPaper.exe` in the repo root. To also run the hidden
+regression suite (windowless, never injects input, uses an isolated
 registry hive - safe to run while working):
 
 ```bat
