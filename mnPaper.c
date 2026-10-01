@@ -1827,6 +1827,7 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         if (!WinHttpReadData(req, buf + total, got, &got)) goto done;
         total += got;
     }
+    if (total >= max_bytes) goto done;  /* the cap is a bound, never a body length */
     if (buf && total) {
         *out_buf = buf;
         *out_len = total;
@@ -1884,6 +1885,11 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
 
 static int UpdDue(void);   /* defined below, before first use in the thread path */
 
+static void UpdateStartFailed(HWND owner) {
+    MessageBoxW(owner, L"Could not start the update check. Please try again.",
+                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+}
+
 static void UpdateBusyNotice(HWND owner) {
     MessageBoxW(owner, L"An update is already in progress.",
                 L"mnPaper - update", MB_OK | MB_ICONINFORMATION);
@@ -1916,6 +1922,7 @@ static void StartUpdateCheck(int manual) {
     t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
     if (!t) {
         InterlockedExchange(&g_update_busy, 0);
+        if (manual) UpdateStartFailed((g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL);
         return;
     }
     CloseHandle(t);   /* the busy flag clears in the thread */
@@ -1989,6 +1996,7 @@ static void StartSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     in = (InstInfo *)calloc(1, sizeof *in);
     if (!in) {
         InterlockedExchange(&g_update_busy, 0);
+        UpdateStartFailed(owner);   /* reached only from the install prompt */
         return;
     }
     lstrcpynW(in->hash, hash_hex, 65);
@@ -1996,6 +2004,7 @@ static void StartSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     if (!t) {
         free(in);
         InterlockedExchange(&g_update_busy, 0);
+        UpdateStartFailed(owner);
         return;
     }
     CloseHandle(t);   /* the busy flag clears in the thread */
@@ -2125,7 +2134,7 @@ static void InstallResult(InstInfo *in) {
         free(in->buf);
         free(in);
         MessageBoxW(owner,
-            L"Could not compute the fingerprint of the downloaded file.\n"
+            L"Could not compute the security fingerprint of the download.\n"
             L"Nothing was changed.",
             L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
         return;
