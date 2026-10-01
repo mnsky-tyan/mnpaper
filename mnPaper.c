@@ -1890,6 +1890,12 @@ static void UpdateStartFailed(HWND owner) {
                 L"mnPaper - update", MB_OK | MB_ICONWARNING);
 }
 
+static void UpdateInstallStartFailed(HWND owner) {
+    MessageBoxW(owner, L"Could not start the update installation.\n"
+                       L"Nothing was changed - please try again.",
+                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+}
+
 static void UpdateBusyNotice(HWND owner) {
     MessageBoxW(owner, L"An update is already in progress.",
                 L"mnPaper - update", MB_OK | MB_ICONINFORMATION);
@@ -1996,7 +2002,7 @@ static void StartSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     in = (InstInfo *)calloc(1, sizeof *in);
     if (!in) {
         InterlockedExchange(&g_update_busy, 0);
-        UpdateStartFailed(owner);   /* reached only from the install prompt */
+        UpdateInstallStartFailed(owner);
         return;
     }
     lstrcpynW(in->hash, hash_hex, 65);
@@ -2004,7 +2010,7 @@ static void StartSelfUpdate(const WCHAR *hash_hex, HWND owner) {
     if (!t) {
         free(in);
         InterlockedExchange(&g_update_busy, 0);
-        UpdateStartFailed(owner);
+        UpdateInstallStartFailed(owner);
         return;
     }
     CloseHandle(t);   /* the busy flag clears in the thread */
