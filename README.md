@@ -21,6 +21,7 @@ changing, one small DirectX swapchain on the GPU.
 - **E-ink mode** turns the entire screen into a greyscale, Kindle-style
   reader view (shades / contrast / dither).
 - The texture can be shown or hidden from screenshots and screen shares.
+- Adjust parameters like strength, warmth, grain, fibre, blotch on your own. 
 
 ## Requirements
 
