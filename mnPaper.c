@@ -85,11 +85,15 @@
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.7.0") and
+ * plain-text file whose first line is the latest version ("2.7.2") and whose
+ * optional second line is the 64-hex SHA-256 pin of that release's exe, and
  * PRODUCT_URL at the page users download from (GitHub Releases recommended:
- * free TLS hosting, the release itself is the artifact). The update check
- * NEVER downloads or replaces code: it compares version numbers and links
- * out, so a hostile or offline feed can at worst show a wrong message. */
+ * free TLS hosting, the release itself is the artifact). The check itself is
+ * read-only: it fetches that feed and compares versions, so a hostile or
+ * offline feed can at worst show a wrong message. The exe is downloaded only
+ * after the user confirms the install prompt, and nothing is written or
+ * swapped until its computed SHA-256 matches the published pin - the feed is
+ * trusted for a version string, a pin, and for nothing else. */
 #define MNVER_MAJOR 2
 #define MNVER_MINOR 7
 #define MNVER_PATCH 2
@@ -1781,10 +1785,12 @@ static int Sha256Hex(const unsigned char *data, DWORD len, WCHAR *hex) {
 /* Plain HTTPS GET of a URL into memory (TLS validation are WinHTTP defaults).
  * Reads at most max_bytes and hands the malloc'd buffer back through
  * *out_buf with its length in *out_len; a response that does not fit is
- * refused whole, never read past the allocation. recv_ms is the receive
- * timeout: short for the version feed, long for the exe download. */
+ * refused whole, never read past the allocation, and sets *too_big when it
+ * is given, so a caller can tell a size refusal from a transport failure.
+ * recv_ms is the receive timeout: short for the version feed, long for the
+ * exe download. */
 static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
-                        unsigned char **out_buf, DWORD *out_len) {
+                        unsigned char **out_buf, DWORD *out_len, int *too_big) {
     WCHAR host[256] = L"", path[512] = L"", ua[32];
     URL_COMPONENTSW uc = { sizeof(uc) };
     HINTERNET ses = NULL, con = NULL, req = NULL;
@@ -1792,6 +1798,7 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
     DWORD cap = 0, total = 0, got = 0, status = 0, stlen = sizeof status;
     *out_buf = NULL;
     *out_len = 0;
+    if (too_big) *too_big = 0;
     _snwprintf(ua, 32, L"mnPaper/%d.%d.%d", MNVER_MAJOR, MNVER_MINOR, MNVER_PATCH);
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;  uc.dwUrlPathLength = 512;
@@ -1816,7 +1823,7 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         goto done;
     while (total < max_bytes) {
         if (!WinHttpQueryDataAvailable(req, &got) || !got) break;
-        if (got > max_bytes - total) goto done;   /* too large: refuse it whole */
+        if (got > max_bytes - total) { if (too_big) *too_big = 1; goto done; }   /* too large: refuse it whole */
         if (total + got > cap) {
             cap = total + got;
             if (cap < 262144) cap = 262144;
@@ -1827,7 +1834,7 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         if (!WinHttpReadData(req, buf + total, got, &got)) goto done;
         total += got;
     }
-    if (total >= max_bytes) goto done;  /* the cap is a bound, never a body length */
+    if (total >= max_bytes) { if (too_big) *too_big = 1; goto done; }  /* the cap is a bound, never a body length */
     if (buf && total) {
         *out_buf = buf;
         *out_len = total;
@@ -1856,7 +1863,7 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
     unsigned char *body = NULL;
     DWORD len = 0;
     int manual = g_upd_manual;
-    if (u && HttpGetToMem(UPDATE_URL, FEED_MAX_BYTES, 10000, &body, &len)) {
+    if (u && HttpGetToMem(UPDATE_URL, FEED_MAX_BYTES, 10000, &body, &len, NULL)) {
         char text[FEED_MAX_BYTES + 1];
         int ma, mi, pa;
         memcpy(text, body, len);   /* the helper hands back at most the cap */
@@ -1873,13 +1880,9 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
             result = UPT_SAME;        /* same or older: already current */
         }
     }
-    if (!u) {
-        InterlockedExchange(&g_update_busy, 0);
-        return 0;
-    }
-    u->result = result;
+    if (u) u->result = result;   /* a failed worker still posts, with no payload */
+    InterlockedExchange(&g_update_busy, 0);   /* the answer is captured: release before it is dispatched */
     PostMessageW(g_host, WM_APP_UPDATE, (WPARAM)manual, (LPARAM)u);
-    InterlockedExchange(&g_update_busy, 0);
     return 0;
 }
 
@@ -1982,6 +1985,7 @@ static void UpdBalloon(const WCHAR *ver) {
 #define UPD_DL_HASHERR  2   /* fetched, but the fingerprint could not be computed */
 #define UPD_DL_MISMATCH 3   /* hashed and compared: not the published fingerprint */
 #define UPD_DL_OK       4   /* fetched and verified: install it               */
+#define UPD_DL_CAP      5   /* refused whole: the asset did not fit the cap    */
 
 typedef struct {
     int result;
@@ -2022,7 +2026,8 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
     DWORD len = 0;
     WCHAR hex[65];
     int result = UPD_DL_NET;
-    if (HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len)) {
+    int too_big = 0;
+    if (HttpGetToMem(UPDATE_EXE_URL, UPDATE_MAX_BYTES, 30000, &buf, &len, &too_big)) {
         if (len < 65536) {
             result = UPD_DL_SHORT;   /* a truncated body: never compared */
         } else if (!Sha256Hex(buf, len, hex)) {
@@ -2035,11 +2040,13 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
             in->len = len;
             result = UPD_DL_OK;
         }
+    } else if (too_big) {
+        result = UPD_DL_CAP;   /* refused whole: the release does not fit */
     }
     free(buf);
     in->result = result;
+    InterlockedExchange(&g_update_busy, 0);   /* the answer is captured: release before it is dispatched */
     PostMessageW(g_host, WM_APP_INSTALL, 0, (LPARAM)in);
-    InterlockedExchange(&g_update_busy, 0);
     return 0;
 }
 
@@ -2145,6 +2152,15 @@ static void InstallResult(InstInfo *in) {
             L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
         return;
     }
+    if (in->result == UPD_DL_CAP) {
+        free(in->buf);
+        free(in);
+        MessageBoxW(owner,
+            L"The download exceeded the size limit.\n"
+            L"Nothing was changed.",
+            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
+        return;
+    }
     if (in->result != UPD_DL_OK) {
         free(in->buf);
         free(in);
@@ -2214,11 +2230,13 @@ static void InstallResult(InstInfo *in) {
  * the built-in PRODUCT_URL - never a string received from the network. */
 static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
     int open = 0;
+    int result;
     if (dlg && !IsWindow(dlg)) dlg = NULL;
+    result = u ? u->result : UPT_NONE;   /* a worker that could not answer posts no payload */
     /* only a check that actually saw the feed consumes the daily slot */
-    if (u->result == UPT_SAME || u->result == UPT_NEW)
+    if (result == UPT_SAME || result == UPT_NEW)
         SaveLastUpdNow();
-    if (u->result == UPT_NEW && u->ver[0]) {
+    if (result == UPT_NEW && u->ver[0]) {
         if (manual) {
             if (u->hash[0]) {
                 WCHAR msg[220];
@@ -2240,11 +2258,11 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
         } else {
             UpdBalloon(u->ver);   /* the daily check never opens dialogs */
         }
-    } else if (u->result == UPT_SAME) {
+    } else if (result == UPT_SAME) {
         if (manual)
             MessageBoxW(dlg, L"You are running the latest version of mnPaper.",
                         L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
-    } else if (u->result == UPT_MALFORMED) {
+    } else if (result == UPT_MALFORMED) {
         if (manual)
             open = MessageBoxW(dlg,
                 L"The update feed answered, but its contents could not be read as a "
