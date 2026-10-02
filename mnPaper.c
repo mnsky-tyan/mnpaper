@@ -85,7 +85,7 @@
 
 /* ------------------------------- version -------------------------------- */
 /* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.7.2") and whose
+ * plain-text file whose first line is the latest version ("2.7.5") and whose
  * optional second line is the 64-hex SHA-256 pin of that release's exe, and
  * PRODUCT_URL at the page users download from (GitHub Releases recommended:
  * free TLS hosting, the release itself is the artifact). The check itself is
@@ -1793,7 +1793,7 @@ static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
 
 typedef struct {
     int result;
-    WCHAR ver[24];    /* "2.7.2" as published by the feed        */
+    WCHAR ver[24];    /* "2.7.5" as published by the feed        */
     WCHAR hash[65];   /* 64 hex chars if the feed pins the exe    */
 } UpdInfo;
 
