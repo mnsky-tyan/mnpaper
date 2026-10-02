@@ -1,0 +1,17 @@
+# Gate settings for the no-mistakes pipeline.
+#
+# mnPaper has no CI system: there are no GitHub Actions workflows, so there is
+# nothing for the pipeline's CI step to watch. Without this declaration that
+# step waits for checks that will never register - it has a 168h timeout, so it
+# reads as a hang rather than a failure, and every run has to be aborted by hand
+# or started with --skip ci.
+#
+# This file must stay COMMITTED on the default branch. The declaration is only
+# trusted from there - deliberately, so that a pull request cannot declare
+# itself check-free and slip past the gate. It was once untracked as an
+# "internal file" along with the other local notes, and the stall came straight
+# back on the next run that reached this step.
+#
+# If CI is ever added, delete this file in the same change: leaving it would
+# tell the gate to treat the real checks as absent.
+no_ci: true
