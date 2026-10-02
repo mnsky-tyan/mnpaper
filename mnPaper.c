@@ -84,19 +84,24 @@
 #define WM_APP_INSTALL  (WM_APP + 6)   /* self-update worker thread -> host window */
 
 /* ------------------------------- version -------------------------------- */
-/* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.7.5") and whose
- * optional second line is the 64-hex SHA-256 pin of that release's exe, and
- * PRODUCT_URL at the page users download from (GitHub Releases recommended:
- * free TLS hosting, the release itself is the artifact). The check itself is
- * read-only: it fetches that feed and compares versions, so a hostile or
- * offline feed can at worst show a wrong message. The exe is downloaded only
- * after the user confirms the install prompt, and nothing is written or
- * swapped until its computed SHA-256 matches the published pin - the feed is
- * trusted for a version string, a pin, and for nothing else. */
-#define MNVER_MAJOR 2
-#define MNVER_MINOR 7
-#define MNVER_PATCH 2
+/* The release number lives in version.h, shared with mnPaper.rc, so the number
+ * compared against the published feed and the number Windows reads out of the
+ * exe's version resource cannot drift apart. They did: 2.7.3 through 2.7.5
+ * bumped only the resource, so those builds reported themselves as 2.7.2 and
+ * kept offering an update that was already installed. To cut a release, edit
+ * version.h and nothing else.
+ *
+ * Before publishing, point UPDATE_URL at a plain-text file whose first line is
+ * the latest version ("2.7.6") and whose optional second line is the 64-hex
+ * SHA-256 pin of that release's exe, and PRODUCT_URL at the page users download
+ * from (GitHub Releases recommended: free TLS hosting, the release itself is
+ * the artifact). The check itself is read-only: it fetches that feed and
+ * compares versions, so a hostile or offline feed can at worst show a wrong
+ * message. The exe is downloaded only after the user confirms the install
+ * prompt, and nothing is written or swapped until its computed SHA-256 matches
+ * the published pin - the feed is trusted for a version string, a pin, and for
+ * nothing else. */
+#include "version.h"
 #define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-tyan/mnpaper/main/version.txt"
 #define PRODUCT_URL L"https://github.com/mnsky-tyan/mnpaper/releases"
 /* self-update payload: stable redirect URL, not the rate-limited REST API */
@@ -1793,7 +1798,7 @@ static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
 
 typedef struct {
     int result;
-    WCHAR ver[24];    /* "2.7.5" as published by the feed        */
+    WCHAR ver[24];    /* version string as published by the feed */
     WCHAR hash[65];   /* 64 hex chars if the feed pins the exe    */
 } UpdInfo;
 
