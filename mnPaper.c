@@ -575,24 +575,59 @@ static void BuildPaper(OVL *ov) {
     BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
 }
 
-/* Punch the taskbar hole into a texture: alpha only, RGB left alone.
+/* Punch the taskbar hole into an upload buffer: alpha only, RGB left alone.
  *
  * One implementation for every path that presents a monitor's texture. ULW
- * blends by alpha, so the RGB under a hole is never seen, and leaving it
- * intact means the input buffer does not have to be restored afterwards -
- * which is what the paper path used to do (malloc, memset, upload, memcpy
- * back). The e-ink path already cleared alpha only; this makes them agree.
- * Both callers pass the buffer they are about to upload, so nothing depends
- * on the RGB surviving. */
-static void ClearHoleAlpha(OVL *ov) {
-    int on, x0, y0, x1, y1, x, y;
+ * blends by alpha, so the RGB under a hole is never seen and needs no work.
+ *
+ * The ALPHA, though, is per-pixel noise (PaperPixel derives it from grain,
+ * fibre and blotch), so it cannot be guessed back - it has to be saved. That is
+ * what makes this restore, not a simplification: Housekeeping re-uploads when
+ * the hole moves or closes with no rebuild behind it, and a texture left
+ * punched would keep a transparent band after the taskbar parked. Forcing a
+ * constant alpha back would instead flatten the paper's own transparency.
+ *
+ * So: save the rect's pixels, zero their alpha, upload, restore. The save is
+ * only ever the hole rect (a taskbar strip), and it is freed here. */
+static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len) {
+    int on, x0, y0, x1, y1, y;
+    size_t rowbytes;
+    *saved = NULL;
+    *saved_len = 0;
     if (!ov->bits) return;
     LocalHole(ov, &on, &x0, &y0, &x1, &y1);
     if (!on) return;
+    rowbytes = (size_t)(x1 - x0) * 4;
+    *saved = (unsigned char *)malloc(rowbytes * (size_t)(y1 - y0));
+    if (!*saved) return;                 /* cannot save: leave the texture alone */
+    *saved_len = rowbytes * (size_t)(y1 - y0);
     for (y = y0; y < y1; y++) {
-        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4;
-        for (x = x0; x < x1; x++) row[4 * x + 3] = 0;
+        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4;
+        memcpy(*saved + rowbytes * (size_t)(y - y0), row, rowbytes);
+        memset(row, 0, rowbytes);
     }
+}
+
+/* Put the saved pixels back where they came from. Called after the upload, on
+ * every path, so the master texture in ov->bits is never left mutated. */
+static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len) {
+    int on, x0, y0, x1, y1, y;
+    size_t rowbytes;
+    if (!saved || !ov->bits) return;
+    /* re-derive the rect that was cleared; the hole may have moved since, but
+     * the save/restore pair is always used within one ApplyLayered call */
+    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
+    if (!on) {                           /* hole closed: nothing to write back into */
+        free(saved);
+        return;
+    }
+    rowbytes = (size_t)(x1 - x0) * 4;
+    if (rowbytes * (size_t)(y1 - y0) != saved_len) { free(saved); return; }
+    for (y = y0; y < y1; y++) {
+        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4;
+        memcpy(row, saved + rowbytes * (size_t)(y - y0), rowbytes);
+    }
+    free(saved);
 }
 
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
@@ -611,11 +646,16 @@ static void SeedPaperPreview(OVL *ov) {
 static int ApplyLayered(OVL *ov) {
     HDC screen = GetDC(NULL);
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    unsigned char *saved = NULL;
+    size_t saved_len = 0;
     int s, ok = 1;
-    /* The hole is alpha-only, so this needs no copy of the texture: the RGB
-     * stays valid and the next full build overwrites it anyway. */
+    /* Mask the taskbar hole out of this upload, then put the master texture
+     * back exactly as it was. Housekeeping re-uploads when the hole closes or
+     * moves WITHOUT rebuilding, so ov->bits must not be left mutated - that is
+     * the regression a no-restore version caused (a permanent transparent band
+     * across the bottom of the screen once the taskbar parked). */
     if (g_s.mode == MODE_PAPER)
-        ClearHoleAlpha(ov);
+        ClearHoleAlpha(ov, &saved, &saved_len);
     for (s = 0; s < ov->n_strips; s++) {
         SIZE size = { ov->w, min(STRIP_H, ov->h - s * STRIP_H) };
         POINT src = { 0, s * STRIP_H };
@@ -625,6 +665,7 @@ static int ApplyLayered(OVL *ov) {
             ok = 0;
         }
     }
+    RestoreHoleAlpha(ov, saved, saved_len);
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -1300,7 +1341,15 @@ static void PresentEinkRect(OVL *ov) {
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
                g_proc + 4 * ((size_t)(y0 + y) * g_vsw + x0),
                (size_t)ov->w * 4);
-    ClearHoleAlpha(ov);   /* same hole rule as the paper path */
+    /* Same hole rule as the paper path. No restore is needed here: this buffer
+     * is re-copied from g_proc at the top of every e-ink frame, so the hole
+     * never survives into the next upload. The save is discarded. */
+    {
+        unsigned char *saved = NULL;
+        size_t saved_len = 0;
+        ClearHoleAlpha(ov, &saved, &saved_len);
+        free(saved);
+    }
 }
 
 static void DxgiShutdown(void) {
