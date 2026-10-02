@@ -1672,7 +1672,7 @@ static const WCHAR HELP_TEXT[] =
     L"  Check for updates automatically - the app reads a tiny version file "
     L"about once a day and, only if a new version exists, shows a tray note. "
     L"Unchecked, it checks only when you press the button.\r\n"
-    L"  Show texture in screenshots and screen shares\r\n"
+    L"  Texture in shares/screenshots\r\n"
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
     L"the texture. E-ink is always hidden from captures.\r\n"
@@ -2481,7 +2481,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
         y += 34;
         g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 180, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
         y += 34;
         g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
         g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
@@ -2518,13 +2518,13 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
-        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
+        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Texture in shares/screenshots",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* daily self-check opt-out; the download itself is always manual */
-        CreateWindowExW(0, L"BUTTON", L"Check for updates automatically (about once a day)",
+        CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
@@ -2538,7 +2538,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 338, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 364, 160, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 364, 240, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
