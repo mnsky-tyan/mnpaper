@@ -1,13 +1,17 @@
 // mnPaper version metadata (product identity for the installed exe).
+// The release number comes from version.h, the same header mnPaper.c includes,
+// so the exe's resource and the number the update check compares against the
+// published feed cannot drift apart.
 #include <winver.h>
+#include "version.h"
 
 // Application icon: layered paper waves. ID 1 = default icon Explorer uses
 // for the exe.
 1 ICON "mnPaper.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    2,7,2,0
- PRODUCTVERSION 2,7,2,0
+ FILEVERSION    MNVER_MAJOR,MNVER_MINOR,MNVER_PATCH,0
+ PRODUCTVERSION MNVER_MAJOR,MNVER_MINOR,MNVER_PATCH,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32
@@ -20,12 +24,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "mnPaper"
             VALUE "FileDescription",  "mnPaper - whole-screen paper texture"
-            VALUE "FileVersion",      "2.7.2"
+            VALUE "FileVersion",      MNVER_STR
             VALUE "InternalName",     "mnPaper"
             VALUE "LegalCopyright",   "(c) mnPaper. All rights reserved."
             VALUE "OriginalFilename", "mnPaper.exe"
             VALUE "ProductName",      "mnPaper"
-            VALUE "ProductVersion",   "2.7.2"
+            VALUE "ProductVersion",   MNVER_STR
         END
     END
     BLOCK "VarFileInfo"

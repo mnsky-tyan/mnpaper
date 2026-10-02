@@ -84,19 +84,24 @@
 #define WM_APP_INSTALL  (WM_APP + 6)   /* self-update worker thread -> host window */
 
 /* ------------------------------- version -------------------------------- */
-/* Bump MNVER_* on every release. Before publishing, point UPDATE_URL at a
- * plain-text file whose first line is the latest version ("2.7.2") and whose
- * optional second line is the 64-hex SHA-256 pin of that release's exe, and
- * PRODUCT_URL at the page users download from (GitHub Releases recommended:
- * free TLS hosting, the release itself is the artifact). The check itself is
- * read-only: it fetches that feed and compares versions, so a hostile or
- * offline feed can at worst show a wrong message. The exe is downloaded only
- * after the user confirms the install prompt, and nothing is written or
- * swapped until its computed SHA-256 matches the published pin - the feed is
- * trusted for a version string, a pin, and for nothing else. */
-#define MNVER_MAJOR 2
-#define MNVER_MINOR 7
-#define MNVER_PATCH 2
+/* The release number lives in version.h, shared with mnPaper.rc, so the number
+ * compared against the published feed and the number Windows reads out of the
+ * exe's version resource cannot drift apart. They did: 2.7.3 through 2.7.5
+ * bumped only the resource, so those builds reported themselves as 2.7.2 and
+ * kept offering an update that was already installed. To cut a release, edit
+ * version.h and nothing else.
+ *
+ * Before publishing, point UPDATE_URL at a plain-text file whose first line is
+ * the latest version ("2.7.6") and whose optional second line is the 64-hex
+ * SHA-256 pin of that release's exe, and PRODUCT_URL at the page users download
+ * from (GitHub Releases recommended: free TLS hosting, the release itself is
+ * the artifact). The check itself is read-only: it fetches that feed and
+ * compares versions, so a hostile or offline feed can at worst show a wrong
+ * message. The exe is downloaded only after the user confirms the install
+ * prompt, and nothing is written or swapped until its computed SHA-256 matches
+ * the published pin - the feed is trusted for a version string, a pin, and for
+ * nothing else. */
+#include "version.h"
 #define UPDATE_URL  L"https://raw.githubusercontent.com/mnsky-tyan/mnpaper/main/version.txt"
 #define PRODUCT_URL L"https://github.com/mnsky-tyan/mnpaper/releases"
 /* self-update payload: stable redirect URL, not the rate-limited REST API */
@@ -1672,7 +1677,7 @@ static const WCHAR HELP_TEXT[] =
     L"  Check for updates automatically - the app reads a tiny version file "
     L"about once a day and, only if a new version exists, shows a tray note. "
     L"Unchecked, it checks only when you press the button.\r\n"
-    L"  Show texture in screenshots and screen shares\r\n"
+    L"  Texture in shares/screenshots\r\n"
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
     L"the texture. E-ink is always hidden from captures.\r\n"
@@ -1793,7 +1798,7 @@ static int CompareVersion(int a0, int a1, int a2, int b0, int b1, int b2) {
 
 typedef struct {
     int result;
-    WCHAR ver[24];    /* "2.7.2" as published by the feed        */
+    WCHAR ver[24];    /* version string as published by the feed */
     WCHAR hash[65];   /* 64 hex chars if the feed pins the exe    */
 } UpdInfo;
 
@@ -2481,7 +2486,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
         y += 34;
         g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 110, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 180, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
         y += 34;
         g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
         g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
@@ -2518,13 +2523,13 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
-        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Show texture in screenshots and screen shares",
+        g_chk_share = CreateWindowExW(0, L"BUTTON", L"Texture in shares/screenshots",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* daily self-check opt-out; the download itself is always manual */
-        CreateWindowExW(0, L"BUTTON", L"Check for updates automatically (about once a day)",
+        CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
@@ -2538,7 +2543,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 338, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 110, 364, 160, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 364, 240, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2650,6 +2655,21 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* The controls are laid out inside a 402x402 client rect, so the client has to
+ * be exactly that whatever frame the shell hands the window: the frame's real
+ * size depends on the display scaling, and AdjustWindowRect does not always
+ * predict it (a request for an 804x804 window was measured to produce a
+ * 778x733 client at 200%, which would have clipped the bottom row). Measure
+ * the frame that was actually applied and correct the window by the gap. */
+static void FitClient(HWND h, int cw, int ch) {
+    RECT w, c;
+    if (!h || !GetWindowRect(h, &w) || !GetClientRect(h, &c)) return;
+    SetWindowPos(h, NULL, 0, 0,
+                 (w.right - w.left) + (cw - (c.right - c.left)),
+                 (w.bottom - w.top) + (ch - (c.bottom - c.top)),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void OpenSettings(void) {
     RECT rc;
     WNDCLASSEXW wc;
@@ -2676,6 +2696,7 @@ static void OpenSettings(void) {
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
         NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (g_dlg) {
+        FitClient(g_dlg, 402, 402);   /* the client the controls are laid out in */
         DlgSyncBars();
         ShowWindow(g_dlg, SW_SHOW);
         UpdateWindow(g_dlg);
