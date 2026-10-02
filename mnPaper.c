@@ -552,13 +552,8 @@ cancelled:
     return 0;
 }
 
-static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp,
-                          int hole_on, int hx0, int hy0, int hx1, int hy1) {
-    int y;
+static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp) {
     BuildPaperFull(px, w, h, sp, NULL, 0);
-    if (hole_on)
-        for (y = hy0; y < hy1; y++)
-            memset(px + 4 * ((size_t)y * w + hx0), 0, (size_t)(hx1 - hx0) * 4);
 }
 
 
@@ -577,31 +572,50 @@ static void LocalHole(const OVL *ov, int *on, int *x0, int *y0, int *x1, int *y1
 }
 
 static void BuildPaper(OVL *ov) {
-    BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s, 0, 0, 0, 0, 0);
+    BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
+}
+
+/* Punch the taskbar hole into a texture: alpha only, RGB left alone.
+ *
+ * One implementation for every path that presents a monitor's texture. ULW
+ * blends by alpha, so the RGB under a hole is never seen, and leaving it
+ * intact means the input buffer does not have to be restored afterwards -
+ * which is what the paper path used to do (malloc, memset, upload, memcpy
+ * back). The e-ink path already cleared alpha only; this makes them agree.
+ * Both callers pass the buffer they are about to upload, so nothing depends
+ * on the RGB surviving. */
+static void ClearHoleAlpha(OVL *ov) {
+    int on, x0, y0, x1, y1, x, y;
+    if (!ov->bits) return;
+    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
+    if (!on) return;
+    for (y = y0; y < y1; y++) {
+        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4;
+        for (x = x0; x < x1; x++) row[4 * x + 3] = 0;
+    }
+}
+
+/* A monitor can appear that has no baked texture yet. Fill it with a cheap
+ * preview here - this runs on the UI thread inside RepaintAll - and let the
+ * worker replace it with the exact texture straight after. The old code ran
+ * BuildPaperFull directly: a synchronous per-pixel noise build for the whole
+ * monitor, every time the effect was switched on, the mode changed or the
+ * display changed. That is the freeze the worker exists to prevent, so the
+ * show path must never do it. */
+static void SeedPaperPreview(OVL *ov) {
+    if (!ov->bits || ov->w <= 0 || ov->h <= 0) return;
+    if (!BuildPaperPreview((unsigned char *)ov->bits, ov->w, ov->h, &g_s))
+        BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
 }
 
 static int ApplyLayered(OVL *ov) {
     HDC screen = GetDC(NULL);
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    unsigned char *saved = NULL;
-    int s, ok = 1, on = 0, x0, y0, x1, y1, y;
-    size_t rowbytes = 0;
-    /* Keep the backing texture intact. Taskbar animation changes only the
-     * presentation mask, not the noise: never queue a seconds-long rebuild
-     * merely to move a hole. ULW copies the pixels before we restore them. */
-    if (g_s.mode == MODE_PAPER) {
-        LocalHole(ov, &on, &x0, &y0, &x1, &y1);
-        if (on) {
-            rowbytes = (size_t)(x1 - x0) * 4;
-            saved = (unsigned char *)malloc(rowbytes * (y1 - y0));
-            if (!saved) on = 0;
-            else for (y = y0; y < y1; y++) {
-                unsigned char *row = (unsigned char *)ov->bits + 4 * ((size_t)y * ov->w + x0);
-                memcpy(saved + rowbytes * (y - y0), row, rowbytes);
-                memset(row, 0, rowbytes);
-            }
-        }
-    }
+    int s, ok = 1;
+    /* The hole is alpha-only, so this needs no copy of the texture: the RGB
+     * stays valid and the next full build overwrites it anyway. */
+    if (g_s.mode == MODE_PAPER)
+        ClearHoleAlpha(ov);
     for (s = 0; s < ov->n_strips; s++) {
         SIZE size = { ov->w, min(STRIP_H, ov->h - s * STRIP_H) };
         POINT src = { 0, s * STRIP_H };
@@ -611,10 +625,6 @@ static int ApplyLayered(OVL *ov) {
             ok = 0;
         }
     }
-    if (on) for (y = y0; y < y1; y++)
-        memcpy((unsigned char *)ov->bits + 4 * ((size_t)y * ov->w + x0),
-               saved + rowbytes * (y - y0), rowbytes);
-    free(saved);
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -690,7 +700,7 @@ static void ShowOverlay(OVL *ov, int show) {
     if (!ov->hwnd) return;
     if (show) {
         if (g_s.mode == MODE_PAPER)
-            BuildPaper(ov);
+            SeedPaperPreview(ov);   /* cheap; the worker bakes the exact one */
         else
             PresentEinkRect(ov);
         ApplyLayered(ov);
@@ -851,6 +861,15 @@ static void CollectTaskbars(void) {
 }
 
 static HWND g_dlg;   /* settings window, declared below */
+
+/* Is the settings window still alive? It can be closed - or destroyed by a
+ * completed self-update - while an update worker is still running, so every
+ * call site that needs an owner handle has to ask rather than assume. The rule
+ * lives here once instead of as a ternary repeated across the file, because the
+ * update path is exactly where a stale handle would do damage. */
+static HWND LiveDlg(void) {
+    return (g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL;
+}
 /* Hover tooltips RETIRED 2026-09-30 (user feedback: "the information window
  * is bad"): hover popups replaced by a ? button that opens a help window only
  * when pressed. The comctl32 tooltip had crashed; the own tip popup worked
@@ -1178,6 +1197,12 @@ static void RepaintAll(void) {
         ApplyCaptureState(&g_ov[i]);
         ShowOverlay(&g_ov[i], g_s.master);
     }
+    /* The show path only lays down a cheap preview (or the current e-ink
+     * frame). Follow it with one full-quality request so what is on screen is
+     * always the exact texture, without the UI thread ever doing the heavy
+     * per-pixel work. Nothing is queued while the effect is off. */
+    if (g_s.master && g_s.mode == MODE_PAPER)
+        RequestPaper();
 }
 
 /* ----------------------------------------------------------------- e-ink --- */
@@ -1275,15 +1300,7 @@ static void PresentEinkRect(OVL *ov) {
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
                g_proc + 4 * ((size_t)(y0 + y) * g_vsw + x0),
                (size_t)ov->w * 4);
-    {
-        int on, hx0, hy0, hx1, hy1, x;
-        LocalHole(ov, &on, &hx0, &hy0, &hx1, &hy1);
-        if (on)
-            for (y = hy0; y < hy1; y++) {
-                unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4;
-                for (x = hx0; x < hx1; x++) row[4 * x + 3] = 0;
-            }
-    }
+    ClearHoleAlpha(ov);   /* same hole rule as the paper path */
 }
 
 static void DxgiShutdown(void) {
@@ -1891,7 +1908,7 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         goto done;
     while (total < max_bytes) {
         if (!WinHttpQueryDataAvailable(req, &got) || !got) break;
-        if (got > max_bytes - total) { if (too_big) *too_big = 1; goto done; }   /* too large: refuse it whole */
+        if (got > max_bytes - total) { if (too_big) *too_big = 1; goto done; }   /* more than the cap holds: refuse it whole */
         if (total + got > cap) {
             cap = total + got;
             if (cap < 262144) cap = 262144;
@@ -1902,7 +1919,11 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         if (!WinHttpReadData(req, buf + total, got, &got)) goto done;
         total += got;
     }
-    if (total >= max_bytes) { if (too_big) *too_big = 1; goto done; }  /* the cap is a bound, never a body length */
+    /* A body that filled the cap exactly is complete and legitimate - the loop
+     * above stops the moment total reaches max_bytes. Only a body with bytes
+     * still to read is over the cap, and that case is refused inside the loop.
+     * The old `total >= max_bytes` check here counted a body of exactly the cap
+     * as oversized and threw away a good download. */
     if (buf && total) {
         *out_buf = buf;
         *out_len = total;
@@ -1992,14 +2013,14 @@ static void StartUpdateCheck(int manual) {
     }
     if (InterlockedCompareExchange(&g_update_busy, 1, 0) != 0) {
         if (manual)
-            UpdateBusyNotice((g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL);
+            UpdateBusyNotice(LiveDlg());
         return;   /* a check is already running */
     }
     g_upd_manual = manual;
     t = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
     if (!t) {
         InterlockedExchange(&g_update_busy, 0);
-        if (manual) UpdateStartFailed((g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL);
+        if (manual) UpdateStartFailed(LiveDlg());
         return;
     }
     CloseHandle(t);   /* the busy flag clears in the thread */
@@ -2211,7 +2232,7 @@ static void InstallResult(InstInfo *in) {
     unsigned char *buf;
     DWORD len, wrote;
     HANDLE f;
-    HWND owner = (g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL;
+    HWND owner = LiveDlg();
     if (!in) return;
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     if (in->result == UPD_DL_MISMATCH) {
@@ -2301,7 +2322,7 @@ static void InstallResult(InstInfo *in) {
             L"Please start mnPaper from your shortcut or the Start menu.",
             L"mnPaper - update", MB_OK | MB_ICONWARNING);
     L("self-update: swapped and relaunching");
-    if (g_dlg && IsWindow(g_dlg)) DestroyWindow(g_dlg);
+    if (LiveDlg()) DestroyWindow(g_dlg);
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
 }
 
@@ -2382,8 +2403,9 @@ static int TbVal(HWND t) {
 }
 
 /* numeric readout next to each slider: the veil change can be subtle, the
-   number always responds */
-static HWND g_val[8];   /* by control id - 100 */
+   number always responds. Indexed by ROW ORDER (0..7), not by control id; the
+   matching slider ids live in UpdateVals' own table below. */
+static HWND g_val[8];
 
 static void UpdateVals(HWND dlg) {
     static const int ids[8] = { 100, 101, 102, 103, 104, 105, 106, 107 };
@@ -2715,7 +2737,7 @@ static void OpenSettings(void) {
 /* ------------------------------------------------------------ commands --- */
 
 static void SyncMasterCheckbox(void) {   /* mirror g_s.master into control 118 */
-    if (g_dlg && IsWindow(g_dlg))
+    if (LiveDlg())
         SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
                      g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
 }
@@ -2736,7 +2758,7 @@ static void SetMode(int mode) {
     if (mode == MODE_EINK)
         EinkEnsureBuffers();
     SaveSettings();
-    if (g_dlg && IsWindow(g_dlg)) {
+    if (LiveDlg()) {
         /* Morph the dialog in place rather than closing it: re-read bar
          * ranges for the new mode, then re-show rows and values. */
         DlgSyncBars();
@@ -2893,7 +2915,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_s.mode == MODE_EINK)
                 EinkEnsureBuffers();
             RepaintAll();
-            if (g_dlg && IsWindow(g_dlg)) {
+            if (LiveDlg()) {
                 DlgSyncBars();
                 UpdateVals(g_dlg);
                 SyncModeRadios(g_dlg, g_s.mode == MODE_PAPER ? 114 : 115);
@@ -2927,7 +2949,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
             g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
-            if (g_dlg && IsWindow(g_dlg)) {
+            if (LiveDlg()) {
                 DlgSyncBars();
                 UpdateVals(g_dlg);
             }
@@ -2950,7 +2972,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_AUTOSTART:
             g_s.autostart = g_s.autostart ? 0 : 1;
             SaveSettings();
-            if (g_dlg && IsWindow(g_dlg))
+            if (LiveDlg())
                 SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
                              g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
             L("autostart=%d", g_s.autostart);
@@ -2958,7 +2980,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_AUTOUPD:
             g_s.autoupd = g_s.autoupd ? 0 : 1;
             SaveSettings();
-            if (g_dlg && IsWindow(g_dlg))
+            if (LiveDlg())
                 SendMessageW(GetDlgItem(g_dlg, 120), BM_SETCHECK,
                              g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
             L("autoupd=%d", g_s.autoupd);
