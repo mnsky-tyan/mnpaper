@@ -1629,30 +1629,9 @@ static HWND g_lb_strength, g_lb_warmth, g_lb_grain, g_lb_fibre, g_lb_blotch;
 static HWND g_lb_shades, g_lb_contrast, g_lb_dither;
 static int   g_advanced;
 static const WCHAR *SET_CLASS = L"MnPaperSettings";
-/* ------------------------- display scaling --------------------------------
- * The process is per-monitor DPI aware, so Windows renders every UI font at
- * the display's scaling factor while pixel literals in this file would stay
- * the size they were on a 96-dpi screen. Text then outgrows the controls that
- * hold it (a caption 409 device pixels wide inside a 352 device pixel box is
- * silently chopped, with no ellipsis). UiDpi() measures the display once, on
- * first use, and S() converts a design pixel into device pixels, so the whole
- * settings window and the help window grow with the text they contain. */
-static int g_ui_dpi = 0;                /* 0 = not measured yet */
-static int UiDpi(void) {
-    if (!g_ui_dpi) {
-        HDC dc = GetDC(NULL);
-        int d = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
-        if (dc) ReleaseDC(NULL, dc);
-        g_ui_dpi = (d >= 96 && d <= 480) ? d : 96;
-    }
-    return g_ui_dpi;
-}
-static int S(int px) { return MulDiv(px, UiDpi(), 96); }
-
 /* ---------------- on-demand help window (replaces hover tips) ------------- */
 
 static HWND g_helpwnd;          /* single "?" help window              */
-static HFONT g_helpfont;        /* its font, freed when the window closes */
 int g_test_headless = 0;        /* tests create the help window hidden */
 static void SetMaster(int on);  /* defined in the commands section below */
 
@@ -1723,7 +1702,6 @@ static LRESULT CALLBACK HelpProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         if (h == g_helpwnd) g_helpwnd = NULL;
-        if (g_helpfont) { DeleteObject(g_helpfont); g_helpfont = NULL; }
         break;
     }
     return DefWindowProcW(h, m, wp, lp);
@@ -1741,6 +1719,7 @@ static void OpenHelp(HWND owner) {
     WNDCLASSEXW w;
     RECT rc, cr;
     HWND e;
+    HFONT f;
     if (g_helpwnd && IsWindow(g_helpwnd)) {
         HelpPresent(g_helpwnd);
         return;
@@ -1755,7 +1734,7 @@ static void OpenHelp(HWND owner) {
     w.hIcon         = LoadIconW(w.hInstance, MAKEINTRESOURCEW(1));
     w.hIconSm       = w.hIcon;
     RegisterClassExW(&w);   /* re-registration after a close fails harmlessly */
-    rc.left = 0; rc.top = 0; rc.right = S(470); rc.bottom = S(580);
+    rc.left = 0; rc.top = 0; rc.right = 470; rc.bottom = 580;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_helpwnd = CreateWindowExW(0, L"MnPaperHelp", L"mnPaper help",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
@@ -1767,17 +1746,8 @@ static void OpenHelp(HWND owner) {
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_LEFT,
         0, 0, cr.right, cr.bottom,
         g_helpwnd, NULL, GetModuleHandleW(NULL), NULL);
-    /* Same font the settings controls draw with, so the help text matches the
-     * window it belongs to instead of staying at its unscaled size. */
-    {
-        NONCLIENTMETRICSW ncm;
-        memset(&ncm, 0, sizeof ncm);
-        ncm.cbSize = sizeof ncm;
-        g_helpfont = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0)
-                   ? CreateFontIndirectW(&ncm.lfMessageFont) : NULL;
-    }
-    SendMessageW(e, WM_SETFONT,
-                 (WPARAM)(g_helpfont ? g_helpfont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
     HelpPresent(g_helpwnd);
 }
 
@@ -2390,7 +2360,7 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
 static HWND MkTrack(HWND parent, int id, int lo, int hi, int pos, int x, int y, int w, int h) {
     HWND t = CreateWindowExW(0, L"msctls_trackbar32", NULL,
         WS_CHILD | WS_VISIBLE | TBS_HORZ | WS_TABSTOP,
-        S(x), S(y), S(w), S(h), parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+        x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
     SendMessageW(t, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
     SendMessageW(t, TBM_SETPOS, TRUE, pos);
     return t;
@@ -2399,7 +2369,7 @@ static HWND MkTrack(HWND parent, int id, int lo, int hi, int pos, int x, int y, 
 static HWND MkLabel(HWND parent, const WCHAR *text, int x, int y, int w, int h) {
     return CreateWindowExW(0, L"STATIC", text,
         WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
-        S(x), S(y), S(w), S(h), parent, NULL, GetModuleHandleW(NULL), NULL);
+        x, y, w, h, parent, NULL, GetModuleHandleW(NULL), NULL);
 }
 
 static int TbVal(HWND t) {
@@ -2500,8 +2470,7 @@ static void SyncModeRadios(HWND dlg, int id) {
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        int y = 14;   /* design pixels: MkLabel/MkTrack and the buttons below
-                       * scale them for the display */
+        int y = 14;
         g_val[0] = MkLabel(hwnd, L"30", 302, y + 4, 44, 20); g_tb_intensity = MkTrack(hwnd, 100, 0, 40,  g_s.intensity, 106, y, 190, 26);
         g_lb_strength = MkLabel(hwnd, L"Strength", 14, y + 4, 92, 20);
         y += 34;
@@ -2512,7 +2481,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lb_grain = MkLabel(hwnd, L"Grain",    14, y + 4, 92, 20);
         y += 34;
         g_btn_adv = CreateWindowExW(0, L"BUTTON", L"Advanced >>",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, S(14), S(y), S(180), S(24), hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, y, 180, 24, hwnd, (HMENU)110, GetModuleHandleW(NULL), NULL);
         y += 34;
         g_val[3] = MkLabel(hwnd, L"40", 302, y + 4, 44, 20); g_tb_fibre     = MkTrack(hwnd, 103, 0, 100, g_s.fibre, 106, y, 190, 26);
         g_lb_fibre = MkLabel(hwnd, L"Fibre",    14, y + 4, 92, 20);
@@ -2528,48 +2497,48 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
          * morphs (SetMode refreshes rows in place). */
         CreateWindowExW(0, L"BUTTON", L"Paper",
-            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, S(14), S(226), S(80), S(20), hwnd, (HMENU)114,
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"E-ink",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, S(100), S(226), S(80), S(20), hwnd, (HMENU)115,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
         SyncModeRadios(hwnd, g_s.mode == MODE_PAPER ? 114 : 115);
         /* Texture on/off: hide the veil without quitting the app (same as the
          * tray's master toggle and Ctrl+Alt+P). */
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, S(14), S(250), S(352), S(20), hwnd, (HMENU)118,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
                      g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Autostart: mirrors the tray's Start-with-Windows item. */
         CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, S(14), S(272), S(352), S(20), hwnd, (HMENU)119,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 119), BM_SETCHECK,
                      g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Texture in shares/screenshots",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, S(14), S(294), S(352), S(20), hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* daily self-check opt-out; the download itself is always manual */
         CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, S(14), S(316), S(352), S(20), hwnd, (HMENU)120,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
         SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
                      g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, S(14), S(338), S(26), S(24), hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 338, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"&Close",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, S(135), S(338), S(110), S(24), hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 338, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, S(81), S(364), S(240), S(24), hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 364, 240, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DlgLayout();
         UpdateVals(hwnd);
@@ -2681,9 +2650,12 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-/* The controls are laid out inside a design client rect, so the client has to
- * be exactly S(402)xS(402) whatever frame the shell gives the window: measure
- * the real frame and correct the window size by the difference. */
+/* The controls are laid out inside a 402x402 client rect, so the client has to
+ * be exactly that whatever frame the shell hands the window: the frame's real
+ * size depends on the display scaling, and AdjustWindowRect does not always
+ * predict it (a request for an 804x804 window was measured to produce a
+ * 778x733 client at 200%, which would have clipped the bottom row). Measure
+ * the frame that was actually applied and correct the window by the gap. */
 static void FitClient(HWND h, int cw, int ch) {
     RECT w, c;
     if (!h || !GetWindowRect(h, &w) || !GetClientRect(h, &c)) return;
@@ -2712,14 +2684,14 @@ static void OpenSettings(void) {
     wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     g_advanced = 0;
-    rc.left = 0; rc.top = 0; rc.right = S(402); rc.bottom = S(402);
+    rc.left = 0; rc.top = 0; rc.right = 402; rc.bottom = 402;
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     g_dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, SET_CLASS,
         L"mnPaper settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
         NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (g_dlg) {
-        FitClient(g_dlg, S(402), S(402));   /* the client the controls expect */
+        FitClient(g_dlg, 402, 402);   /* the client the controls are laid out in */
         DlgSyncBars();
         ShowWindow(g_dlg, SW_SHOW);
         UpdateWindow(g_dlg);
@@ -3173,7 +3145,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         SaveSettings();
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    (void)UiDpi();   /* measure the display now that we are DPI aware */
     InitCommonControls();
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
