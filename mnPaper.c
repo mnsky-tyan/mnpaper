@@ -172,12 +172,20 @@ static int g_upd_fails;              /* consecutive checks that could not read t
 static FILE *g_log;
 static void L(const char *fmt, ...) {
     va_list ap;
-    if (!g_log) return;
+    char buf[512];
+    int n;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
-    fprintf(g_log, "\n");
-    fflush(g_log);
+    n = _vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    buf[sizeof buf - 1] = 0;
+    if (n > 0) OutputDebugStringA(buf);   /* visible in DbgView, no log file needed */
+    if (g_log) {
+        va_start(ap, fmt);
+        vfprintf(g_log, fmt, ap);
+        fprintf(g_log, "\n");
+        fflush(g_log);
+        va_end(ap);
+    }
 }
 
 static void ClampSettingsOf(SETTINGS *s) {
@@ -206,8 +214,8 @@ static void ApplyAutostart(void) {
         WCHAR path[MAX_PATH];
         DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
         if (n > 0)
-            RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)path, (n + 1) * sizeof(WCHAR));        else
-            RegDeleteValueW(k, L"mnPaper");
+            RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)path, (n + 1) * sizeof(WCHAR));
+        /* a transient path-read failure here must not silently disable autostart */
     } else {
         RegDeleteValueW(k, L"mnPaper");
     }
@@ -589,14 +597,16 @@ static void BuildPaper(OVL *ov) {
  *
  * So: save the rect's pixels, zero their alpha, upload, restore. The save is
  * only ever the hole rect (a taskbar strip), and it is freed here. */
-static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len) {
+static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
     int on, x0, y0, x1, y1, y;
     size_t rowbytes;
     *saved = NULL;
     *saved_len = 0;
+    *rx0 = *ry0 = *rx1 = *ry1 = 0;
     if (!ov->bits) return;
     LocalHole(ov, &on, &x0, &y0, &x1, &y1);
     if (!on) return;
+    *rx0 = x0; *ry0 = y0; *rx1 = x1; *ry1 = y1;
     rowbytes = (size_t)(x1 - x0) * 4;
     *saved = (unsigned char *)malloc(rowbytes * (size_t)(y1 - y0));
     if (!*saved) return;                 /* cannot save: leave the texture alone */
@@ -610,17 +620,14 @@ static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len) {
 
 /* Put the saved pixels back where they came from. Called after the upload, on
  * every path, so the master texture in ov->bits is never left mutated. */
-static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len) {
-    int on, x0, y0, x1, y1, y;
+static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, int x0, int y0, int x1, int y1) {
+    int y;
     size_t rowbytes;
     if (!saved || !ov->bits) return;
-    /* re-derive the rect that was cleared; the hole may have moved since, but
-     * the save/restore pair is always used within one ApplyLayered call */
-    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
-    if (!on) {                           /* hole closed: nothing to write back into */
-        free(saved);
-        return;
-    }
+    /* Restore by the rect that was actually saved, never by re-reading the
+     * live hole: the live state may already differ, but the pixels must
+     * come back regardless or the punched alpha stays permanent (that was
+     * the 2.7.7 regression). */
     rowbytes = (size_t)(x1 - x0) * 4;
     if (rowbytes * (size_t)(y1 - y0) != saved_len) { free(saved); return; }
     for (y = y0; y < y1; y++) {
@@ -649,13 +656,14 @@ static int ApplyLayered(OVL *ov) {
     unsigned char *saved = NULL;
     size_t saved_len = 0;
     int s, ok = 1;
+    int rx0=0, ry0=0, rx1=0, ry1=0;
     /* Mask the taskbar hole out of this upload, then put the master texture
      * back exactly as it was. Housekeeping re-uploads when the hole closes or
      * moves WITHOUT rebuilding, so ov->bits must not be left mutated - that is
      * the regression a no-restore version caused (a permanent transparent band
      * across the bottom of the screen once the taskbar parked). */
     if (g_s.mode == MODE_PAPER)
-        ClearHoleAlpha(ov, &saved, &saved_len);
+        ClearHoleAlpha(ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
     for (s = 0; s < ov->n_strips; s++) {
         SIZE size = { ov->w, min(STRIP_H, ov->h - s * STRIP_H) };
         POINT src = { 0, s * STRIP_H };
@@ -665,7 +673,7 @@ static int ApplyLayered(OVL *ov) {
             ok = 0;
         }
     }
-    RestoreHoleAlpha(ov, saved, saved_len);
+    RestoreHoleAlpha(ov, saved, saved_len, rx0, ry0, rx1, ry1);
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -811,7 +819,6 @@ static RECT g_tb[TB_MAX];
 static HWND g_tbw[TB_MAX];
 static int  g_ntb;
 static int  g_tb_state[TB_MAX];   /* 0 unknown, 1 parked, 2 revealed */
-static int  g_housekeep_n;  /* (reserved for slow tick work) */
 
 /* Pills-only hole: on Windows 11 the taskbar WINDOW is a full-width strip
  * while it only DRAWS three floating surfaces (Start button, icon pill,
@@ -1347,7 +1354,8 @@ static void PresentEinkRect(OVL *ov) {
     {
         unsigned char *saved = NULL;
         size_t saved_len = 0;
-        ClearHoleAlpha(ov, &saved, &saved_len);
+        int rx0=0, ry0=0, rx1=0, ry1=0;
+        ClearHoleAlpha(ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
         free(saved);
     }
 }
@@ -2863,43 +2871,6 @@ static void TrayMenu(void) {
 }
 
 /* one-shot self check on a live desktop: styles, click-through, taskbar, guard */
-static void SelfCheck(void) {
-    DWORD aff;
-    int i;
-    for (i = 0; i < g_n; i++) {
-        OVL *ov = &g_ov[i];
-        LONG ex;
-        RECT rc;
-        POINT c;
-        HWND hit;
-        WCHAR cls[128] = L"?";
-        LRESULT ht;
-        if (!ov->hwnd) continue;
-        GetWindowRect(ov->hwnd, &rc);
-        ex = GetWindowLongW(ov->hwnd, GWL_EXSTYLE);
-        L("overlay %d: %dx%d rect=(%ld,%ld)-(%ld,%ld)", ov->idx, ov->w, ov->h, rc.left, rc.top, rc.right, rc.bottom);
-        L("  exstyle=%08lx LAYERED=%ld TRANSPARENT=%ld TOOLWINDOW=%ld NOACTIVATE=%ld TOPMOST=%ld",
-          (unsigned long)ex, (long)((ex & WS_EX_LAYERED) != 0), (long)((ex & WS_EX_TRANSPARENT) != 0),
-          (long)((ex & WS_EX_TOOLWINDOW) != 0), (long)((ex & WS_EX_NOACTIVATE) != 0),
-          (long)((ex & WS_EX_TOPMOST) != 0));
-        c.x = (rc.left + rc.right) / 2;
-        c.y = (rc.top + rc.bottom) / 2;
-        hit = WindowFromPoint(c);
-        if (hit) GetClassNameW(hit, cls, 128);
-        L("  WindowFromPoint(center)=%p class=%S -> %s", (void *)hit, cls,
-          hit == ov->hwnd ? "HIT OVERLAY (BAD)" : "fell through (click-through OK)");
-        ht = SendMessageW(ov->hwnd, WM_NCHITTEST, 0, MAKELPARAM(c.x - rc.left, c.y - rc.top));
-        L("  WM_NCHITTEST=%ld (DefWindowProc does not implement the style, informational)", (long)ht);
-        aff = 0;
-        if (GetWindowDisplayAffinity(ov->hwnd, &aff))
-            L("  capture: hidden=%d (share=%d eink=%d force=%d actual_affinity=%d)",
-              CaptureHidden(), g_s.share, g_s.mode == MODE_EINK, g_force_capture_show, aff);
-    }
-    CollectTaskbars();
-    for (i = 0; i < g_ntb; i++)
-        L("selfcheck: taskbar %d at %ld,%ld %ldx%ld", i, g_tb[i].left, g_tb[i].top,
-          g_tb[i].right - g_tb[i].left, g_tb[i].bottom - g_tb[i].top);
-}
 
 static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -2910,9 +2881,6 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* hourly wakeup: UpdDue's 22h stamp decides if this one fetches */
             SetTimer(hwnd, TIMER_UPD, 3600000, NULL);
             StartUpdateCheck(0);
-        } else if (wp == 3) {
-            KillTimer(hwnd, 3);
-            SelfCheck();
         } else if (wp == TIMER_TICK) {
             Housekeeping();
             if (g_s.master && g_s.mode == MODE_EINK)
@@ -3057,7 +3025,6 @@ static SETTINGS g_cli_settings;
 
 static WCHAR g_sets[16][80];
 static int    g_nsets;
-static int g_selfcheck;
 static const WCHAR *g_dump_tex;
 static const WCHAR *g_dump_eink;
 static int g_dump_w = 960, g_dump_h = 600;
@@ -3069,6 +3036,12 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
     if (!eq || eq - arg >= 64) return 0;
     wcsncpy(key, arg, (size_t)(eq - arg));
     key[eq - arg] = 0;
+    {   /* a malformed --set value must be refused, not become a silent 0 */
+        const WCHAR *p = eq + 1;
+        if (!*p) return 0;
+        for (; *p; p++)
+            if (*p < L'0' || *p > L'9') return 0;
+    }
     v = _wtoi(eq + 1);
     if (!_wcsicmp(key, L"intensity")) s->intensity = v;
     else if (!_wcsicmp(key, L"warmth")) s->warmth = v;
@@ -3094,7 +3067,8 @@ static void ApplySets(SETTINGS *s) {
         WCHAR buf[80];
         wcsncpy(buf, g_sets[i], 79);
         buf[79] = 0;
-        SetKeyValue(s, buf);
+        if (!SetKeyValue(s, buf))
+            L("ignoring unknown or malformed --set entry: %S", buf);
     }
     ClampSettingsOf(s);
 }
@@ -3122,6 +3096,7 @@ static int SendToRunning(void) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     SetUnhandledExceptionFilter(CrashDump);
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSEXW wc;
     MSG msg;
     HANDLE mutex;
@@ -3154,8 +3129,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 if (g_nsets < 16)
                     wcsncpy(g_sets[g_nsets++],
                             !_wcsicmp(argv[i], L"on") ? L"share=1" : L"share=0", 79);
-            } else if (!_wcsicmp(argv[i], L"--selfcheck")) {
-                g_selfcheck = 1;
             } else if (!_wcsicmp(argv[i], L"--toggle")) g_cmd = CMD_TOGGLE;
             else if (!_wcsicmp(argv[i], L"--on"))     g_cmd = CMD_ON;
             else if (!_wcsicmp(argv[i], L"--off"))    g_cmd = CMD_OFF;
@@ -3171,6 +3144,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
                     i++;
                 }
                 i--;
+            } else {
+                L("ignoring unknown argument: %S", argv[i]);
             }
         }
         LocalFree(argv);
@@ -3201,6 +3176,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         GetModuleFileNameW(NULL, exe, MAX_PATH);
         lstrcpyW(oldp, exe); lstrcpyW(oldp + lstrlenW(oldp), L".old");
         DeleteFileW(oldp);   /* best effort; may still be locked right after the swap */
+        {   /* the updater's throwaway .cmd also outlives its run */
+            WCHAR tdir[MAX_PATH], cmdp[MAX_PATH + 24];
+            if (GetTempPathW(MAX_PATH, tdir)) {
+                _snwprintf(cmdp, MAX_PATH + 24, L"%smnpaper-upd.cmd", tdir);
+                DeleteFileW(cmdp);
+            }
+        }
     }
 
     mutex = CreateMutexW(NULL, TRUE, L"mnPaper-single-instance");
@@ -3220,7 +3202,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         ApplySets(&g_s);
         SaveSettings();
     }
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -3266,8 +3247,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* the daily update check: the host window lives for the whole process, the
      * settings dialog does not */
     SetTimer(g_host, TIMER_UPD, 30000, NULL);
-    if (g_selfcheck)
-        SetTimer(g_host, 3, 1500, NULL);
 
     SyncOverlays();
     if (g_s.mode == MODE_EINK)
