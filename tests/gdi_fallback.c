@@ -33,28 +33,29 @@ int main(void) {
     size_t probe = ((size_t)1 * 64 + 3) * 4 + 2;   /* row 1, pixel 3, blue */
     unsigned char live;
 
+    unsigned char *dst;
     g_test_headless = 1;
     /* a small capture: the properties under test do not depend on size, and a
      * 64x48 grab is quick anywhere the test runs */
     g_vsx = g_vsy = 0;
     g_vsw = 64; g_vsh = 48;
-    g_cap = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
-    Check(g_cap != NULL, "capture buffer allocated");
-    if (!g_cap) { printf("RESULT %d failure(s)\n", failures); return 1; }
-    memset(g_cap, 0x80, (size_t)g_vsw * g_vsh * 4);
+    dst = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
+    Check(dst != NULL, "destination capture buffer allocated");
+    if (!dst) { printf("RESULT %d failure(s)\n", failures); return 1; }
+    memset(dst, 0x80, (size_t)g_vsw * g_vsh * 4);
     n = (size_t)g_vsw * g_vsh * 4;
 
     /* first call allocates the DIB/DC/shadow and grabs */
-    GdiPoll();                      /* allocation; result is desktop-dependent */
+    GdiPoll(dst);                      /* allocation; result is desktop-dependent */
     Check(g_gdi_bmp != NULL && g_gdi_dc != NULL && g_gdi_prev != NULL,
           "grab DIB, DC and previous buffer exist");
     memset(g_gdi_prev, 0xFF, n);    /* force the comparison to differ, on any desktop */
-    Check(GdiPoll() == 1, "a grab that differs from the shadow reports a change");
-    Check(memcmp(g_cap, g_gdi_bits, n) == 0, "the grab reaches g_cap");
+    Check(GdiPoll(dst) == 1, "a grab that differs from the shadow reports a change");
+    Check(memcmp(dst, g_gdi_bits, n) == 0, "the grab reaches the caller's buffer");
 
     /* PERSISTENCE: the same DIB and DC survive later ticks */
     bmp_before = g_gdi_bmp; bits_before = g_gdi_bits;
-    Check(GdiPoll() == 0, "an unchanged screen does no work");
+    Check(GdiPoll(dst) == 0, "an unchanged screen does no work");
     Check(g_gdi_bmp == bmp_before && g_gdi_bits == bits_before,
           "the DIB is reused across ticks, not recreated each 50 ms");
 
@@ -63,25 +64,24 @@ int main(void) {
      * like. The poller must notice and must update its shadow. */
     live = g_gdi_bits[probe];
     g_gdi_prev[probe] = (unsigned char)(live ^ 0x07);
-    Check(GdiPoll() == 1, "a change at an unsampled coordinate is still detected");
+    Check(GdiPoll(dst) == 1, "a change at an unsampled coordinate is still detected");
     Check(g_gdi_prev[probe] != (live ^ 0x07) || live == (g_gdi_bits[probe] ^ 0x07),
           "the shadow is resynced to the live grab after a detected change");
-    Check(GdiPoll() == 0, "the resynced poller stays quiet when nothing moves");
+    Check(GdiPoll(dst) == 0, "the resynced poller stays quiet when nothing moves");
 
     /* a restart (size change, or e-ink shutdown) rebuilds cleanly */
     GdiResetGrabs();
     Check(g_gdi_bmp == NULL && g_gdi_dc == NULL && g_gdi_prev == NULL,
           "reset releases the DIB, the DC and the shadow buffer");
-    Check(GdiPoll() == 1, "the next grab after a reset rebuilds and reports");
-    Check(GdiPoll() == 0, "the rebuilt poller stays quiet when nothing moves");
+    Check(GdiPoll(dst) == 1, "the next grab after a reset rebuilds and reports");
+    Check(GdiPoll(dst) == 0, "the rebuilt poller stays quiet when nothing moves");
 
     /* the e-ink teardown path releases the same objects twice safely */
     GdiResetGrabs();
     GdiResetGrabs();
     Check(g_gdi_prev == NULL, "double reset is safe");
     GdiResetGrabs();
-
-    free(g_cap); g_cap = NULL;
+    free(dst);
     printf("RESULT %d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

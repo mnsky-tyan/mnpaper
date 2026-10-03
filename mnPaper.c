@@ -1238,9 +1238,23 @@ static void ApplyPaperResult(PaperDone *d) {
     FreePaperDone(d);
 }
 
+/* The e-ink run state is decided here, before the e-ink section defines it. */
+static void EinkWorkerSet(int want);
+static int  EinkBuffersReady(void);
+static void EinkBuffersRestart(void);
+static LONG g_eset_gen;               /* bumped whenever settings change */
+static LONG g_egen_done;              /* generation the worker has rendered */
+
 static void RepaintAll(void) {
     int i;
     PaperWorkerStop();  /* A mode/master/CLI change invalidates old snapshots. */
+    if (g_s.master && g_s.mode == MODE_EINK) {
+        InterlockedIncrement(&g_eset_gen);   /* re-render even with a static screen */
+        if (!EinkBuffersReady()) EinkBuffersRestart();
+        else EinkWorkerSet(1);
+    } else {
+        EinkWorkerSet(0);
+    }
     for (i = 0; i < g_n; i++) {
         ApplyCaptureState(&g_ov[i]);
         ShowOverlay(&g_ov[i], g_s.master);
@@ -1270,8 +1284,37 @@ static ID3D11DeviceContext *g_ctx;
 static OUTINFO g_out[MAX_OUT];
 static int g_nout;
 static int g_vsx, g_vsy, g_vsw, g_vsh;
-static unsigned char *g_cap;
-static unsigned char *g_proc;
+/* -------------------------------------------------- e-ink ring and worker ---
+ *
+ * The heavy e-ink step - a per-pixel double-precision conversion of the whole
+ * virtual screen - used to run on the UI thread inside the 50 ms tick, so
+ * dragging a slider or opening a menu stuttered while e-ink was live. The
+ * paper path already solved this with a worker thread; e-ink follows the
+ * same shape:
+ *
+ *   UI thread  capture (DXGI duplication, or the GDI fallback) into a free
+ *              ring slot, publish it, keep ticking.
+ *   worker     convert the newest slot into the build buffer, publish the
+ *              result by swapping the show pointer, post a paint message.
+ *   UI thread  present: memcpy the show buffer per monitor, upload the strips.
+ *
+ * Only the memcpy and the layered upload stay on the UI thread - exactly the
+ * work the paper path already does there. Slot states: 0 free, 4 filling
+ * (being captured), 1 newest (ready), 2 older (droppable when a newer one
+ * arrives), 3 retained (what the worker last rendered, kept so a settings
+ * change can re-render it when the screen is static). */
+#define EINK_SLOTS 3
+#define WM_APP_EINK (WM_APP + 8)
+
+static unsigned char *g_ecap[EINK_SLOTS];
+static unsigned char *g_eproc_a, *g_eproc_b;
+static unsigned char *g_eproc_show;    /* the UI thread presents this one */
+static unsigned char *g_ebuild;        /* the worker renders into this one */
+static LONG  g_ecap_state[EINK_SLOTS];
+static HANDLE g_ework, g_ewake;
+static volatile LONG g_estop;
+static CRITICAL_SECTION g_ecs;
+static int   g_ecs_ready;
 static int  g_dxgi = 0;        /* 0 uninit, 1 live, -1 failed (use GDI) */
 static int  g_gdi_only = 0;     /* duplication unavailable: BitBlt fallback */
 static DWORD g_dxgi_fail_at;
@@ -1285,45 +1328,64 @@ static const int BAYER4[4][4] = {
 };
 
 static void EinkEnsureBuffers(void) {
-    if (g_cap && g_proc) {
+    int i;
+    size_t n;
+    if (g_ecap[0] && g_eproc_show) {
         /* size may have changed */
         int vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         int vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if (vsw == g_vsw && vsh == g_vsh) return;
     }
-    free(g_cap); free(g_proc);
+    for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; }
+    free(g_eproc_a); free(g_eproc_b);
+    g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
     g_vsx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     g_vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     g_vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (g_vsw <= 0 || g_vsh <= 0) { g_cap = g_proc = NULL; return; }
-    g_cap  = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
-    g_proc = (unsigned char *)malloc((size_t)g_vsw * g_vsh * 4);
-    memset(g_cap, 0x80, (size_t)g_vsw * g_vsh * 4);
-    memset(g_proc, 0xFF, (size_t)g_vsw * g_vsh * 4);
-    L("buffers %dx%d", g_vsw, g_vsh);
+    if (g_vsw <= 0 || g_vsh <= 0) return;
+    n = (size_t)g_vsw * g_vsh * 4;
+    for (i = 0; i < EINK_SLOTS; i++) {
+        g_ecap[i] = (unsigned char *)malloc(n);
+        if (!g_ecap[i]) { while (--i >= 0) { free(g_ecap[i]); g_ecap[i] = NULL; } return; }
+        memset(g_ecap[i], 0x80, n);
+    }
+    g_eproc_a = (unsigned char *)malloc(n);
+    g_eproc_b = (unsigned char *)malloc(n);
+    if (!g_eproc_a || !g_eproc_b) { free(g_eproc_a); free(g_eproc_b); g_eproc_a = g_eproc_b = NULL; 
+        for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; } return; }
+    memset(g_eproc_a, 0xFF, n);
+    memset(g_eproc_b, 0xFF, n);
+    g_eproc_show = g_eproc_a;
+    g_ebuild     = g_eproc_b;
+    for (i = 0; i < EINK_SLOTS; i++) g_ecap_state[i] = 0;
+    L("buffers %dx%d (3 capture slots, 2 processed)", g_vsw, g_vsh);
 }
 
 static void EinkFreeBuffers(void) {
-    free(g_cap); free(g_proc);
-    g_cap = g_proc = NULL;
+    EinkWorkerSet(0);           /* never free a live worker's buffers */
+    { int i; for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; } }
+    free(g_eproc_a); free(g_eproc_b);
+    g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
+    { int i; for (i = 0; i < EINK_SLOTS; i++) g_ecap_state[i] = 0; }
     GdiResetGrabs();   /* the grab DC/DIB are bound to the thread that polls */
 }
 
 void EinkShutdownCapture(void);
 
-static void EinkProcess(void) {
-    int w = g_vsw, h = g_vsh, x, y;
+/* Pure function of (src, dst, w, h): no globals read except the settings,
+ * so it is safe to run on the worker thread and in the headless dump. */
+static void EinkRender(const unsigned char *src, unsigned char *dst, int w, int h) {
+    int x, y;
     int levels = g_s.shades;
     double gain = 0.6 + (g_s.contrast / 100.0) * 1.4;
     double ds = g_s.dither / 100.0;
-    unsigned char *src = g_cap, *dst = g_proc;
     double scale = (levels > 1) ? 255.0 / (levels - 1) : 0.0;
 
     if (w <= 0 || h <= 0 || !src || !dst) return;
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
-            unsigned char *s = src + 4 * ((size_t)y * w + x);
+            const unsigned char *s = src + 4 * ((size_t)y * w + x);
             unsigned char *d = dst + 4 * ((size_t)y * w + x);
             double lum = 0.299 * s[2] + 0.587 * s[1] + 0.114 * s[0];
             double v = (lum - 128.0) * gain + 128.0;
@@ -1342,12 +1404,13 @@ static void EinkProcess(void) {
 }
 
 static void PresentEinkRect(OVL *ov) {
+    const unsigned char *show = g_eproc_show;   /* one coherent read */
     int x0 = ov->rc.left - g_vsx, y0 = ov->rc.top - g_vsy, y;
-    if (!g_proc || x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
+    if (!show || !ov->bits || x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
         return;
     for (y = 0; y < ov->h; y++)
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
-               g_proc + 4 * ((size_t)(y0 + y) * g_vsw + x0),
+               show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
                (size_t)ov->w * 4);
     /* Same hole rule as the paper path. No restore is needed here: this buffer
      * is re-copied from g_proc at the top of every e-ink frame, so the hole
@@ -1436,8 +1499,9 @@ static int DxgiInit(void) {
 }
 
 /* returns 1 when at least one output produced a new frame */
-static int DxgiPoll(void) {
+static int DxgiPoll(unsigned char *dst) {
     int i, got = 0;
+    if (!dst) return 0;
     for (i = 0; i < g_nout; i++) {
         DXGI_OUTDUPL_FRAME_INFO fi;
         IDXGIResource *res = NULL;
@@ -1493,7 +1557,7 @@ static int DxgiPoll(void) {
             continue;
         }
         srow = (BYTE *)m.pData;
-        drow = g_cap + 4 * ((size_t)g_out[i].r.top * g_vsw + g_out[i].r.left);
+        drow = dst + 4 * ((size_t)g_out[i].r.top * g_vsw + g_out[i].r.left);
         pitch = m.RowPitch;
         for (y = 0; y < (long)td.Height; y++) {
             BYTE *s = srow + (size_t)y * pitch;
@@ -1543,13 +1607,13 @@ static void GdiResetGrabs(void) {
     g_gdi_bmp = NULL; g_gdi_dc = NULL; g_gdi_bits = NULL; g_gdi_prev = NULL;
 }
 
-static int GdiPoll(void) {
+static int GdiPoll(unsigned char *dst) {
     HDC screen;
     BITMAPINFO bi;
     size_t n;
     int w = g_vsw, h = g_vsh;
 
-    if (w <= 0 || h <= 0) return 0;
+    if (w <= 0 || h <= 0 || !dst) return 0;
     n = (size_t)w * h * 4;
     if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) {
         GdiResetGrabs();
@@ -1579,15 +1643,149 @@ static int GdiPoll(void) {
     if (g_gdi_prev && memcmp(g_gdi_bits, g_gdi_prev, n) == 0)
         return 0;                        /* nothing moved: no work */
     memcpy(g_gdi_prev, g_gdi_bits, n);
-    memcpy(g_cap, g_gdi_bits, n);
+    memcpy(dst, g_gdi_bits, n);
     return 1;
 }
 
+/* Stop or start the conversion worker with the e-ink run state. Buffers are
+ * only (re)allocated with the worker stopped, so every call site that can
+ * change the buffer set goes through EinkBuffersRestart below. */
+static int EinkBuffersReady(void) {
+    return g_ecap[0] && g_eproc_show && g_vsw == GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        && g_vsh == GetSystemMetrics(SM_CYVIRTUALSCREEN);
+}
+
+static void EinkBuffersRestart(void) {
+    int want;
+    EinkWorkerSet(0);
+    EinkEnsureBuffers();
+    want = (g_ecap[0] && g_eproc_show && g_s.master && g_s.mode == MODE_EINK);
+    EinkWorkerSet(want);
+    L("eink buffers %s (worker=%d)", want ? "armed" : "idle", g_ework ? 1 : 0);
+}
+
+/* ------------------------------- e-ink worker thread --------------------- */
+
+static DWORD WINAPI EinkWorker(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        int i, pick = -1, rerender = 0;
+        unsigned char *src = NULL;
+        EnterCriticalSection(&g_ecs);
+        for (i = 0; i < EINK_SLOTS; i++)
+            if (g_ecap_state[i] == 1) { pick = i; break; }            /* newest */
+        if (pick >= 0) {
+            src = g_ecap[pick];
+            for (i = 0; i < EINK_SLOTS; i++)
+                if (g_ecap_state[i] == 2) g_ecap_state[i] = 0;        /* drop older */
+        } else if (g_egen_done != g_eset_gen) {                       /* settings moved */
+            for (i = 0; i < EINK_SLOTS; i++)
+                if (g_ecap_state[i] == 3) { pick = i; rerender = 1; src = g_ecap[i]; break; }
+        }
+        LeaveCriticalSection(&g_ecs);
+        if (!src) {
+            if (g_estop) break;
+            WaitForSingleObject(g_ewake, 100);
+            continue;
+        }
+        /* the heavy step, outside the lock: nobody else touches the build
+         * buffer while the worker owns it */
+        EinkRender(src, g_ebuild, g_vsw, g_vsh);
+        EnterCriticalSection(&g_ecs);
+        {   /* publish: what was the build buffer becomes the shown one */
+            unsigned char *t = g_eproc_show;
+            g_eproc_show = g_ebuild;
+            g_ebuild = t;
+        }
+        for (i = 0; i < EINK_SLOTS; i++)
+            if (g_ecap_state[i] == 3) g_ecap_state[i] = 0;            /* previous kept */
+        if (pick >= 0) g_ecap_state[pick] = 3;                        /* keep this frame */
+        g_egen_done = g_eset_gen;
+        LeaveCriticalSection(&g_ecs);
+        if (g_host) PostMessageW(g_host, WM_APP_EINK, 0, 0);
+    }
+    return 0;
+}
+
+static void EinkWorkerSet(int want) {
+    if (want && !g_ework) {
+        if (!g_ecs_ready) { InitializeCriticalSection(&g_ecs); g_ecs_ready = 1; }
+        InterlockedExchange(&g_estop, 0);
+        g_ewake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_ewake) { L("eink worker wake event failed: %lu", GetLastError()); return; }
+        g_ework = CreateThread(NULL, 0, EinkWorker, NULL, 0, NULL);
+        if (!g_ework) {
+            CloseHandle(g_ewake); g_ewake = NULL;
+            L("eink worker thread failed: %lu", GetLastError());
+            return;
+        }
+        return;
+    }
+    if (!want && g_ework) {
+        int i;
+        InterlockedExchange(&g_estop, 1);
+        SetEvent(g_ewake);
+        /* the render step is coalesced to whole frames; a join never hangs
+         * on a partial frame, so a plain wait is safe here */
+        WaitForSingleObject(g_ework, INFINITE);
+        CloseHandle(g_ework); CloseHandle(g_ewake);
+        g_ework = NULL; g_ewake = NULL;
+        for (i = 0; i < EINK_SLOTS; i++) g_ecap_state[i] = 0;   /* start clean */
+        g_egen_done = g_eset_gen;                    /* nothing to re-render yet */
+    }
+}
+
+/* Capture slot ownership, UI-thread side only. */
+static unsigned char *EinkCapBegin(void) {
+    int i;
+    unsigned char *p = NULL;
+    if (!g_ework || !g_ecs_ready) return NULL;
+    EnterCriticalSection(&g_ecs);
+    for (i = 0; i < EINK_SLOTS; i++)
+        if (g_ecap_state[i] == 0) { g_ecap_state[i] = 4; p = g_ecap[i]; break; }
+    LeaveCriticalSection(&g_ecs);
+    return p;
+}
+
+/* Returns 1 when a fresh frame was published. */
+static int EinkCapEnd(int ok, unsigned char *p) {
+    int i, published = 0;
+    if (!p) return 0;
+    EnterCriticalSection(&g_ecs);
+    for (i = 0; i < EINK_SLOTS; i++) {
+        if (g_ecap[i] != p) continue;
+        if (g_ecap_state[i] != 4) break;             /* ownership lost */
+        if (ok) {
+            int j;
+            for (j = 0; j < EINK_SLOTS; j++)
+                if (g_ecap_state[j] == 1) g_ecap_state[j] = 2;   /* this one is older */
+            g_ecap_state[i] = 1;
+            SetEvent(g_ewake);
+            published = 1;
+        } else {
+            g_ecap_state[i] = 0;
+        }
+        break;
+    }
+    LeaveCriticalSection(&g_ecs);
+    return published;
+}
+
+/* Present, on the UI thread: one memcpy per monitor and the upload. */
+static void EinkPresent(void) {
+    int i;
+    for (i = 0; i < g_n; i++) {
+        PresentEinkRect(&g_ov[i]);
+        ApplyLayered(&g_ov[i]);
+    }
+}
+
 static void EinkTick(void) {
-    int i, got;
+    unsigned char *dst;
+    int got = 0;
     static int nf;
 
-    if (!g_cap || !g_proc) return;
+    if (!g_s.master || g_s.mode != MODE_EINK) { EinkWorkerSet(0); return; }
     if (g_dxgi == 0) {
         if (g_gdi_only) {
             /* retry duplication occasionally in case the reason is gone */
@@ -1609,26 +1807,26 @@ static void EinkTick(void) {
             return;
         }
     }
+    if (!EinkBuffersReady()) { EinkBuffersRestart(); return; }
+    if (!g_ework) EinkWorkerSet(1);          /* mode/master flipped: arm it */
+
+    dst = EinkCapBegin();
+    if (!dst) return;                        /* worker behind: coalesce, skip */
     if (g_dxgi == 1) {
         int lost = 0;
-        got = DxgiPoll();
-        if (g_dxgi == 0) lost = 1;   /* DxgiPoll shut capture down */
+        got = DxgiPoll(dst);
+        if (g_dxgi == 0) lost = 1;           /* DxgiPoll shut capture down */
         if (lost) {
+            EinkCapEnd(0, dst);
             g_gdi_only = 1;
             return;
         }
     } else {
-        got = GdiPoll();
+        got = GdiPoll(dst);
     }
-    if (got) {
-        if ((++nf % 25) == 0)
-            L("eink frame %d (dxgi=%d gdi_only=%d)", nf, g_dxgi, g_gdi_only);
-        EinkProcess();
-        for (i = 0; i < g_n; i++) {
-            PresentEinkRect(&g_ov[i]);
-            ApplyLayered(&g_ov[i]);
-        }
-    }
+    if (!EinkCapEnd(got, dst)) return;
+    if ((++nf % 25) == 0)
+        L("eink frame %d (dxgi=%d gdi_only=%d)", nf, g_dxgi, g_gdi_only);
 }
 
 
@@ -1697,12 +1895,10 @@ static void DumpPaper(const char *path, int w, int h) {
 /* synthetic desktop: gradient, blocks, text-like lines -> exercises e-ink */
 static void DumpEink(const char *path, int w, int h) {
     int x, y;
-    unsigned char *bgra;
+    unsigned char *cap = (unsigned char *)malloc((size_t)w * h * 4);
+    unsigned char *proc = (unsigned char *)malloc((size_t)w * h * 4);
+    unsigned char *bgra = cap;
     g_vsw = w; g_vsh = h;
-    free(g_proc);
-    g_proc = (unsigned char *)malloc((size_t)w * h * 4);
-    if (!g_cap) g_cap = (unsigned char *)malloc((size_t)w * h * 4);
-    bgra = g_cap;
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             unsigned char *p = bgra + 4 * ((size_t)y * w + x);
@@ -1719,10 +1915,12 @@ static void DumpEink(const char *path, int w, int h) {
             }
         }
     }
-    EinkProcess();
-    DumpBgra(path, g_proc, w, h);
-    free(g_proc);
-    g_proc = NULL;
+    if (cap && proc) {
+        EinkRender(cap, proc, w, h);
+        DumpBgra(path, proc, w, h);
+    }
+    free(cap);
+    free(proc);
 }
 
 
@@ -2860,7 +3058,7 @@ static void SetMode(int mode) {
     if (g_s.mode == mode) return;
     g_s.mode = mode;
     if (mode == MODE_EINK)
-        EinkEnsureBuffers();
+        EinkBuffersRestart();
     SaveSettings();
     if (LiveDlg()) {
         /* Morph the dialog in place rather than closing it: re-read bar
@@ -2873,7 +3071,7 @@ static void SetMode(int mode) {
 }
 
 static void ActivateMode(int mode) {         /* also turns master on */
-    EinkEnsureBuffers();
+    EinkBuffersRestart();
     g_s.master = 1;
     SyncMasterCheckbox();
     SetMode(mode);
@@ -2940,10 +3138,12 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         L("display change");
         PaperWorkerStop();
         EinkShutdownCapture();
-        EinkFreeBuffers();
-        EinkEnsureBuffers();
+        EinkFreeBuffers();          /* stops the e-ink worker, frees the ring */
         SyncOverlays();
-        RepaintAll();
+        RepaintAll();               /* re-arms and ensures the ring for the mode */
+        return 0;
+    case WM_APP_EINK:
+        if (g_s.master && g_s.mode == MODE_EINK) EinkPresent();
         return 0;
     case WM_APP_UPDATE:
         UpdateResult(g_dlg, (int)wp, (UpdInfo *)lp);   /* may outlive the dialog that asked */
@@ -2973,7 +3173,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ClampSettings();
             SaveSettings();
             if (g_s.mode == MODE_EINK)
-                EinkEnsureBuffers();
+                EinkBuffersRestart();
             RepaintAll();
             if (LiveDlg()) {
                 DialogPushSettings(g_dlg);
@@ -3282,7 +3482,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     SyncOverlays();
     if (g_s.mode == MODE_EINK)
-        EinkEnsureBuffers();
+        EinkBuffersRestart();
     RepaintAll();
     L("ready master=%d mode=%s monitors=%d strips/mon=%d", g_s.master,
       g_s.mode == MODE_PAPER ? "paper" : "eink", g_n,
