@@ -10,6 +10,8 @@ Currently Windows only. Local, lightweight and free. Download `mnPaper.exe` from
 
 ![Reading a PDF under the texture](assets/screenshot-pdf.png)
 
+![The settings window and the taskbar, with the texture kept off the taskbar's own buttons and the gaps still textured](assets/screenshot-gui-taskbar.png)
+
 Expected usage: **paper mode** - about 25-50 MB of RAM, near-zero CPU when
 nothing is changing, no GPU (it draws with plain GDI, no Direct3D).
 **E-ink mode** - about 25-50 MB of RAM, near-zero CPU when nothing is
@@ -80,11 +82,13 @@ The build produces `mnPaper.exe` in the repo root.
   the login screen): Windows forbids drawing there by design.
 - The Start menu, search and notification center run in shell z-order bands
   ordinary apps cannot enter, so they stay untextured.
-- An auto-hidden taskbar is covered by the paper while it is parked, and
-  floats above the paper when you reveal it. The revealed taskbar itself is
-  not textured: mnPaper steps aside for it, because forcing the always-on-top
-  paper over a revealed taskbar makes Windows drop the taskbar's own topmost
-  state.
+- An auto-hidden taskbar is covered by the paper while it is parked. When you
+  reveal it, the paper steps out of the way of the taskbar's own buttons (the
+  Start button, the icon pill and the tray pill) so they stay crisp with no
+  texturing on top of them - the gaps between them keep the paper, as shown in
+  the screenshot above. Forcing the always-on-top paper over the taskbar
+  instead makes Windows drop the taskbar's own topmost state, which is why it
+  steps aside rather than covering it.
 - E-ink mode can shimmer on content-heavy screens at low shade counts.
 - The exe is not code-signed yet: the first run may show a SmartScreen
   warning ("More info" -> "Run anyway").
