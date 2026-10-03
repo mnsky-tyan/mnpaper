@@ -2551,6 +2551,31 @@ static void SyncModeRadios(HWND dlg, int id) {
     if (b) SetWindowLongW(b, GWL_STYLE, GetWindowLongW(b, GWL_STYLE) | WS_TABSTOP);
 }
 
+/* The ONE place that pushes g_s into the dialog controls. Every "refresh the
+ * window because settings changed" site calls this - WM_CREATE, a mode
+ * switch, a tray-menu change and a CLI sync used to each push a different
+ * subset, which is how the share checkbox kept its old state after a remote
+ * change. Narrow paths stay narrow: when the user clicks a checkbox, the
+ * control is the source of truth and only that one control is written back
+ * (or nothing is, for the tri-state boxes whose mirror is a no-op). */
+static void DialogPushSettings(HWND dlg) {
+    if (!dlg || !IsWindow(dlg)) return;
+    DlgSyncBars();              /* bar positions from g_s + row visibility */
+    UpdateVals(dlg);            /* numeric readouts from the bars */
+    SyncModeRadios(dlg, g_s.mode == MODE_PAPER ? 114 : 115);
+    if (g_chk_share) {
+        EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);   /* e-ink is always capture-excluded */
+        SendMessageW(g_chk_share, BM_SETCHECK,
+                     g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    SendMessageW(GetDlgItem(dlg, 118), BM_SETCHECK,
+                 g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(GetDlgItem(dlg, 119), BM_SETCHECK,
+                 g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(GetDlgItem(dlg, 120), BM_SETCHECK,
+                 g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -2586,7 +2611,6 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"E-ink",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
-        SyncModeRadios(hwnd, g_s.mode == MODE_PAPER ? 114 : 115);
         /* Texture on/off: hide the veil without quitting the app (same as the
          * tray's master toggle and Ctrl+Alt+P). */
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
@@ -2598,21 +2622,15 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
             GetModuleHandleW(NULL), NULL);
-        SendMessageW(GetDlgItem(hwnd, 119), BM_SETCHECK,
-                     g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Texture in shares/screenshots",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
-        SendMessageW(g_chk_share, BM_SETCHECK, g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
-        EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
         /* daily self-check opt-out; the download itself is always manual */
         CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
-        SendMessageW(GetDlgItem(hwnd, 120), BM_SETCHECK,
-                     g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
@@ -2624,8 +2642,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 364, 240, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
-        DlgLayout();
-        UpdateVals(hwnd);
+        DialogPushSettings(hwnd);   /* every control reflects g_s: one push, one place */
 
         return 0;
     }
@@ -2818,11 +2835,7 @@ static void SetMode(int mode) {
     if (LiveDlg()) {
         /* Morph the dialog in place rather than closing it: re-read bar
          * ranges for the new mode, then re-show rows and values. */
-        DlgSyncBars();
-        DlgLayout();
-        UpdateVals(g_dlg);
-        SyncModeRadios(g_dlg, mode == MODE_PAPER ? 114 : 115);
-        EnableWindow(g_chk_share, mode == MODE_PAPER);
+        DialogPushSettings(g_dlg);
     }
     if (g_s.master)
         RepaintAll();
@@ -2933,17 +2946,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 EinkEnsureBuffers();
             RepaintAll();
             if (LiveDlg()) {
-                DlgSyncBars();
-                UpdateVals(g_dlg);
-                SyncModeRadios(g_dlg, g_s.mode == MODE_PAPER ? 114 : 115);
-                EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);
-                SendMessageW(g_chk_share, BM_SETCHECK,
-                             g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
-                SyncMasterCheckbox();
-                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
-                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
-                SendMessageW(GetDlgItem(g_dlg, 120), BM_SETCHECK,
-                             g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
+                DialogPushSettings(g_dlg);
             }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
         }
@@ -2967,8 +2970,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
             g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
             if (LiveDlg()) {
-                DlgSyncBars();
-                UpdateVals(g_dlg);
+                DialogPushSettings(g_dlg);
             }
             SaveSettings();
             if (g_s.master && g_s.mode == MODE_PAPER)
