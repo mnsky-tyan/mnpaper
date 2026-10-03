@@ -1275,7 +1275,7 @@ static unsigned char *g_proc;
 static int  g_dxgi = 0;        /* 0 uninit, 1 live, -1 failed (use GDI) */
 static int  g_gdi_only = 0;     /* duplication unavailable: BitBlt fallback */
 static DWORD g_dxgi_fail_at;
-static unsigned long g_gdi_hash;
+static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1307,6 +1307,7 @@ static void EinkEnsureBuffers(void) {
 static void EinkFreeBuffers(void) {
     free(g_cap); free(g_proc);
     g_cap = g_proc = NULL;
+    GdiResetGrabs();   /* the grab DC/DIB are bound to the thread that polls */
 }
 
 void EinkShutdownCapture(void);
@@ -1514,42 +1515,71 @@ static int DxgiPoll(void) {
     return got;
 }
 
-/* GDI fallback: grab the desktop at tick rate, skip work when nothing moved */
+/* GDI fallback: grab the desktop at tick rate, skip work when nothing
+ * moved.
+ *
+ * Two corrections over the original, both found by the codebase review:
+ *
+ * 1. The DIB and its DC are created ONCE and kept: this ran at 20 Hz, so a
+ *    create/destroy pair per tick meant a GDI alloc + a kernel round-trip
+ *    every 50 ms for the lifetime of e-ink mode. The objects are bound to the
+ *    UI thread that creates them, which is the only thread that calls this.
+ *
+ * 2. Change detection reads EVERY pixel. The sampled hash (one pixel in 97)
+ *    could not see the other 96/97ths of the screen: a text edit landing
+ *    between sample points never updated the e-ink view until an unrelated
+ *    change happened to hit a sampled pixel. memcmp against the previous grab
+ *    is exact and runs at memory speed, so the security of the check costs
+ *    about as much as the copy it guards. */
+static HDC    g_gdi_dc;
+static HBITMAP g_gdi_bmp;
+static unsigned char *g_gdi_bits;   /* the DIB's pixels, written by BitBlt */
+static unsigned char *g_gdi_prev;  /* previous grab, owned by this module */
+
+static void GdiResetGrabs(void) {
+    if (g_gdi_bmp) DeleteObject(g_gdi_bmp);
+    if (g_gdi_dc)  DeleteDC(g_gdi_dc);
+    free(g_gdi_prev);
+    g_gdi_bmp = NULL; g_gdi_dc = NULL; g_gdi_bits = NULL; g_gdi_prev = NULL;
+}
+
 static int GdiPoll(void) {
-    HDC screen, mem;
+    HDC screen;
     BITMAPINFO bi;
-    void *bits = NULL;
-    HBITMAP bmp;
-    int w = g_vsw, h = g_vsh, y;
-    unsigned long hsh = 5381;
-    int i;
+    size_t n;
+    int w = g_vsw, h = g_vsh;
 
     if (w <= 0 || h <= 0) return 0;
-    memset(&bi, 0, sizeof bi);
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
+    n = (size_t)w * h * 4;
+    if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) {
+        GdiResetGrabs();
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        screen = GetDC(NULL);
+        g_gdi_dc = CreateCompatibleDC(screen);
+        g_gdi_bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&g_gdi_bits, NULL, 0);
+        ReleaseDC(NULL, screen);
+        if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) { GdiResetGrabs(); return 0; }
+        g_gdi_prev = (unsigned char *)malloc(n);
+        if (!g_gdi_prev) { GdiResetGrabs(); return 0; }
+        SelectObject(g_gdi_dc, g_gdi_bmp);
+        memset(g_gdi_prev, 0, n);   /* force the first comparison to differ */
+    }
     screen = GetDC(NULL);
-    mem = CreateCompatibleDC(screen);
-    bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!bmp) { DeleteDC(mem); ReleaseDC(NULL, screen); return 0; }
-    SelectObject(mem, bmp);
-    BitBlt(mem, 0, 0, w, h, screen, g_vsx, g_vsy, SRCCOPY | CAPTUREBLT);
-    for (i = 0; i < w * h; i += 97)
-        hsh = ((hsh << 5) + hsh) + ((unsigned *)bits)[i];
-    if (hsh == g_gdi_hash) {
-        DeleteObject(bmp); DeleteDC(mem); ReleaseDC(NULL, screen);
+    if (!BitBlt(g_gdi_dc, 0, 0, w, h, screen, g_vsx, g_vsy, SRCCOPY | CAPTUREBLT)) {
+        ReleaseDC(NULL, screen);
         return 0;
     }
-    g_gdi_hash = hsh;
-    for (y = 0; y < h; y++)
-        memcpy(g_cap + (size_t)y * w * 4, (unsigned char *)bits + (size_t)y * w * 4, (size_t)w * 4);
-    DeleteObject(bmp);
-    DeleteDC(mem);
     ReleaseDC(NULL, screen);
+    if (g_gdi_prev && memcmp(g_gdi_bits, g_gdi_prev, n) == 0)
+        return 0;                        /* nothing moved: no work */
+    memcpy(g_gdi_prev, g_gdi_bits, n);
+    memcpy(g_cap, g_gdi_bits, n);
     return 1;
 }
 
