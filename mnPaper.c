@@ -217,8 +217,10 @@ static void ClampSettings(void) {
 
 static void ApplyAutostart(void) {
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) {
+        L("autostart: cannot open Run key, err %lu", (unsigned long)GetLastError());
         return;
+    }
     if (g_s.autostart) {
         WCHAR path[MAX_PATH];
         DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -245,7 +247,8 @@ static void SaveSettings(void) {
     RegSetValueExW(k, L"shades",    0, REG_DWORD, (BYTE *)&g_s.shades,    sizeof(int));
     RegSetValueExW(k, L"contrast",  0, REG_DWORD, (BYTE *)&g_s.contrast,  sizeof(int));
     RegSetValueExW(k, L"dither",    0, REG_DWORD, (BYTE *)&g_s.dither,    sizeof(int));
-    RegSetValueExW(k, L"autostart", 0, REG_DWORD, (BYTE *)&g_s.autostart, sizeof(int));
+    /* no "autostart" value here: LoadSettings derives it from the Run key,
+     * so a stored copy could only diverge from the truth (2026-10-04 review) */
     RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
     RegSetValueExW(k, L"autoupd",   0, REG_DWORD, (BYTE *)&g_s.autoupd,   sizeof(int));
     RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,    sizeof(g_lastupd));
@@ -406,7 +409,6 @@ static void ApplyCaptureState(OVL *ov) {
 typedef struct {
     HMONITOR mon;
     RECT     rc;
-    int      w, h;
 } MONINFO;
 static MONINFO g_mi[MAX_MON];
 static int     g_nmi;
@@ -438,6 +440,7 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
+    p.fs = 1.f;   /* full-res default; the preview build raises it to step */
     p.pg = NextPow2(w / sp->grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
@@ -499,7 +502,6 @@ static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
                           volatile LONG *epoch, LONG expected) {
     PAPERPARAMS p = PaperParams(w, sp);
     int x, y;
-    p.fs = 1.f;   /* full build: true frequencies */
     for (y = 0; y < h; y++) {
         if (PaperCancelled(epoch, expected)) return 0;
         for (x = 0; x < w; x++)
@@ -797,8 +799,6 @@ static BOOL CALLBACK MonRectCb(HMONITOR hm, HDC hdc, LPRECT rc, LPARAM lp) {
     if (g_nmi >= MAX_MON) return FALSE;
     g_mi[g_nmi].mon = hm;
     g_mi[g_nmi].rc = *rc;
-    g_mi[g_nmi].w = rc->right - rc->left;
-    g_mi[g_nmi].h = rc->bottom - rc->top;
     g_nmi++;
     return TRUE;
 }
@@ -863,6 +863,15 @@ static int  g_tb_state[TB_MAX];   /* 0 unknown, 1 parked, 2 revealed */
  * band: holing more than needed is safe, holing less is not. */
 typedef struct { const WCHAR *want; RECT u; int have; } PillScan;
 
+/* grow *into to the union with *r (PillEnumProc and RefinePillHole used to
+ * hand-write this min/max chain twice; 2026-10-04 review) */
+static void GrowRect(RECT *into, const RECT *r) {
+    if (r->left   < into->left)   into->left   = r->left;
+    if (r->top    < into->top)    into->top    = r->top;
+    if (r->right  > into->right)  into->right  = r->right;
+    if (r->bottom > into->bottom) into->bottom = r->bottom;
+}
+
 static BOOL CALLBACK PillEnumProc(HWND hwnd, LPARAM lp) {
     PillScan *s = (PillScan *)lp;
     WCHAR cls[64];
@@ -872,12 +881,7 @@ static BOOL CALLBACK PillEnumProc(HWND hwnd, LPARAM lp) {
     if (!GetWindowRect(hwnd, &r)) return TRUE;
     if (r.right <= r.left || r.bottom <= r.top) return TRUE;
     if (!s->have) { s->u = r; s->have = 1; }
-    else {
-        if (r.left   < s->u.left)   s->u.left   = r.left;
-        if (r.top    < s->u.top)    s->u.top    = r.top;
-        if (r.right  > s->u.right)  s->u.right  = r.right;
-        if (r.bottom > s->u.bottom) s->u.bottom = r.bottom;
-    }
+    else GrowRect(&s->u, &r);
     return TRUE;
 }
 
@@ -895,12 +899,7 @@ static void RefinePillHole(HWND taskbar, RECT *hole) {
         EnumChildWindows(taskbar, PillEnumProc, (LPARAM)&ps);
         if (!ps.have) continue;
         if (!have) { u = ps.u; have = 1; }
-        else {
-            if (ps.u.left   < u.left)   u.left   = ps.u.left;
-            if (ps.u.top    < u.top)    u.top    = ps.u.top;
-            if (ps.u.right  > u.right)  u.right  = ps.u.right;
-            if (ps.u.bottom > u.bottom) u.bottom = ps.u.bottom;
-        }
+        else GrowRect(&u, &ps.u);
     }
     if (!have) return;                       /* keep the full band */
     u.left -= m; u.top -= m; u.right += m; u.bottom += m;
@@ -940,6 +939,12 @@ static int IsTaskbarWnd(HWND h) {
 
 static void CollectTaskbars(void) {
     g_ntb = 0;
+    /* state slots at indices >= g_ntb must read as "unknown" after this:
+     * Housekeeping's tb_up latch scans the whole array, and a slot left at 2
+     * by a since-disappeared taskbar (unplugged while revealed) would pin
+     * the latch forever and stop the z-order re-claim walk (2026-10-04
+     * review) */
+    memset(g_tb_state, 0, sizeof g_tb_state);
     EnumWindows(TbEnumProc, 0);
 }
 
@@ -1053,7 +1058,7 @@ static void Housekeeping(void) {
        is a possibly untextured mascot while the taskbar is up. */
     {
         int tb_up = 0;
-        for (j = 0; j < TB_MAX; j++)
+        for (j = 0; j < g_ntb; j++)      /* only slots this cycle produced */
             if (g_tb_state[j] == 2) { tb_up = 1; break; }
         if (!tb_up) {
     h = GetTopWindow(NULL);
@@ -1315,8 +1320,9 @@ typedef struct {
     IDXGIOutputDuplication *dup;
     RECT r;                 /* rect inside the virtual-screen capture buffer */
     ID3D11Texture2D *stage;
-    int stageW, stageH;
+    int stageW, stageH, stageFmt;
     int swapRB;
+    int badfmt;             /* output skipped: format unsupported, logged once */
 } OUTINFO;
 
 static ID3D11Device        *g_dev;
@@ -1350,6 +1356,12 @@ static unsigned char *g_ecap[EINK_SLOTS];
 static unsigned char *g_eproc_a, *g_eproc_b;
 static unsigned char *g_eproc_show;    /* the UI thread presents this one */
 static unsigned char *g_ebuild;        /* the worker renders into this one */
+static volatile int g_eproc_valid;     /* 0 until the worker published a real
+                                        * frame: EinkEnsureBuffers seeds the
+                                        * show buffer with 0xFF, and presenting
+                                        * that reads as an opaque white screen
+                                        * until the first real frame lands
+                                        * (2026-10-04 review) */
 static LONG  g_ecap_state[EINK_SLOTS];
 static HANDLE g_ework, g_ewake;
 static volatile LONG g_estop;
@@ -1376,6 +1388,8 @@ static void EinkEnsureBuffers(void) {
         int vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if (vsw == g_vsw && vsh == g_vsh) return;
     }
+    g_eproc_valid = 0;      /* rebuilding: nothing publishable until the
+                             * worker's next frame lands */
     for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; }
     free(g_eproc_a); free(g_eproc_b);
     g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
@@ -1446,7 +1460,8 @@ static void EinkRender(const unsigned char *src, unsigned char *dst, int w, int 
 static void PresentEinkRect(OVL *ov) {
     const unsigned char *show = g_eproc_show;   /* one coherent read */
     int x0 = ov->rc.left - g_vsx, y0 = ov->rc.top - g_vsy, y;
-    if (!show || !ov->bits || x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
+    if (!show || !g_eproc_valid || !ov->bits ||
+        x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
         return;
     for (y = 0; y < ov->h; y++)
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
@@ -1473,6 +1488,13 @@ static void DxgiShutdown(void) {
     g_nout = 0;
     if (g_ctx) { g_ctx->lpVtbl->Release(g_ctx); g_ctx = NULL; }
     if (g_dev) { g_dev->lpVtbl->Release(g_dev); g_dev = NULL; }
+}
+
+/* Every shutdown site wants this exact order: stop the worker first,
+ * then free what it was using (2026-10-04 review). */
+static void EinkShutdownAll(void) {
+    EinkShutdownCapture();
+    EinkFreeBuffers();
 }
 
 void EinkShutdownCapture(void) {
@@ -1505,8 +1527,13 @@ static int DxgiInit(void) {
     for (a = 0; a < nadapt; a++) {
         IDXGIOutput *out = NULL;
         o = 0;
-        while (g_nout < MAX_OUT && adapters[a]->lpVtbl->EnumOutputs(adapters[a], o++, &out) != DXGI_ERROR_NOT_FOUND) {
+        while (g_nout < MAX_OUT) {
+            HRESULT ehr;
             IDXGIOutput1 *out1 = NULL;
+            ehr = adapters[a]->lpVtbl->EnumOutputs(adapters[a], o++, &out);
+            if (ehr == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(ehr) || !out) break;   /* transient failure: skip the
+                                               * adapter, never deref NULL */
             DXGI_OUTPUT_DESC desc;
             if (SUCCEEDED(out->lpVtbl->QueryInterface(out, &IID_IDXGIOutput1, (void **)&out1)) && out1) {
                 memset(&g_out[g_nout], 0, sizeof(OUTINFO));
@@ -1571,8 +1598,22 @@ static int DxgiPoll(unsigned char *dst) {
         res->lpVtbl->Release(res);
         tex->lpVtbl->GetDesc(tex, &td);
 
-        if (!g_out[i].stage || g_out[i].stageW != (int)td.Width || g_out[i].stageH != (int)td.Height) {
+        if (!g_out[i].stage || g_out[i].stageW != (int)td.Width || g_out[i].stageH != (int)td.Height ||
+            g_out[i].stageFmt != (int)td.Format) {
             D3D11_TEXTURE2D_DESC sd;
+            if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM && td.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+                /* anything else would memcpy channel-swapped garbage; the
+                 * GDI fallback only covers a whole-adapter loss, so this
+                 * output goes stale - log it once so it is not silent */
+                if (!g_out[i].badfmt) {
+                    g_out[i].badfmt = 1;
+                    L("dxgi: output %d desktop format %d unsupported, output not refreshed",
+                      i, (int)td.Format);
+                }
+                tex->lpVtbl->Release(tex);
+                g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
+                continue;
+            }
             if (g_out[i].stage) { g_out[i].stage->lpVtbl->Release(g_out[i].stage); g_out[i].stage = NULL; }
             memset(&sd, 0, sizeof sd);
             sd.Width = td.Width; sd.Height = td.Height;
@@ -1588,6 +1629,7 @@ static int DxgiPoll(unsigned char *dst) {
             }
             g_out[i].stageW = (int)td.Width;
             g_out[i].stageH = (int)td.Height;
+            g_out[i].stageFmt = (int)td.Format;
             g_out[i].swapRB = (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
         }
         g_ctx->lpVtbl->CopyResource(g_ctx, (ID3D11Resource *)g_out[i].stage, (ID3D11Resource *)tex);
@@ -1757,6 +1799,7 @@ static DWORD WINAPI EinkWorker(LPVOID unused) {
             unsigned char *t = g_eproc_show;
             g_eproc_show = g_ebuild;
             g_ebuild = t;
+            g_eproc_valid = 1;
         }
         for (i = 0; i < EINK_SLOTS; i++)
             if (g_ecap_state[i] == 3) g_ecap_state[i] = 0;            /* previous kept */
@@ -1899,6 +1942,7 @@ static void DumpBgra(const char *path, unsigned char *bgra, int w, int h) {
     int x, y;
     int stride = ((w * 3 + 3) / 4) * 4;
     unsigned char *row = (unsigned char *)malloc(stride);
+    if (!row) return;
     memset(&fh, 0, sizeof fh);
     memset(&ih, 0, sizeof ih);
     fh.bfType = 0x4D42;
@@ -1947,6 +1991,7 @@ static void DumpPaper(const char *path, int w, int h) {
     memset(&ov, 0, sizeof ov);
     ov.w = w; ov.h = h;
     ov.bits = malloc((size_t)w * h * 4);
+    if (!ov.bits) return;
     BuildPaper(&ov);
     CompositeOver((unsigned char *)ov.bits, w, h, g_dump_bg);
     DumpBgra(path, (unsigned char *)ov.bits, w, h);
@@ -1958,6 +2003,7 @@ static void DumpEink(const char *path, int w, int h) {
     int x, y;
     unsigned char *cap = (unsigned char *)malloc((size_t)w * h * 4);
     unsigned char *proc = (unsigned char *)malloc((size_t)w * h * 4);
+    if (!cap || !proc) { free(cap); free(proc); return; }
     unsigned char *bgra = cap;
     g_vsw = w; g_vsh = h;
     for (y = 0; y < h; y++) {
@@ -2333,16 +2379,19 @@ static DWORD WINAPI UpdateCheckThread(LPVOID param) {
 }
 
 static int UpdDue(void);   /* defined below, before first use in the thread path */
+static void UpdNote(HWND owner, const WCHAR *title, const WCHAR *text);
 
+/* Both wrappers used to re-implement UpdNote's MessageBoxW call
+ * (2026-10-04 review); they only differ in text. */
 static void UpdateStartFailed(HWND owner) {
-    MessageBoxW(owner, L"Could not start the update check. Please try again.",
-                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+    UpdNote(owner, L"mnPaper - update",
+            L"Could not start the update check. Please try again.");
 }
 
 static void UpdateInstallStartFailed(HWND owner) {
-    MessageBoxW(owner, L"Could not start the update installation.\n"
-                       L"Nothing was changed - please try again.",
-                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+    UpdNote(owner, L"mnPaper - update",
+            L"Could not start the update installation.\n"
+            L"Nothing was changed - please try again.");
 }
 
 static void UpdateBusyNotice(HWND owner) {
@@ -2351,7 +2400,12 @@ static void UpdateBusyNotice(HWND owner) {
 }
 
 /* manual = the user pressed the button (always runs); auto = the daily lazy
- * check (gated by the autoupd setting and the once-a-day timestamp). */
+ * check (gated by the autoupd setting and the once-a-day timestamp).
+ * The manual path is INTENTIONALLY not gated on g_test_headless: the
+ * update_help_capture suite's MN_VAL_NETWORK build clicks 117 for a real
+ * check. The only thing standing between a headless click and a network
+ * request is the caller pre-setting g_update_busy (load-bearing - see the
+ * test); the CAS below is that gate. */
 static void StartUpdateCheck(int manual) {
     HANDLE t;
     static DWORD last_manual_tick;
@@ -2683,7 +2737,7 @@ static void InstallResult(InstInfo *in) {
             L"The update is installed, but mnPaper could not start itself again.\n"
             L"Please start mnPaper from your shortcut or the Start menu.");
     L("self-update: swapped and relaunching");
-    if (LiveDlg()) DestroyWindow(g_dlg);
+    { HWND dlg = LiveDlg(); if (dlg) DestroyWindow(dlg); }
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
 }
 
@@ -3111,8 +3165,9 @@ static void OpenSettings(void) {
 /* ------------------------------------------------------------ commands --- */
 
 static void SyncMasterCheckbox(void) {   /* mirror g_s.master into control 118 */
-    if (LiveDlg())
-        SetChk(GetDlgItem(g_dlg, 118), g_s.master);
+    HWND dlg = LiveDlg();
+    if (dlg)
+        SetChk(GetDlgItem(dlg, 118), g_s.master);
 }
 
 static void SetMaster(int on) {
@@ -3131,10 +3186,13 @@ static void SetMode(int mode) {
     if (mode == MODE_EINK)
         EinkBuffersRestart();
     SaveSettings();
-    if (LiveDlg()) {
-        /* Morph the dialog in place rather than closing it: re-read bar
-         * ranges for the new mode, then re-show rows and values. */
-        DialogPushSettings(g_dlg);
+    {
+        HWND dlg = LiveDlg();
+        if (dlg) {
+            /* Morph the dialog in place rather than closing it: re-read bar
+             * ranges for the new mode, then re-show rows and values. */
+            DialogPushSettings(dlg);
+        }
     }
     if (g_s.master)
         RepaintAll();
@@ -3145,8 +3203,10 @@ static void ActivateMode(int mode) {         /* also turns master on */
     EinkBuffersRestart();
     g_s.master = 1;
     SyncMasterCheckbox();
-    SetMode(mode);
-    RepaintAll();
+    if (g_s.mode != mode)
+        SetMode(mode);      /* repaints itself on the change path */
+    else
+        RepaintAll();       /* unchanged mode: one repaint shows the veil */
     SaveSettings();
 }
 
@@ -3208,8 +3268,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DISPLAYCHANGE:
         L("display change");
         PaperWorkerStop();
-        EinkShutdownCapture();
-        EinkFreeBuffers();          /* stops the e-ink worker, frees the ring */
+        EinkShutdownAll();          /* stops the e-ink worker, frees the ring */
         SyncOverlays();
         RepaintAll();               /* re-arms and ensures the ring for the mode */
         return 0;
@@ -3246,8 +3305,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_s.mode == MODE_EINK)
                 EinkBuffersRestart();
             RepaintAll();
-            if (LiveDlg()) {
-                DialogPushSettings(g_dlg);
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) DialogPushSettings(dlg);
             }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
         }
@@ -3270,8 +3330,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
             g_s.intensity = STRENGTH_STEPS[LOWORD(wp) - IDM_STRENGTH];
-            if (LiveDlg()) {
-                DialogPushSettings(g_dlg);
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) DialogPushSettings(dlg);
             }
             SaveSettings();
             if (g_s.master && g_s.mode == MODE_PAPER)
@@ -3284,22 +3345,28 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_s.share = g_s.share ? 0 : 1;
             SaveSettings();
             RepaintAll();   /* re-applies the capture exclusion state */
-            if (LiveDlg())
-                SetChk(g_chk_share, g_s.share);
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) SetChk(GetDlgItem(dlg, 113), g_s.share);
+            }
             L("share=%d", g_s.share);
             break;
         case IDM_AUTOSTART:
             g_s.autostart = g_s.autostart ? 0 : 1;
             SaveSettings();
-            if (LiveDlg())
-                SetChk(GetDlgItem(g_dlg, 119), g_s.autostart);
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) SetChk(GetDlgItem(dlg, 119), g_s.autostart);
+            }
             L("autostart=%d", g_s.autostart);
             break;
         case IDM_AUTOUPD:
             g_s.autoupd = g_s.autoupd ? 0 : 1;
             SaveSettings();
-            if (LiveDlg())
-                SetChk(GetDlgItem(g_dlg, 120), g_s.autoupd);
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) SetChk(GetDlgItem(dlg, 120), g_s.autoupd);
+            }
             L("autoupd=%d", g_s.autoupd);
             break;
         case IDM_EXIT:
@@ -3325,8 +3392,11 @@ static SETTINGS g_cli_settings;
 
 static WCHAR g_sets[16][80];
 static int    g_nsets;
-static const WCHAR *g_dump_tex;
-static const WCHAR *g_dump_eink;
+/* owned copies: the parse below used to store pointers INTO the
+ * CommandLineToArgvW block and then LocalFree it, so the dump path read
+ * freed memory (2026-10-04 review) */
+static WCHAR g_dump_tex[MAX_PATH];
+static WCHAR g_dump_eink[MAX_PATH];
 static int g_dump_w = 960, g_dump_h = 600;
 
 static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
@@ -3411,13 +3481,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 g_log = _wfopen(argv[++i], L"a");
                 L("=== mnPaper start ===");
             } else if (!_wcsicmp(argv[i], L"--dump-tex") && i + 2 < argc) {
-                g_dump_tex  = argv[++i];
+                wcsncpy(g_dump_tex, argv[++i], MAX_PATH - 1);
                 g_dump_w    = _wtoi(argv[++i]);
                 g_dump_h    = _wtoi(argv[++i]);
                 if (i + 1 < argc && argv[i + 1][0] != L'-')
                     g_dump_bg = _wtoi(argv[++i]);
             } else if (!_wcsicmp(argv[i], L"--dump-eink") && i + 2 < argc) {
-                g_dump_eink = argv[++i];
+                wcsncpy(g_dump_eink, argv[++i], MAX_PATH - 1);
                 g_dump_w    = _wtoi(argv[++i]);
                 g_dump_h    = _wtoi(argv[++i]);
             } else if (!_wcsicmp(argv[i], L"--no-exclude")) {
@@ -3451,13 +3521,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
         LocalFree(argv);
     }
 
-    if (g_dump_tex || g_dump_eink) {
+    if (g_dump_tex[0] || g_dump_eink[0]) {
         LoadSettings();
         if (g_nsets)
             ApplySets(&g_s);
         L("dump path: nsets=%d intensity=%d warmth=%d grain=%d fibre=%d blotch=%d",
           g_nsets, g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch);
-        if (g_dump_tex) {
+        if (g_dump_tex[0]) {
             char p[512];
             WideCharToMultiByte(CP_UTF8, 0, g_dump_tex, -1, p, sizeof p, NULL, NULL);
             DumpPaper(p, g_dump_w, g_dump_h);
@@ -3568,8 +3638,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     for (i = 0; i < g_n; i++)
         DestroyOverlay(&g_ov[i]);
-    EinkShutdownCapture();
-    EinkFreeBuffers();
+    EinkShutdownAll();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     SaveSettings();
     if (g_log) fclose(g_log);
