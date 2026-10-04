@@ -11,5 +11,5 @@
  */
 #define MNVER_MAJOR 2
 #define MNVER_MINOR 7
-#define MNVER_PATCH 11
-#define MNVER_STR   "2.7.11"
+#define MNVER_PATCH 12
+#define MNVER_STR   "2.7.12"
