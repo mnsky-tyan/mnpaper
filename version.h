@@ -7,7 +7,9 @@
  * shipped builds reported themselves as 2.7.2 and every update check offered a
  * version that was already installed.
  *
- * To cut a release, edit this file and nothing else.
+ * The release number lives here and nowhere else in code. Cutting a release
+ * then also pins the built exe's SHA-256 in version.txt (see AGENTS.md and
+ * tests/release_guard.py).
  */
 #define MNVER_MAJOR 2
 #define MNVER_MINOR 7
