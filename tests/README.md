@@ -123,7 +123,7 @@ intermittently quarantine these unsigned exes (`Behavior:Win32/Execution.A!ml`,
 seen 2026-10-04 on a hole_cycle build). `Get-MpThreatDetection` shows it;
 rebuild and run in one go, or exclude the temp directory.
 
-### What each tracked suite asserts
+### What each suite asserts
 
 - `slider_latency.c` - drag latency end to end (request-to-upload budget with
   METRIC lines), the final bitmap, worker preemption, close-before-timer, the

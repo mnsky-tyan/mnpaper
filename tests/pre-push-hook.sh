@@ -18,6 +18,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 fail=0
+# local_ref is the git pre-push protocol field; unused on purpose.
+# shellcheck disable=SC2034
 while read -r local_ref local_sha remote_ref remote_sha; do
     case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
     echo "release guard: $remote_ref <- ${local_sha%"${local_sha#??????}"}"

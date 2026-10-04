@@ -91,12 +91,11 @@ The build produces `mnPaper.exe` in the repo root.
   a parked auto-hidden taskbar keeps on screen, which stays covered like the
   rest of the desktop - the paper steps out of the way of the taskbar's own
   buttons (the Start button, the icon pill and the tray pill) so they stay
-  crisp with no texturing on top of
-  them; the gaps between them keep the paper, as shown in the screenshot
-  above. Forcing the always-on-top paper over the taskbar instead makes
-  Windows drop the taskbar's own topmost state, which is why it steps aside
-  rather than covering it. Taskbars shown on secondary displays get the same
-  treatment.
+  crisp with no texturing on top of them; the gaps between them keep the
+  paper, as shown in the screenshot above. Forcing the always-on-top paper
+  over the taskbar instead makes Windows drop the taskbar's own topmost
+  state, which is why it steps aside rather than covering it. Taskbars shown
+  on secondary displays get the same treatment.
 - The settings window keeps a compact fixed-size layout rather than scaling
   with your display DPI, so it looks small on a high-DPI screen; every
   control still fits and works.
