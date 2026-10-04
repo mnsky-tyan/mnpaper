@@ -3,16 +3,13 @@
 *.res
 *.dmp
 *.log
+*.pdb
+*.ilk
 samples/
 AGENTS.md
 probes/
 docs/reviews/
 # tests/ as a whole used to hide every NEW suite from git status and from
-# `git add tests/` (2026-10-04 review); ignore only build artefacts, plus the
-# one deliberately-internal file.
-tests/*.exe
-tests/*.obj
-tests/*.log
-tests/*.pdb
-tests/*.ilk
+# `git add tests/` (2026-10-04 review); the global patterns above already
+# cover tests build artefacts, so only the one internal file needs naming.
 tests/release_guard.py
