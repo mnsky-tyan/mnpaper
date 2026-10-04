@@ -92,8 +92,8 @@ Re-run before treating it as a regression.
 
 ## Build recipe (Windows host)
 
-`tests/README.md` documents the debug recipe; the practical build for all suites
-on a Windows box with VS2022 (any edition) is:
+Above is the debug recipe for the leak-checked suite. The practical build for
+all suites on a Windows box with VS2022 (any edition) is:
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Auxiliary\Build\vcvars64.bat"
@@ -101,9 +101,35 @@ rc /nologo mnPaper.rc
 cl /nologo /O2 /W3 mnPaper.c mnPaper.res /FemnPaper.exe
 for %%f in (layout_fit slider_latency verify_fixes hole_cycle dialog_push gdi_fallback eink_thread) do ^
   cl /nologo /O2 /W3 tests\%%f.c /Fe%%f.exe
-cl /nologo /O2 /W3 /MTd tests\update_help_capture.c /Fetest_extra.exe
+cl /nologo /O2 /W3 /MTd /D_DEBUG tests\update_help_capture.c /Fetest_extra.exe
 ```
 
-`test_extra` is the only test that needs `/MTd` (it instruments the CRT debug
-heap); everything else is `/O2 /W3 /MT` (the default). Run every exe twice:
-each is idempotent and leaves no windows behind.
+One source file, two recipes: the block above this one builds the same
+`update_help_capture.c` as `tests\update_help_capture.exe` with `/Od /D_DEBUG /MDd`,
+the line here builds it as `test_extra.exe` with `/O2 /MTd /D_DEBUG` - either
+link works, and the leak assertions only exist because of `/D_DEBUG`, so a
+build without that define silently drops them.
+
+Suites reachable from a fresh clone: `slider_latency.c`, `eink_thread.c`,
+`gdi_fallback.c` (tracked). The rest - `layout_fit`, `verify_fixes`,
+`hole_cycle`, `dialog_push`, `update_help_capture` - are internal and not in
+the repo; the loop above is for a machine with the full working tree.
+
+Run every exe twice: each is idempotent and leaves no windows behind.
+
+### What each tracked suite asserts
+
+- `slider_latency.c` - drag latency end to end (request-to-upload budget with
+  METRIC lines), the final bitmap, worker preemption, close-before-timer, the
+  taskbar hole cycle (hole moves/parks with no texture rebuild, master
+  byte-identical - every byte), odd preview sizes, warmth/grain/fibre/blotch
+  structure, help window, update-feed parsing, and the share/mode/texture-on/
+  autostart controls against a PID-suffixed scratch hive.
+- `eink_thread.c` - the e-ink worker machinery headlessly: pure render
+  properties, capture-slot ownership (the ring is 3 deep), publish, worker
+  render, pointer swap, newest-wins, settings re-render on a static screen,
+  idle quiescence, ring hygiene, stop/restart.
+- `gdi_fallback.c` - the GDI capture fallback: DIB/DC persistence across
+  ticks (no per-tick reallocation), exact whole-buffer change detection (an
+  edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
+  rebuild after a reset.
