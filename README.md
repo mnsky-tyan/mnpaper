@@ -30,7 +30,7 @@ desktop-duplication setup on the GPU.
   Duplication would otherwise capture its own output).
 - Adjust parameters like strength, warmth, grain, fibre, blotch on your own.
 - Keyboard: **Ctrl+Alt+P** toggles the texture, **Ctrl+Alt+E** switches
-  between paper and e-ink mode.
+  between paper and e-ink mode (and turns the effect on if it was off).
 
 ## Requirements
 
@@ -87,10 +87,11 @@ The build produces `mnPaper.exe` in the repo root.
   the login screen): Windows forbids drawing there by design.
 - The Start menu, search and notification center run in shell z-order bands
   ordinary apps cannot enter, so they stay untextured.
-- The taskbar: while it is visible (including a parked auto-hidden taskbar's
-  16-pixel sliver - anything taller than that counts as visible), the paper
-  steps out of the way of the taskbar's own buttons (the Start button, the
-  icon pill and the tray pill) so they stay crisp with no texturing on top of
+- The taskbar: while it is visible - taller than the roughly 16-pixel sliver
+  a parked auto-hidden taskbar keeps on screen, which stays covered like the
+  rest of the desktop - the paper steps out of the way of the taskbar's own
+  buttons (the Start button, the icon pill and the tray pill) so they stay
+  crisp with no texturing on top of
   them; the gaps between them keep the paper, as shown in the screenshot
   above. Forcing the always-on-top paper over the taskbar instead makes
   Windows drop the taskbar's own topmost state, which is why it steps aside
