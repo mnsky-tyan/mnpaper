@@ -289,7 +289,11 @@ int main(void) {
     }
     hbtn = GetDlgItem(g_dlg, 117);
     Check(IsWindow(hbtn), "check-for-updates button exists in a reopened dialog");
-    InterlockedExchange(&g_update_busy, 1);   /* stand in for a running check */
+    /* LOAD-BEARING: StartUpdateCheck's manual path has no headless gate by
+     * design (the MN_VAL_NETWORK block below needs a real check). This
+     * pre-set busy guard is the only thing that keeps the click below from
+     * starting a real network request (2026-10-04 review). */
+    InterlockedExchange(&g_update_busy, 1);
     ResetBox();
     SendMessageW(hbtn, BM_CLICK, 0, 0);
     Pump(50);

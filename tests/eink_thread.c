@@ -167,7 +167,8 @@ int main(void) {
     Check(g_ework == NULL, "the worker stops and joins");
     Check(EinkCapBegin() == NULL, "no capture slots are handed out with no worker");
     EinkWorkerSet(0);
-    Check(1, "a second stop is a no-op");
+    Check(g_ework == NULL && g_ewake == NULL,
+          "a second stop is a no-op (still no worker, no wake event)");
     EinkWorkerSet(1);
     EinkWorkerSet(0);
     Check(g_ework == NULL, "start+stop is clean");
