@@ -82,6 +82,7 @@
                                  * preview itself applies immediately */
 #define WM_APP_UPDATE   (WM_APP + 5)   /* update-check thread -> host window */
 #define WM_APP_INSTALL  (WM_APP + 6)   /* self-update worker thread -> host window */
+#define WM_APP_CMD      (WM_APP + 1)   /* second instance -> first instance: tray command */
 
 /* ------------------------------- version -------------------------------- */
 /* The release number lives in version.h, shared with mnPaper.rc, so the number
@@ -159,7 +160,15 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static SETTINGS g_s = { 1, MODE_PAPER, 30, 45, 4, 40, 30, 4, 50, 75, 0, 0, 1 };
+static SETTINGS g_s = { .master = 1, .mode = MODE_PAPER, .intensity = 30,
+                        .warmth = 45, .grain = 4, .fibre = 40, .blotch = 30,
+                        .shades = 4, .contrast = 50, .dither = 75,
+                        .autostart = 0, .share = 0, .autoupd = 1 };
+/* Test mode: the hidden regression suites set this before anything runs. It
+ * gates every side effect a test must not perform (windows on the working
+ * desktop, network, the Run key); declared here because ShowOverlay, the
+ * first gate, sits well above the help window that used to own it. */
+int g_test_headless = 0;
 static int g_hotkey_failed;
 
 static const WCHAR *REG_KEY = L"Software\\mnPaper";
@@ -178,7 +187,7 @@ static void L(const char *fmt, ...) {
     n = _vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     buf[sizeof buf - 1] = 0;
-    if (n > 0) OutputDebugStringA(buf);   /* visible in DbgView, no log file needed */
+    OutputDebugStringA(buf);   /* visible in DbgView, no log file needed */
     if (g_log) {
         va_start(ap, fmt);
         vfprintf(g_log, fmt, ap);
@@ -510,7 +519,11 @@ static void ExpandPaperRow(unsigned char *dst, const unsigned char *grid, int w)
     }
 }
 
-static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp) {
+/* Same cancel contract as BuildPaperFull: epoch == NULL means uncancellable
+ * (the show path, which must finish even though RepaintAll has parked the
+ * stop flag at 1 while it shows the strips). */
+static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp,
+                             volatile LONG *epoch, LONG expected) {
     PAPERPARAMS p = PaperParams(w, sp);
     int step = PAPER_PREVIEW_STEP;
     p.fs = (float)step;   /* preview: same character, step-x coarser noise */
@@ -521,7 +534,7 @@ static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp
     __m128i zero = _mm_setzero_si128(), round = _mm_set1_epi16(PAPER_PREVIEW_STEP / 2);
     if (!grid || !rows) { free(grid); free(rows); return 0; }
     for (y = 0; y < gh; y++) {
-        if (InterlockedCompareExchange(&g_stop_thread, 0, 0)) goto cancelled;
+        if (PaperCancelled(epoch, expected)) goto cancelled;
         for (x = 0; x < gw; x++)
             PaperPixel(grid + 4 * ((size_t)y * gw + x), x * step, y * step, &p);
     }
@@ -530,7 +543,7 @@ static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp
         unsigned char *top = rows, *bot = rows + bytes;
         unsigned char *out = px + (size_t)y * bytes;
         __m128i wa = _mm_set1_epi16((short)(step - fy)), wb = _mm_set1_epi16((short)fy);
-        if (InterlockedCompareExchange(&g_stop_thread, 0, 0)) goto cancelled;
+        if (PaperCancelled(epoch, expected)) goto cancelled;
         if (!fy) {
             if (y) memcpy(top, bot, bytes);
             else ExpandPaperRow(top, grid, w);
@@ -581,6 +594,11 @@ static void LocalHole(const OVL *ov, int *on, int *x0, int *y0, int *x1, int *y1
 
 static void BuildPaper(OVL *ov) {
     BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
+}
+
+/* mirror one setting into one checkbox; no-op when there is no live control */
+static void SetChk(HWND ctl, int on) {
+    if (ctl) SendMessageW(ctl, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 /* Punch the taskbar hole into an upload buffer: alpha only, RGB left alone.
@@ -643,10 +661,19 @@ static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, in
  * BuildPaperFull directly: a synchronous per-pixel noise build for the whole
  * monitor, every time the effect was switched on, the mode changed or the
  * display changed. That is the freeze the worker exists to prevent, so the
- * show path must never do it. */
+ * show path must never do it.
+ *
+ * The preview must also be UNCANCELLABLE here, not just cheap: RepaintAll
+ * parks g_stop_thread at 1 before showing the strips (its first act is
+ * PaperWorkerStop, and the flag only clears when RequestPaper restarts the
+ * worker at the end). A stop-flag check on the UI thread would cancel every
+ * preview mid-flight, the allocation-failure fallback would fire every
+ * single time, and the whole-monitor build would run right back on the UI
+ * thread - found by the 2026-10-03 review, present since 2.7.7. Passing
+ * epoch = NULL is the same "must complete" contract BuildPaperInto has. */
 static void SeedPaperPreview(OVL *ov) {
     if (!ov->bits || ov->w <= 0 || ov->h <= 0) return;
-    if (!BuildPaperPreview((unsigned char *)ov->bits, ov->w, ov->h, &g_s))
+    if (!BuildPaperPreview((unsigned char *)ov->bits, ov->w, ov->h, &g_s, NULL, 0))
         BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
 }
 
@@ -748,6 +775,11 @@ static void ShowOverlay(OVL *ov, int show) {
     int s;
     if (!ov->hwnd) return;
     if (show) {
+        /* the hidden regression suites must never put strips on the working
+         * desktop, and until 2026-10-03 nothing in the code stopped them:
+         * the gate lived only in conventions per test file. The hide branch
+         * below stays reachable so tests can still verify teardown. */
+        if (g_test_headless) return;
         if (g_s.mode == MODE_PAPER)
             SeedPaperPreview(ov);   /* cheap; the worker bakes the exact one */
         else
@@ -879,13 +911,16 @@ static void RefinePillHole(HWND taskbar, RECT *hole) {
     if (u.right > u.left && u.bottom > u.top) *hole = u;
 }
 
+static int IsTaskbarWnd(HWND h);
+
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
-    WCHAR cls[64];
     RECT r;
     if (g_ntb >= TB_MAX) return FALSE;
     if (!IsWindowVisible(hwnd)) return TRUE;
-    GetClassNameW(hwnd, cls, 64);
-    if (lstrcmpW(cls, L"Shell_TrayWnd") != 0) return TRUE;
+    /* IsTaskbarWnd also matches SecondaryTrayWnd: taskbars shown on secondary
+     * displays (Windows 10 all-displays mode, Windows 11 secondary trays) used
+     * to be skipped here, so the veil painted straight over them. */
+    if (!IsTaskbarWnd(hwnd)) return TRUE;
     if (!GetWindowRect(hwnd, &r)) return TRUE;
     if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
     g_tb[g_ntb] = r;
@@ -1055,9 +1090,11 @@ static void Housekeeping(void) {
                 SetWindowPos(g_ov[i].shwnd[s], HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
-        if (g_dlg)   /* keep the settings window above the veil too */
-            SetWindowPos(g_dlg, HWND_TOPMOST, 0, 0, 0, 0,
+        {   /* keep the settings window above the veil too (ask, never assume) */
+            HWND d = LiveDlg();
+            if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        }
         break;
         }
     }
@@ -1075,8 +1112,9 @@ static void Housekeeping(void) {
     }
     /* the settings window floats above the veil (the veil used to swallow
        it, which is what made the sliders feel laggy and unreadable). */
-    if (g_dlg) {
-        SetWindowPos(g_dlg, HWND_TOPMOST, 0, 0, 0, 0,
+    {
+        HWND d = LiveDlg();   /* the veil floats the settings window above itself */
+        if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 
@@ -1114,7 +1152,6 @@ typedef struct PaperDone {
 static PAPERJOB g_pjob[MAX_MON];
 static SRWLOCK g_plock = SRWLOCK_INIT;
 static unsigned g_pgen, g_platest[MAX_MON], g_papplied[MAX_MON];
-static int g_pupload_ok;
 static HANDLE g_worker, g_pwake;
 
 static void FreePaperDone(PaperDone *d) {
@@ -1148,7 +1185,8 @@ static DWORD WINAPI PaperWorker(LPVOID unused) {
         d->px = (unsigned char *)malloc((size_t)job.w * job.h * 4);
         if (!d->px) { free(d); continue; }
         began = GetTickCount();
-        built = job.preview ? BuildPaperPreview(d->px, job.w, job.h, &job.s)
+        built = job.preview ? BuildPaperPreview(d->px, job.w, job.h, &job.s,
+                                                &g_pepoch[job.idx], job.epoch)
                             : BuildPaperFull(d->px, job.w, job.h, &job.s,
                                              &g_pepoch[job.idx], job.epoch);
         if (!built || InterlockedCompareExchange(&g_stop_thread, 0, 0)) {
@@ -1230,10 +1268,12 @@ static void ApplyPaperResult(PaperDone *d) {
         g_s.mode == MODE_PAPER && g_s.master) {
         g_papplied[d->idx] = d->gen;
         memcpy(ov->bits, d->px, (size_t)ov->w * ov->h * 4);
-        g_pupload_ok = ApplyLayered(ov);
-        L("paper %s monitor=%d gen=%u build=%lums request-to-upload=%lums uploaded=%d",
-          d->preview ? "preview" : "full", d->idx, d->gen, d->build_ms,
-          GetTickCount() - d->queued, g_pupload_ok);
+        {
+            int ok = ApplyLayered(ov);   /* local: it only feeds the line below */
+            L("paper %s monitor=%d gen=%u build=%lums request-to-upload=%lums uploaded=%d",
+              d->preview ? "preview" : "full", d->idx, d->gen, d->build_ms,
+              GetTickCount() - d->queued, ok);
+        }
     }
     FreePaperDone(d);
 }
@@ -1413,8 +1453,8 @@ static void PresentEinkRect(OVL *ov) {
                show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
                (size_t)ov->w * 4);
     /* Same hole rule as the paper path. No restore is needed here: this buffer
-     * is re-copied from g_proc at the top of every e-ink frame, so the hole
-     * never survives into the next upload. The save is discarded. */
+     * is re-copied from g_eproc_show at the top of every e-ink frame, so the
+     * hole never survives into the next upload. The save is discarded. */
     {
         unsigned char *saved = NULL;
         size_t saved_len = 0;
@@ -1557,18 +1597,39 @@ static int DxgiPoll(unsigned char *dst) {
             continue;
         }
         srow = (BYTE *)m.pData;
-        drow = dst + 4 * ((size_t)g_out[i].r.top * g_vsw + g_out[i].r.left);
-        pitch = m.RowPitch;
-        for (y = 0; y < (long)td.Height; y++) {
-            BYTE *s = srow + (size_t)y * pitch;
-            BYTE *d = drow + (size_t)y * g_vsw * 4;
-            if (g_out[i].swapRB) {
-                for (x = 0; x < (long)td.Width; x++) {
-                    BYTE *sp = s + 4 * x, *dp = d + 4 * x;
-                    dp[0] = sp[2]; dp[1] = sp[1]; dp[2] = sp[0]; dp[3] = 255;
+        /* DesktopCoordinates live in unrotated desktop space while the
+         * duplicated texture follows the rotated output, so r and
+         * td.Width/Height can disagree - and r can fall partly or wholly
+         * outside the ring slot, which is sized g_vsw*g_vsh. Copy only the
+         * part that lands inside the slot (the same bound PresentEinkRect
+         * enforces on the way back out); an empty intersection means this
+         * output has no on-slot pixels and is skipped. */
+        {
+            RECT c = g_out[i].r;
+            long cw, ch;
+            if (c.left < 0) c.left = 0;
+            if (c.top < 0) c.top = 0;
+            if (c.right > g_vsw) c.right = g_vsw;
+            if (c.bottom > g_vsh) c.bottom = g_vsh;
+            cw = c.right - c.left;
+            ch = c.bottom - c.top;
+            if (cw > (long)td.Width) cw = (long)td.Width;
+            if (ch > (long)td.Height) ch = (long)td.Height;
+            if (cw > 0 && ch > 0) {
+                drow = dst + 4 * ((size_t)c.top * g_vsw + c.left);
+                pitch = m.RowPitch;
+                for (y = 0; y < ch; y++) {
+                    BYTE *s = srow + (size_t)y * pitch;
+                    BYTE *d = drow + (size_t)y * g_vsw * 4;
+                    if (g_out[i].swapRB) {
+                        for (x = 0; x < cw; x++) {
+                            BYTE *sp = s + 4 * x, *dp = d + 4 * x;
+                            dp[0] = sp[2]; dp[1] = sp[1]; dp[2] = sp[0]; dp[3] = 255;
+                        }
+                    } else {
+                        memcpy(d, s, (size_t)cw * 4);
+                    }
                 }
-            } else {
-                memcpy(d, s, (size_t)td.Width * 4);
             }
         }
         g_ctx->lpVtbl->Unmap(g_ctx, (ID3D11Resource *)g_out[i].stage, 0);
@@ -1887,7 +1948,7 @@ static void DumpPaper(const char *path, int w, int h) {
     ov.w = w; ov.h = h;
     ov.bits = malloc((size_t)w * h * 4);
     BuildPaper(&ov);
-    CompositeOver((unsigned char *)ov.bits, w, h, 235);
+    CompositeOver((unsigned char *)ov.bits, w, h, g_dump_bg);
     DumpBgra(path, (unsigned char *)ov.bits, w, h);
     free(ov.bits);
 }
@@ -1939,7 +2000,6 @@ static const WCHAR *SET_CLASS = L"MnPaperSettings";
 /* ---------------- on-demand help window (replaces hover tips) ------------- */
 
 static HWND g_helpwnd;          /* single "?" help window              */
-int g_test_headless = 0;        /* tests create the help window hidden */
 static void SetMaster(int on);  /* defined in the commands section below */
 
 static const WCHAR HELP_TEXT[] =
@@ -2159,6 +2219,14 @@ static int Sha256Hex(const unsigned char *data, DWORD len, WCHAR *hex) {
  * is given, so a caller can tell a size refusal from a transport failure.
  * recv_ms is the receive timeout: short for the version feed, long for the
  * exe download. */
+/* The one cap decision HttpGetToMem makes per chunk: WinHTTP hands the body
+ * over in pieces, and a piece that does not fit under the cap means the body
+ * as a whole is over the cap - it is refused whole, never truncated. Kept as
+ * a function so the regression suite can drive the boundary directly. */
+static int FeedFits(DWORD total, DWORD got, DWORD max_bytes) {
+    return got <= max_bytes - total;
+}
+
 static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
                         unsigned char **out_buf, DWORD *out_len, int *too_big) {
     WCHAR host[256] = L"", path[512] = L"", ua[32];
@@ -2193,10 +2261,14 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         goto done;
     while (total < max_bytes) {
         if (!WinHttpQueryDataAvailable(req, &got) || !got) break;
-        if (got > max_bytes - total) { if (too_big) *too_big = 1; goto done; }   /* more than the cap holds: refuse it whole */
+        if (!FeedFits(total, got, max_bytes)) { if (too_big) *too_big = 1; goto done; }   /* more than the cap holds: refuse it whole */
         if (total + got > cap) {
-            cap = total + got;
-            if (cap < 262144) cap = 262144;
+            /* geometric growth: the old "cap = total + got" grew the buffer
+             * by one ~8 KB read at a time, so an 8 MB update realloc'd (and
+             * copied) roughly a thousand times. */
+            cap = cap ? cap * 2 : 262144;
+            if (cap < total + got) cap = total + got;
+            if (cap > max_bytes) cap = max_bytes;
             nb = (unsigned char *)realloc(buf, cap);
             if (!nb) goto done;
             buf = nb;
@@ -2512,6 +2584,18 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
  * relaunch. Neither rename can fail for the running process (it may rename
  * its own image), but a failure must never leave the user with no exe at
  * all, and never destroy the only verified copy on disk. */
+/* One shape for every "nothing was changed" box the updater can raise: same
+ * flags, owner asked for at the call site. Text and title vary per failure. */
+static void UpdNote(HWND owner, const WCHAR *title, const WCHAR *text) {
+    MessageBoxW(owner, text, title, MB_OK | MB_ICONWARNING);
+}
+
+/* The two "feed answered but odd - open the page anyway?" prompts. */
+static int UpdAskPage(HWND owner, const WCHAR *text) {
+    return MessageBoxW(owner, text, L"mnPaper - check for updates",
+                       MB_YESNO | MB_ICONWARNING) == IDYES;
+}
+
 static void InstallResult(InstInfo *in) {
     WCHAR exe[MAX_PATH], old[MAX_PATH + 8], newf[MAX_PATH + 8];
     unsigned char *buf;
@@ -2523,36 +2607,32 @@ static void InstallResult(InstInfo *in) {
     if (in->result == UPD_DL_MISMATCH) {
         free(in->buf);
         free(in);
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update refused",
             L"The downloaded file does not match the published fingerprint.\n"
-            L"It was discarded and nothing was changed.",
-            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
+            L"It was discarded and nothing was changed.");
         return;
     }
     if (in->result == UPD_DL_SHORT) {
         free(in->buf);
         free(in);
-        MessageBoxW(owner,
-            L"The download was incomplete. Nothing was changed - please try again.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        UpdNote(owner, L"mnPaper - update",
+            L"The download was incomplete. Nothing was changed - please try again.");
         return;
     }
     if (in->result == UPD_DL_CAP) {
         free(in->buf);
         free(in);
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update refused",
             L"The download exceeded the size limit.\n"
-            L"Nothing was changed.",
-            L"mnPaper - update refused", MB_OK | MB_ICONWARNING);
+            L"Nothing was changed.");
         return;
     }
     if (in->result != UPD_DL_OK) {
         free(in->buf);
         free(in);
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update",
             L"The download failed (offline, or the release is not reachable).\n"
-            L"Nothing was changed. You can try again later or download manually from the releases page.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+            L"Nothing was changed. You can try again later or download manually from the releases page.");
         return;
     }
     buf = in->buf;
@@ -2566,8 +2646,8 @@ static void InstallResult(InstInfo *in) {
         if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
         DeleteFileW(newf);
         free(buf);
-        MessageBoxW(owner, L"Could not write the update next to the exe. Nothing was changed.",
-                    L"mnPaper - update", MB_OK | MB_ICONWARNING);
+        UpdNote(owner, L"mnPaper - update",
+                L"Could not write the update next to the exe. Nothing was changed.");
         return;
     }
     CloseHandle(f);
@@ -2577,35 +2657,31 @@ static void InstallResult(InstInfo *in) {
     DeleteFileW(old);   /* best effort: a leftover must never be renamed back */
     if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(newf);   /* nothing moved: the running exe is untouched */
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update",
             L"The update could not be applied (the exe is locked). Nothing was changed - "
-            L"try again in a moment, or download manually from the releases page.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+            L"try again in a moment, or download manually from the releases page.");
         return;
     }
     if (!MoveFileExW(newf, exe, MOVEFILE_REPLACE_EXISTING)) {
         if (!MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING)) {
             /* the undo failed as well: .new is the only verified copy */
-            MessageBoxW(owner,
+            UpdNote(owner, L"mnPaper - update",
                 L"The update could not be applied, and the previous exe could not be "
                 L"restored either.\nThe new version is saved as mnPaper.exe.new next to "
                 L"mnPaper.exe - close mnPaper and rename it over mnPaper.exe, or "
-                L"download manually from the releases page.",
-                L"mnPaper - update", MB_OK | MB_ICONWARNING);
+                L"download manually from the releases page.");
             return;
         }
         DeleteFileW(newf);
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update",
             L"The update could not be applied (the exe is locked). Nothing was changed - "
-            L"try again in a moment, or download manually from the releases page.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+            L"try again in a moment, or download manually from the releases page.");
         return;
     }
     if (!RelaunchAfterSwap(exe))
-        MessageBoxW(owner,
+        UpdNote(owner, L"mnPaper - update",
             L"The update is installed, but mnPaper could not start itself again.\n"
-            L"Please start mnPaper from your shortcut or the Start menu.",
-            L"mnPaper - update", MB_OK | MB_ICONWARNING);
+            L"Please start mnPaper from your shortcut or the Start menu.");
     L("self-update: swapped and relaunching");
     if (LiveDlg()) DestroyWindow(g_dlg);
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
@@ -2652,16 +2728,14 @@ static void UpdateResult(HWND dlg, int manual, UpdInfo *u) {
                         L"mnPaper - up to date", MB_OK | MB_ICONINFORMATION);
     } else if (result == UPT_MALFORMED) {
         if (manual)
-            open = MessageBoxW(dlg,
+            open = UpdAskPage(dlg,
                 L"The update feed answered, but its contents could not be read as a "
-                L"version number.\n\nOpen the mnPaper download page anyway?",
-                L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+                L"version number.\n\nOpen the mnPaper download page anyway?");
     } else {
         if (manual)
-            open = MessageBoxW(dlg,
+            open = UpdAskPage(dlg,
                 L"Could not reach the update feed (offline, or the feed is not "
-                L"published yet).\n\nOpen the mnPaper download page anyway?",
-                L"mnPaper - check for updates", MB_YESNO | MB_ICONWARNING) == IDYES;
+                L"published yet).\n\nOpen the mnPaper download page anyway?");
     }
     free(u);
     if (open)
@@ -2793,15 +2867,11 @@ static void DialogPushSettings(HWND dlg) {
     SyncModeRadios(dlg, g_s.mode == MODE_PAPER ? 114 : 115);
     if (g_chk_share) {
         EnableWindow(g_chk_share, g_s.mode == MODE_PAPER);   /* e-ink is always capture-excluded */
-        SendMessageW(g_chk_share, BM_SETCHECK,
-                     g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+        SetChk(g_chk_share, g_s.share);
     }
-    SendMessageW(GetDlgItem(dlg, 118), BM_SETCHECK,
-                 g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(GetDlgItem(dlg, 119), BM_SETCHECK,
-                 g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(GetDlgItem(dlg, 120), BM_SETCHECK,
-                 g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetChk(GetDlgItem(dlg, 118), g_s.master);
+    SetChk(GetDlgItem(dlg, 119), g_s.autostart);
+    SetChk(GetDlgItem(dlg, 120), g_s.autoupd);
 }
 
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2844,8 +2914,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
             GetModuleHandleW(NULL), NULL);
-        SendMessageW(GetDlgItem(hwnd, 118), BM_SETCHECK,
-                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+        SetChk(GetDlgItem(hwnd, 118), g_s.master);
         /* Autostart: mirrors the tray's Start-with-Windows item. */
         CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
@@ -2998,9 +3067,12 @@ static void OpenSettings(void) {
     RECT rc;
     WNDCLASSEXW wc;
     L("open settings");
-    if (g_dlg) {
-        SetForegroundWindow(g_dlg);
-        return;
+    {
+        HWND have = LiveDlg();   /* ask rather than assume: the dialog can die between ticks */
+        if (have) {
+            SetForegroundWindow(have);
+            return;
+        }
     }
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
@@ -3040,8 +3112,7 @@ static void OpenSettings(void) {
 
 static void SyncMasterCheckbox(void) {   /* mirror g_s.master into control 118 */
     if (LiveDlg())
-        SendMessageW(GetDlgItem(g_dlg, 118), BM_SETCHECK,
-                     g_s.master ? BST_CHECKED : BST_UNCHECKED, 0);
+        SetChk(GetDlgItem(g_dlg, 118), g_s.master);
 }
 
 static void SetMaster(int on) {
@@ -3154,7 +3225,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_PAPER:
         ApplyPaperResult((PaperDone *)lp);
         return 0;
-    case WM_APP + 1:
+    case WM_APP_CMD:
         L("cmd %d", (int)wp);
         switch (wp) {
         case CMD_TOGGLE: SetMaster(!g_s.master); break;
@@ -3213,25 +3284,22 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_s.share = g_s.share ? 0 : 1;
             SaveSettings();
             RepaintAll();   /* re-applies the capture exclusion state */
-            if (g_dlg && g_chk_share)
-                SendMessageW(g_chk_share, BM_SETCHECK,
-                             g_s.share ? BST_CHECKED : BST_UNCHECKED, 0);
+            if (LiveDlg())
+                SetChk(g_chk_share, g_s.share);
             L("share=%d", g_s.share);
             break;
         case IDM_AUTOSTART:
             g_s.autostart = g_s.autostart ? 0 : 1;
             SaveSettings();
             if (LiveDlg())
-                SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK,
-                             g_s.autostart ? BST_CHECKED : BST_UNCHECKED, 0);
+                SetChk(GetDlgItem(g_dlg, 119), g_s.autostart);
             L("autostart=%d", g_s.autostart);
             break;
         case IDM_AUTOUPD:
             g_s.autoupd = g_s.autoupd ? 0 : 1;
             SaveSettings();
             if (LiveDlg())
-                SendMessageW(GetDlgItem(g_dlg, 120), BM_SETCHECK,
-                             g_s.autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
+                SetChk(GetDlgItem(g_dlg, 120), g_s.autoupd);
             L("autoupd=%d", g_s.autoupd);
             break;
         case IDM_EXIT:
@@ -3320,7 +3388,7 @@ static int SendToRunning(void) {
         SendMessageW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd);
     }
     if (g_cmd)
-        PostMessageW(h, WM_APP + 1, (WPARAM)g_cmd, 0);
+        PostMessageW(h, WM_APP_CMD, (WPARAM)g_cmd, 0);
     return 1;
 }
 
@@ -3489,8 +3557,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
       g_n > 0 ? g_ov[0].n_strips : 0);
 
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        if (g_dlg && IsDialogMessageW(g_dlg, &msg))
-            continue;
+        {
+            HWND d = LiveDlg();
+            if (d && IsDialogMessageW(d, &msg))
+                continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

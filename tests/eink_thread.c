@@ -30,7 +30,7 @@ static int WaitForPresents(int want, int timeout_ms) {
             DispatchMessageW(&msg);
             if (msg.message == WM_APP_EINK) want--;
         }
-        if (GetTickCount() - began > 250) Sleep(5);
+        Sleep(1);   /* yield; the old 250 ms busy-spin burned a core for nothing */
     }
     return want == 0;
 }
@@ -102,18 +102,13 @@ int main(void) {
     EinkWorkerSet(1);
     Check(g_ework != NULL, "e-ink worker thread starts");
     adist[slots_used++] = EinkCapBegin();
-    Check(adist[0] != NULL, "a capture slot is available");
-    {   /* slots are distinct: the ring is a real ring, not one buffer */
-        adist[slots_used] = EinkCapBegin();
-        unsigned char *s2 = EinkCapBegin();
-        Check(adist[slots_used] && s2 && adist[slots_used] != s2,
-              "successive captures take different slots");
-        slots_used++;
-        if (s2 != adist[0] && s2 != adist[1]) { adist[slots_used++] = s2; }
-        else EinkCapEnd(0, s2);   /* same slot twice: the ring is only 3 deep */
-    }
-    Check(slots_used >= 2, "each grab owns its own slot");
-    for (i = 0; i < EINK_SLOTS; i++) if (g_ecap_state[i] == 0) { /* release nothing */ }
+    adist[slots_used++] = EinkCapBegin();
+    adist[slots_used++] = EinkCapBegin();
+    /* the ring is EINK_SLOTS deep: every grab owns its own distinct slot */
+    Check(adist[0] && adist[1] && adist[2] &&
+          adist[0] != adist[1] && adist[1] != adist[2] && adist[0] != adist[2],
+          "all three grabs own distinct slots (a real ring, not one buffer)");
+    Check(EinkCapBegin() == NULL, "a fourth grab finds the ring full");
     for (i = 0; i < slots_used; i++) EinkCapEnd(0, adist[i]);   /* hand them back unused */
 
     before_show = g_eproc_show; before_build = g_ebuild;

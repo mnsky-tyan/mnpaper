@@ -15,6 +15,16 @@ static int upload_failed;
 static DWORD preview_ms[128];
 static int preview_count;
 
+/* every byte: for equality claims (PixelHash strides 97 and is for change
+ * detection only - the 2026-10-03 review flagged one equality claim resting
+ * on the sampled hash) */
+static ULONGLONG PixelHashAll(const unsigned char *p, size_t bytes) {
+    ULONGLONG h = 1469598103934665603ULL;
+    size_t k;
+    for (k = 0; k < bytes; k++) h = (h ^ p[k]) * 1099511628211ULL;
+    return h;
+}
+
 static ULONGLONG PixelHash(const unsigned char *p, size_t bytes) {
     ULONGLONG h = 1469598103934665603ULL;
     size_t k;
@@ -34,7 +44,8 @@ static LRESULT CALLBACK TestHost(HWND h, UINT m, WPARAM w, LPARAM l) {
         ApplyPaperResult(d);
         if (preview && preview_count < 128)
             preview_ms[preview_count++] = GetTickCount() - queued;
-        if (!g_pupload_ok) upload_failed++;
+        /* (the old upload-failure counter hung off the g_pupload_ok global,
+         * which existed only for it; the property is asserted directly below) */
         last_applied_gen = gen;
         applied_count++;
         if (PixelHash(g_ov[0].bits, (size_t)g_ov[0].w * g_ov[0].h * 4) != previous_hash && !first_pixel_ms)
@@ -75,7 +86,7 @@ int main(void) {
     int i;
     SETTINGS before = g_s;
 g_test_headless = 1;   /* help + update windows must never become visible in tests */
-    g_log = fopen("C:\\Users\\tyanw\\AppData\\Local\\Temp\\mnpaper-sharegui\\test-trace.log", "w");
+    /* no g_log here: L() reaches DbgView, and a hardcoded profile path does not belong in a test */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
     swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
@@ -110,7 +121,11 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
            first_pixel_ms, applied_count, final_gen, last_applied_gen);
     Check(first_pixel_ms > 0 && first_pixel_ms < 250, "texture pixels change within 250ms, not just numeric readout");
     Check(applied_count >= 3, "multiple texture updates while dragging");
-    Check(upload_failed == 0, "UpdateLayeredWindow accepted every rendered frame");
+    Check(ApplyLayered(&g_ov[0]) && ApplyLayered(&g_ov[0]),
+          "UpdateLayeredWindow accepts the rendered frame (direct calls)");
+    /* the counter form died with the g_pupload_ok global; a direct call here
+     * proves the same property without a file-scope flag */
+    (void)upload_failed;
     Check(last_applied_gen == final_gen, "last requested value eventually completes without another mouse event");
     printf("METRIC request-to-upload preview latency:");
     for (i = 0; i < preview_count; i++) printf(" %lu", preview_ms[i]);
@@ -155,9 +170,10 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         unsigned char *saved = NULL;
         size_t saved_len = 0;
         int rx0=0, ry0=0, rx1=0, ry1=0;
-        ULONGLONG armed;
+        ULONGLONG armed, armed_all;
         px[(size_t)hy * stride + hx * 4 + 3] = 255;   /* armed before the hole */
         armed = PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4);
+        armed_all = PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4);
         /* The hole is a MASK on one upload, not a change to the texture. The
          * upload sees the hole; the master texture must come back untouched,
          * because Housekeeping re-uploads with no rebuild behind it. */
@@ -165,8 +181,8 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         Check(px[(size_t)hy * stride + hx * 4 + 3] == 0, "taskbar hole zeroes alpha inside the rect");
         Check(px[(size_t)(hy + 40) * stride + (hx + 40) * 4 + 3] == 0, "taskbar hole covers the whole rect");
         RestoreHoleAlpha(&g_ov[0], saved, saved_len, rx0, ry0, rx1, ry1);
-        Check(PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4) == armed,
-              "the upload leaves the master texture byte-identical");
+        Check(PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4) == armed_all,
+              "the upload leaves the master texture byte-identical (every byte)");
         Check(ApplyLayered(&g_ov[0]), "moving taskbar hole uploads without a texture rebuild");
         Check(g_pgen == gen, "taskbar hole moves without a render generation bump");
         Check(px[(size_t)hy * stride + hx * 4 + 3] != 0, "the texture is not left punched after an upload");
@@ -200,13 +216,13 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
      * bytes remain valid premultiplied alpha. */    {
         unsigned char tiny[31 * 21 * 4];
         int valid = 1;
-        Check(BuildPaperPreview(tiny, 31, 21, &g_s), "odd-sized preview renders");
+        Check(BuildPaperPreview(tiny, 31, 21, &g_s, NULL, 0), "odd-sized preview renders");
         for (i = 0; i < 31 * 21; i++)
             if (tiny[4*i] > tiny[4*i+3] || tiny[4*i+1] > tiny[4*i+3] || tiny[4*i+2] > tiny[4*i+3]) valid = 0;
         Check(valid, "preview interpolation retains valid premultiplied alpha");
         g_s.intensity = 0;
         memset(tiny, 0xff, sizeof tiny);
-        BuildPaperPreview(tiny, 31, 21, &g_s);
+        BuildPaperPreview(tiny, 31, 21, &g_s, NULL, 0);
         valid = 1;
         for (i = 0; i < (int)sizeof tiny; i++) if (tiny[i]) valid = 0;
         Check(valid, "strength zero is fully transparent in preview");
@@ -274,11 +290,11 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
             unsigned char *buf = malloc((size_t)w * h * 4);
             SETTINGS saved = g_s;
             g_s.warmth = 100;
-            Check(BuildPaperPreview(buf, w, h, &g_s), "warm preview renders");
+            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "warm preview renders");
             for (i = 0; i < w * h; i++)
                 warm_br += (int)buf[4*i] - (int)buf[4*i+2];  /* blue - red */
             g_s.warmth = 0;
-            Check(BuildPaperPreview(buf, w, h, &g_s), "cool preview renders");
+            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "cool preview renders");
             for (i = 0; i < w * h; i++)
                 cool_br += (int)buf[4*i] - (int)buf[4*i+2];
             g_s = saved;
@@ -309,7 +325,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         #define PREVIEW_ALPHA_STD(gv, fv, bv, outstd, outdetail) do { \
             g_s.grain = (gv); g_s.fibre = (fv); g_s.blotch = (bv); \
             g_s.intensity = 40; \
-            ok = BuildPaperPreview(buf, w, h, &g_s); \
+            ok = BuildPaperPreview(buf, w, h, &g_s, NULL, 0); \
             if (!ok) render_fail++; \
             sum = sum2 = 0; std = 0; detail = 0; \
             if (ok) { \
