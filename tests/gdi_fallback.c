@@ -90,7 +90,14 @@ int main(void) {
     GdiResetGrabs();
     Check(g_gdi_bmp == NULL && g_gdi_dc == NULL && g_gdi_prev == NULL,
           "reset releases the DIB, the DC and the shadow buffer");
-    Check(GdiPoll(dst) == 1, "the next grab after a reset rebuilds and reports");
+    {   /* the first post-reset poll: assert the REBUILD property only - the
+         * fresh shadow is zeroed, so an all-black live corner would return 0
+         * with nothing wrong (a black wallpaper or a locked desktop is
+         * exactly where this fallback runs) */
+        GdiPoll(dst);
+        Check(g_gdi_bmp != NULL && g_gdi_dc != NULL && g_gdi_prev != NULL,
+              "the next grab after a reset rebuilds the DIB, DC and shadow");
+    }
     /* seed the fresh shadow to a value a real corner is unlikely to hold, so
      * the "reports again" half does not depend on the desktop's pixels */
     memset(g_gdi_prev, 0x5A, n);
