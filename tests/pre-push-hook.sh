@@ -44,12 +44,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             echo "release guard: new ref carries version.txt - strict feed rules apply"
             echo "release guard: NOTE after publishing, still run: release_guard.py --verify-asset and --deployed <exe>"
         fi
-    elif git diff --name-only "$remote_sha..$local_sha" | grep -q "^version.txt$"; then
-        strict="--release"
-        echo "release guard: push carries version.txt - strict feed rules apply"
-        echo "release guard: NOTE after publishing, still run: release_guard.py --verify-asset and --deployed <exe>"
-    elif ! git diff --name-only "$remote_sha..$local_sha" >/dev/null 2>&1; then
-        echo "release guard: NOTE could not diff $remote_sha..$local_sha; strict feed rules skipped"
+    else
+        # one diff per push: the output answers "carries version.txt", the
+        # exit status answers "diffable at all" (2026-10-05 review)
+        diff_files=$(git diff --name-only "$remote_sha..$local_sha" 2>/dev/null)
+        diff_ok=$?
+        if printf '%s\n' "$diff_files" | grep -q "^version.txt$"; then
+            strict="--release"
+            echo "release guard: push carries version.txt - strict feed rules apply"
+            echo "release guard: NOTE after publishing, still run: release_guard.py --verify-asset and --deployed <exe>"
+        elif [ "$diff_ok" -ne 0 ]; then
+            echo "release guard: NOTE could not diff $remote_sha..$local_sha; strict feed rules skipped"
+        fi
     fi
     python3 "$guard" --commit "$local_sha" $strict || fail=1
 done

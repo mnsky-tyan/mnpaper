@@ -15,12 +15,9 @@
 #include "../mnPaper.c"
 #undef wWinMain
 
-static unsigned long long PixelHash8(const unsigned char *p, size_t bytes) {
-    unsigned long long h = 1469598103934665603ULL;
-    size_t i;
-    for (i = 0; i < bytes; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-    return h;
-}
+/* shared full-byte hash (tests/fnv64.h); PixelHash8 kept as the local name */
+#include "fnv64.h"
+#define PixelHash8 PixelHashAll
 
 static int fails, checks;
 static void Check(int c, const char *what) {
@@ -155,11 +152,12 @@ int main(void) {
         RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
         Check(PixelHash8(px, (size_t)w * h * 4) == before,
               "RestoreHoleAlpha puts the texture back byte-for-byte (no permanent band)");
-        /* and the property the bug violated: an upload must never leave the
-         * master texture mutated, because Housekeeping re-uploads without a
-         * rebuild when the taskbar parks */
+        /* the restore put the punched pixel's own alpha back (the hash check
+         * above already proves it for every byte; this names the property in
+         * the bug report's own terms) */
         Check(px[(size_t)150 * w * 4 + 50 * 4 + 3] == 255,
-              "the master texture keeps its own alpha after a hole upload");        free(px);
+              "RestoreHoleAlpha leaves the punched pixel back at its own alpha");
+        free(px);
     }
     {
         /* the owner rule: a dead handle must come back as NULL, not be used */

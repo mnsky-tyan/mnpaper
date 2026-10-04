@@ -16,13 +16,9 @@ static int preview_count;
 
 /* every byte: for equality claims (PixelHash strides 97 and is for change
  * detection only - the 2026-10-03 review flagged one equality claim resting
- * on the sampled hash) */
-static ULONGLONG PixelHashAll(const unsigned char *p, size_t bytes) {
-    ULONGLONG h = 1469598103934665603ULL;
-    size_t k;
-    for (k = 0; k < bytes; k++) h = (h ^ p[k]) * 1099511628211ULL;
-    return h;
-}
+ * on the sampled hash). PixelHashAll is the shared full-byte hash in
+ * tests/fnv64.h, also used by hole_cycle and verify_fixes. */
+#include "fnv64.h"   /* full-byte hash: tests/slider_latency.c and fnv64.h sit in tests/ */
 
 static ULONGLONG PixelHash(const unsigned char *p, size_t bytes) {
     ULONGLONG h = 1469598103934665603ULL;
@@ -191,7 +187,7 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
          * bottom. So: open the hole, upload, close the hole, upload again, and
          * the texture must be exactly as it was before the hole ever opened. */
         {
-            ULONGLONG before = PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4);
+            ULONGLONG before = PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4);
             g_hole_on[0] = 1;
             SetRect(&g_hole[0], 0, 1700, 2880, 1800);
             ApplyLayered(&g_ov[0]);
@@ -199,12 +195,12 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
              * only during the upload - which is what keeps the next no-rebuild
              * re-upload correct. What is observable here is that the texture is
              * unchanged by the upload, which the check below pins down. */
-            Check(PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
-                  "an upload with the hole leaves the master texture untouched");
+            Check(PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
+                  "an upload with the hole leaves the master texture untouched (every byte)");
             g_hole_on[0] = 0;                       /* taskbar parked: hole closes */
             Check(ApplyLayered(&g_ov[0]), "closing the hole uploads with no rebuild");
-            Check(PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
-                  "closing the hole restores the texture exactly (no permanent band)");
+            Check(PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
+                  "closing the hole restores the texture exactly, every byte (no permanent band)");
             Check(px[(size_t)1750 * stride + 200 * 4 + 3] != 0,
                   "the band under a parked taskbar renders paper again");
         }
@@ -425,9 +421,13 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         int saved_master = g_s.master, saved_share = -1, saved_mode = -1;
         HKEY key = NULL;
         g_s.master = 0;   /* keep hidden strips hidden: RepaintAll only re-affinitizes */
+        {
+            WCHAR cls[32];
+            Check(g_chk_share && IsWindow(g_chk_share) &&
+                  GetClassNameW(g_chk_share, cls, 32) == 6 && lstrcmpW(cls, L"Button") == 0,
+                  "share checkbox is a live button control in the settings window");
+        }
         SendMessageW(g_chk_share, BM_SETCHECK, BST_CHECKED, 0);
-        Check(SendMessageW(g_chk_share, BM_GETCHECK, 0, 0) == BST_CHECKED,
-              "share checkbox is a live control in the settings window");
         SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(113, BN_CLICKED), (LPARAM)g_chk_share);
         Pump(50);
         if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {

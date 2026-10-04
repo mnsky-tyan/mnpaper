@@ -18,11 +18,9 @@ static void Check(int c, const char *what) {
     printf("  %s  %s\n", c ? "PASS" : "FAIL", what);
     if (!c) fails++;
 }
-static unsigned long long H(const unsigned char *p, size_t n) {
-    unsigned long long h = 1469598103934665603ULL; size_t i;
-    for (i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-    return h;
-}
+/* shared full-byte hash (tests/fnv64.h); H kept as the file's short name */
+#include "fnv64.h"
+#define H PixelHashAll
 
 int main(void) {
     RECT mon = { 0, 0, 2880, 1800 };          /* fixed reference geometry */

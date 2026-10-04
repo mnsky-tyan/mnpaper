@@ -89,12 +89,16 @@
  * compared against the published feed and the number Windows reads out of the
  * exe's version resource cannot drift apart. They did: 2.7.3 through 2.7.5
  * bumped only the resource, so those builds reported themselves as 2.7.2 and
- * kept offering an update that was already installed. To cut a release, edit
- * version.h and nothing else.
+ * kept offering an update that was already installed. The release NUMBER lives
+ * here and nowhere else in code; cutting a release then also pins the built
+ * exe's SHA-256 in version.txt (the flow in AGENTS.md, checked by
+ * tests/release_guard.py).
  *
  * Before publishing, point UPDATE_URL at a plain-text file whose first line is
- * the latest version ("2.7.6") and whose optional second line is the 64-hex
- * SHA-256 pin of that release's exe, and PRODUCT_URL at the page users download
+ * the latest version ("2.7.6") and whose body carries the 64-hex SHA-256 pin
+ * of that release's exe (FindHash64 below: a run of exactly 64 hex chars
+ * bounded by non-hex bytes, anywhere in the feed), and PRODUCT_URL at the page
+ * users download
  * from (GitHub Releases recommended: free TLS hosting, the release itself is
  * the artifact). The check itself is read-only: it fetches that feed and
  * compares versions, so a hostile or offline feed can at worst show a wrong
@@ -108,7 +112,7 @@
 /* self-update payload: stable redirect URL, not the rate-limited REST API */
 #define UPDATE_EXE_URL L"https://github.com/mnsky-tyan/mnpaper/releases/latest/download/mnPaper.exe"
 #define UPDATE_MAX_BYTES (8u * 1024u * 1024u)
-#define FEED_MAX_BYTES 4096   /* version.txt is two short lines; a bigger one is refused */
+#define FEED_MAX_BYTES 4096   /* the feed is a tiny text file; anything bigger is refused */
 
 #define MODE_PAPER 0
 #define MODE_EINK  1
@@ -657,6 +661,21 @@ static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, in
     free(saved);
 }
 
+/* Punch the hole in place with no save: for the e-ink present path, whose
+ * buffer is re-copied from g_eproc_show at the top of every present, so the
+ * pixels under the hole are disposable. ApplyLayered's paper path needs the
+ * save/restore pair instead: Housekeeping re-uploads there without a rebuild,
+ * so ov->bits must never stay mutated. */
+static void PunchHoleAlpha(OVL *ov) {
+    int on, x0, y0, x1, y1, y;
+    if (!ov->bits) return;
+    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
+    if (!on) return;
+    for (y = y0; y < y1; y++)
+        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
+               (size_t)(x1 - x0) * 4);
+}
+
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
  * preview here - this runs on the UI thread inside RepaintAll - and let the
  * worker replace it with the exact texture straight after. The old code ran
@@ -804,17 +823,20 @@ static BOOL CALLBACK MonRectCb(HMONITOR hm, HDC hdc, LPRECT rc, LPARAM lp) {
 }
 
 static void SyncOverlays(void) {
-    OVL tmp[MAX_MON];
+    OVL tmp[MAX_MON] = { 0 };   /* the tail slots are memcpy'd too */
     int i, j, n = 0;
 
     g_nmi = 0;
     EnumDisplayMonitors(NULL, NULL, MonRectCb, 0);
 
-    /* keep windows whose monitor still exists, drop the rest */
+    /* keep windows whose monitor still exists at the same geometry, drop the
+     * rest: HMONITOR handles can be reused across a resolution change, and a
+     * surviving overlay with a stale rect would seed the veil at the old
+     * size (2026-10-05 review) */
     for (i = 0; i < g_n; i++) {
         int alive = 0;
         for (j = 0; j < g_nmi; j++)
-            if (g_mi[j].mon == g_ov[i].mon) { alive = 1; break; }
+            if (g_mi[j].mon == g_ov[i].mon && EqualRect(&g_mi[j].rc, &g_ov[i].rc)) { alive = 1; break; }
         if (alive && n < MAX_MON)
             tmp[n++] = g_ov[i];
         else
@@ -911,6 +933,7 @@ static void RefinePillHole(HWND taskbar, RECT *hole) {
 }
 
 static int IsTaskbarWnd(HWND h);
+static void EinkPresent(void);   /* e-ink arm of the hole-dirty refresh below */
 
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     RECT r;
@@ -1114,6 +1137,12 @@ static void Housekeeping(void) {
         g_hole_dirty = 0;
         if (g_s.master && g_s.mode == MODE_PAPER)
             for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
+        else if (g_s.master && g_s.mode == MODE_EINK)
+            /* the punch lives in ov->bits and a static screen publishes no
+             * frames, so without this the parked taskbar leaves the last
+             * published frame's transparent band on screen indefinitely
+             * (2026-10-05 review) */
+            EinkPresent();
     }
     /* the settings window floats above the veil (the veil used to swallow
        it, which is what made the sliders feel laggy and unreadable). */
@@ -1467,16 +1496,11 @@ static void PresentEinkRect(OVL *ov) {
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
                show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
                (size_t)ov->w * 4);
-    /* Same hole rule as the paper path. No restore is needed here: this buffer
-     * is re-copied from g_eproc_show at the top of every e-ink frame, so the
-     * hole never survives into the next upload. The save is discarded. */
-    {
-        unsigned char *saved = NULL;
-        size_t saved_len = 0;
-        int rx0=0, ry0=0, rx1=0, ry1=0;
-        ClearHoleAlpha(ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
-        free(saved);
-    }
+    /* Same hole rule as the paper path, punched in place: this buffer is
+     * re-copied from g_eproc_show at the top of every present, so the pixels
+     * under the hole are disposable. Housekeeping re-presents on every hole
+     * change, so a parked taskbar cannot leave a stale band in the upload. */
+    PunchHoleAlpha(ov);
 }
 
 static void DxgiShutdown(void) {
@@ -3200,13 +3224,17 @@ static void SetMode(int mode) {
 }
 
 static void ActivateMode(int mode) {         /* also turns master on */
-    EinkBuffersRestart();
     g_s.master = 1;
     SyncMasterCheckbox();
-    if (g_s.mode != mode)
-        SetMode(mode);      /* repaints itself on the change path */
-    else
-        RepaintAll();       /* unchanged mode: one repaint shows the veil */
+    if (g_s.mode != mode) {
+        /* SetMode restarts the e-ink ring when needed, repaints and saves.
+         * No eager EinkBuffersRestart here: it used to allocate the whole
+         * ring on paper-mode clicks and leave it pinned until exit
+         * (2026-10-05 review). */
+        SetMode(mode);
+        return;
+    }
+    RepaintAll();           /* unchanged mode: one repaint shows the veil */
     SaveSettings();
 }
 
@@ -3480,13 +3508,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
             if (!_wcsicmp(argv[i], L"--log") && i + 1 < argc) {
                 g_log = _wfopen(argv[++i], L"a");
                 L("=== mnPaper start ===");
-            } else if (!_wcsicmp(argv[i], L"--dump-tex") && i + 2 < argc) {
+            } else if (!_wcsicmp(argv[i], L"--dump-tex") && i + 3 < argc) {
                 wcsncpy(g_dump_tex, argv[++i], MAX_PATH - 1);
                 g_dump_w    = _wtoi(argv[++i]);
                 g_dump_h    = _wtoi(argv[++i]);
                 if (i + 1 < argc && argv[i + 1][0] != L'-')
                     g_dump_bg = _wtoi(argv[++i]);
-            } else if (!_wcsicmp(argv[i], L"--dump-eink") && i + 2 < argc) {
+            } else if (!_wcsicmp(argv[i], L"--dump-eink") && i + 3 < argc) {
                 wcsncpy(g_dump_eink, argv[++i], MAX_PATH - 1);
                 g_dump_w    = _wtoi(argv[++i]);
                 g_dump_h    = _wtoi(argv[++i]);
