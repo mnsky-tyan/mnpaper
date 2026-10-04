@@ -3,8 +3,16 @@
 *.res
 *.dmp
 *.log
-tests/
 samples/
 AGENTS.md
 probes/
 docs/reviews/
+# tests/ as a whole used to hide every NEW suite from git status and from
+# `git add tests/` (2026-10-04 review); ignore only build artefacts, plus the
+# one deliberately-internal file.
+tests/*.exe
+tests/*.obj
+tests/*.log
+tests/*.pdb
+tests/*.ilk
+tests/release_guard.py

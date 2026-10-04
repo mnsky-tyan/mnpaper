@@ -1,4 +1,4 @@
-# Slider latency regression
+# Test suites
 
 `slider_latency.c` includes the native app and runs its actual `DlgProc`
 slider handler, asynchronous renderer and `UpdateLayeredWindow` presentation.
@@ -110,14 +110,20 @@ the line here builds it as `test_extra.exe` with `/O2 /MTd /D_DEBUG` - either
 link works, and the leak assertions only exist because of `/D_DEBUG`, so a
 build without that define silently drops them.
 
-Suites reachable from a fresh clone: `slider_latency.c`, `eink_thread.c`,
-`gdi_fallback.c` (tracked). The rest - `layout_fit`, `verify_fixes`,
-`hole_cycle`, `dialog_push`, `update_help_capture` - are internal and not in
-the repo; the loop above is for a machine with the full working tree.
+Every suite is in the repository (`git ls-files tests/` is the truth): the
+loop above builds all of them from a fresh clone. The only gitignored file
+under tests/ is `release_guard.py`.
 
-Run every exe twice: each is idempotent and leaves no windows behind.
+Run every exe twice; `slider_latency.c` a third time (measured 1-in-16 flake
+above). Each is idempotent and leaves no windows behind.
 
-### What each tracked suite asserts
+If a freshly built test exe will not start or vanishes between build and
+run, check Windows Defender before suspecting the build: its ML heuristics
+intermittently quarantine these unsigned exes (`Behavior:Win32/Execution.A!ml`,
+seen 2026-10-04 on a hole_cycle build). `Get-MpThreatDetection` shows it;
+rebuild and run in one go, or exclude the temp directory.
+
+### What each suite asserts
 
 - `slider_latency.c` - drag latency end to end (request-to-upload budget with
   METRIC lines), the final bitmap, worker preemption, close-before-timer, the

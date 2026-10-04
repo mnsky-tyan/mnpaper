@@ -181,6 +181,8 @@ int main(void) {
     Render rold, rnew, roldref, rnewref;
     HWND hOld, hOldRef, hNewRef, h120;
     int clippedOld, completeNew;
+    char tmpdir[MAX_PATH];
+    char bmp_old[520], bmp_new[520], bmp_row[520], bmp_dlg[520];
 
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("mnPaper settings-dialog caption fit check\n");
@@ -191,6 +193,15 @@ int main(void) {
     swprintf(scratch, 128, L"Software\\mnPaper-layout-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
     REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
+
+    /* visual-check BMPs land in %TEMP%, never the working directory (the
+     * old relative paths littered the repo and WriteBmp failed silently
+     * on a read-only cwd; 2026-10-04 review) */
+    GetTempPathA(MAX_PATH, tmpdir);
+    snprintf(bmp_old, sizeof bmp_old, "%smnpaper_layout_caption_old.bmp", tmpdir);
+    snprintf(bmp_new, sizeof bmp_new, "%smnpaper_layout_caption_new.bmp", tmpdir);
+    snprintf(bmp_row, sizeof bmp_row, "%smnpaper_layout_row_real.bmp", tmpdir);
+    snprintf(bmp_dlg, sizeof bmp_dlg, "%smnpaper_layout_dialog_real.bmp", tmpdir);
 
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpfnWndProc = DlgProc; wc.lpszClassName = SET_CLASS;
@@ -241,13 +252,20 @@ int main(void) {
     clippedOld  = InkWidth(&rold) < InkWidth(&roldref) - 1;
     completeNew = abs(InkWidth(&rnew) - InkWidth(&rnewref)) <= 1;
 
-    Check(rold.magenta == 0 && rnew.magenta == 0 && roldref.magenta == 0,
+    Check(rold.magenta == 0 && rnew.magenta == 0 && roldref.magenta == 0 && rnewref.magenta == 0,
           "all four controls really painted themselves into the scratch DC");
-    Check(clippedOld, "OLD caption is measurably clipped at 352px (the reported bug)");
+    /* Whether the OLD caption clips at 352px depends on the host's font and
+     * scaling - a host font that fits it failed this suite with nothing
+     * wrong (2026-10-04 review). It stays a measurement. What IS
+     * font-independent, and therefore assertable: the short caption renders
+     * strictly narrower than the long one in whatever font the host picked. */
+    Check(InkWidth(&rnew) < InkWidth(&rold),
+          "the short caption renders strictly narrower than the old one in this host's font");
+    printf("  old caption at 352px: %s (ink %d vs unclipped %d)\n",
+           clippedOld ? "clipped at this host's font/DPI" : "fits at this host's font/DPI",
+           InkWidth(&rold), InkWidth(&roldref));
     Check(completeNew, "NEW caption draws in full at the same 352px (fix proven)");
     Check(rnew.last < 351, "fixed caption no longer runs into the clip edge");
-    printf("  old ink %d vs unclipped %d (%s)\n", InkWidth(&rold), InkWidth(&roldref),
-           clippedOld ? "glyphs lost" : "fit at this DPI");
     printf("  new ink %d vs unclipped %d (%s)\n", InkWidth(&rnew), InkWidth(&rnewref),
            completeNew ? "complete" : "still losing glyphs");
 
@@ -379,16 +397,17 @@ int main(void) {
             old = SelectObject(mdc, bmp);
             SendMessageW(g_dlg, WM_PRINT, (WPARAM)mdc, PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
             SelectObject(mdc, old);
-            WriteBmp("row_real.bmp",   bits + 300 * 402, 402, 44);
-            WriteBmp("dialog_real.bmp", bits, 402, 402);
+            WriteBmp(bmp_row, bits + 300 * 402, 402, 44);
+            WriteBmp(bmp_dlg, bits, 402, 402);
             ok = 1;
         }
         if (bmp) DeleteObject(bmp);
         if (mdc) DeleteDC(mdc);
         Check(ok, "rendered the real dialog for a visual check");
     }
-    WriteBmp("caption_old_352.bmp", rold.px, 352, 20);
-    WriteBmp("caption_new_352.bmp", rnew.px, 352, 20);
+    WriteBmp(bmp_old, rold.px, 352, 20);
+    WriteBmp(bmp_new, rnew.px, 352, 20);
+    printf("  visual-check BMPs: %s , %s\n", bmp_old, bmp_new);
 
     free(rold.px); free(rnew.px); free(roldref.px); free(rnewref.px);
     RegDeleteTreeW(HKEY_CURRENT_USER, scratch);

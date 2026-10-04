@@ -11,7 +11,6 @@ static DWORD first_pixel_ms;
 static unsigned last_applied_gen;
 static ULONGLONG previous_hash;
 static DWORD started;
-static int upload_failed;
 static DWORD preview_ms[128];
 static int preview_count;
 
@@ -125,7 +124,6 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
           "UpdateLayeredWindow accepts the rendered frame (direct calls)");
     /* the counter form died with the g_pupload_ok global; a direct call here
      * proves the same property without a file-scope flag */
-    (void)upload_failed;
     Check(last_applied_gen == final_gen, "last requested value eventually completes without another mouse event");
     printf("METRIC request-to-upload preview latency:");
     for (i = 0; i < preview_count; i++) printf(" %lu", preview_ms[i]);

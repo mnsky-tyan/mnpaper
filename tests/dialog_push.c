@@ -32,6 +32,19 @@ int main(void) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
 
+    /* Same scratch registry as the other suites (PID-suffixed): this suite
+     * only pushes settings into controls today, but any future click-driven
+     * check (e.g. checkbox 119) runs SaveSettings -> ApplyAutostart, and
+     * without the redirect that would write the REAL Run key with this test
+     * exe's path - a persistent autostart change surviving the run
+     * (2026-10-04 review). */
+    {
+        WCHAR scratch[128], run[160];
+        swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+        swprintf(run, 160, L"%s\\Run", scratch);
+        REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
+    }
+
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpfnWndProc = HostProc; wc.lpszClassName = L"MnPaperPushHost";
     RegisterClassW(&wc);
@@ -101,15 +114,20 @@ int main(void) {
     Check(IsWindowEnabled(GetDlgItem(dlg, 113)) == 1, "share box enabled in paper mode");
     Check(DlgCheck(dlg, 118, BST_CHECKED), "master on restored in its checkbox");
 
-    /* A dead dialog must be a no-op, not a crash. The proof is reaching the
-     * final RESULT line: DialogPushSettings's IsWindow guard means the push
-     * above returns before touching anything, and a regression that removed
-     * the guard dies here loudly instead of passing a vacuous Check(1, ...). */
+    /* A dead dialog must be a no-op, not a crash. The guard the push leans
+     * on is LiveDlg's IsWindow test, so assert THAT, then push: a regression
+     * that removed the guard dies here loudly. */
     g_dlg = dlg;
     DestroyWindow(dlg);
+    Check(LiveDlg() == NULL, "a destroyed dialog is dead to LiveDlg (the push's own guard)");
     DialogPushSettings(dlg);
-    printf("PASS push against a destroyed dialog did not crash (reached the end)\n");
+    Check(!IsWindow(dlg), "the push left the dead dialog dead (no resurrection, no crash)");
     DestroyWindow(g_host);
+    {   /* leave no scratch behind */
+        WCHAR scratch[128];
+        swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+        RegDeleteTreeW(HKEY_CURRENT_USER, scratch);
+    }
 
     printf("RESULT %d failure(s)\n", failures);
     return failures ? 1 : 0;
