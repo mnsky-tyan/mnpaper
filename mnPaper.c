@@ -112,7 +112,7 @@
 /* self-update payload: stable redirect URL, not the rate-limited REST API */
 #define UPDATE_EXE_URL L"https://github.com/mnsky-tyan/mnpaper/releases/latest/download/mnPaper.exe"
 #define UPDATE_MAX_BYTES (8u * 1024u * 1024u)
-#define FEED_MAX_BYTES 4096   /* version.txt is two short lines; a bigger one is refused */
+#define FEED_MAX_BYTES 4096   /* the feed is a tiny text file; anything bigger is refused */
 
 #define MODE_PAPER 0
 #define MODE_EINK  1
