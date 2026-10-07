@@ -625,23 +625,12 @@ static void SetChk(HWND ctl, int on) {
     if (ctl) SendMessageW(ctl, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
-/* Punch the taskbar hole into an upload buffer: alpha only, RGB left alone.
- *
- * One implementation for every path that presents a monitor's texture. ULW
- * blends by alpha, so the RGB under a hole is never seen and needs no work.
- *
- * The ALPHA, though, is per-pixel noise (PaperPixel derives it from grain,
- * fibre and blotch), so it cannot be guessed back - it has to be saved. That is
- * what makes this restore, not a simplification: Housekeeping re-uploads when
- * the hole moves or closes with no rebuild behind it, and a texture left
- * punched would keep a transparent band after the taskbar parked. Forcing a
- * constant alpha back would instead flatten the paper's own transparency.
- *
- * So: save the rect's pixels, zero their alpha, upload, restore. The save is
- * only ever the hole rect (a taskbar strip), and it is freed here.
- *
- * The punch itself is PunchHoleAlpha below, so paper and e-ink cannot drift
- * apart on the row/stride geometry. */
+/* Zero a rect's alpha in place, RGB left alone: one implementation for every
+ * path that presents a monitor's texture, so paper and e-ink cannot drift
+ * apart on the row/stride geometry. ULW blends by alpha, so the RGB under a
+ * hole is never seen and needs no work. Callers that must not leave the master
+ * texture mutated use ClearHoleAlpha/RestoreHoleAlpha below, which save the
+ * rect first and punch through this. */
 static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
     int y;
     if (!ov->bits || !on) return;
@@ -650,6 +639,17 @@ static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
                (size_t)(x1 - x0) * 4);
 }
 
+/* Save the hole rect's pixels, zero their alpha, and hand the saved block back
+ * so the caller can restore it after the upload.
+ *
+ * The ALPHA is per-pixel noise (PaperPixel derives it from grain, fibre and
+ * blotch), so it cannot be guessed back - it has to be saved. That is what
+ * makes the restore load-bearing, not a simplification: Housekeeping re-uploads
+ * when the hole moves or closes with no rebuild behind it, and a texture left
+ * punched would keep a transparent band after the taskbar parked. Forcing a
+ * constant alpha back would instead flatten the paper's own transparency. The
+ * save is only ever the hole rect (a taskbar strip), and RestoreHoleAlpha
+ * frees it. */
 static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
     int on, x0, y0, x1, y1, y;
     size_t rowbytes;
@@ -1464,7 +1464,6 @@ static int  g_dxgi_retry = 1;   /* 0: the reason is permanent (every output
 static DWORD g_dxgi_fail_at;
 static int g_rot_logged;    /* the rotated-output notice is a once-per-process line */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
-
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
     { 12, 4, 14,  6 },
@@ -1937,7 +1936,7 @@ static void EinkBuffersRestart(void) {
 static DWORD WINAPI EinkWorker(LPVOID unused) {
     (void)unused;
     for (;;) {
-        int i, pick = -1, rerender = 0;
+        int i, pick = -1;
         unsigned char *src = NULL;
         EnterCriticalSection(&g_ecs);
         for (i = 0; i < EINK_SLOTS; i++)
@@ -1948,7 +1947,7 @@ static DWORD WINAPI EinkWorker(LPVOID unused) {
                 if (g_ecap_state[i] == 2) g_ecap_state[i] = 0;        /* drop older */
         } else if (g_egen_done != g_eset_gen) {                       /* settings moved */
             for (i = 0; i < EINK_SLOTS; i++)
-                if (g_ecap_state[i] == 3) { pick = i; rerender = 1; src = g_ecap[i]; break; }
+                if (g_ecap_state[i] == 3) { pick = i; src = g_ecap[i]; break; }
         }
         LeaveCriticalSection(&g_ecs);
         if (!src) {
@@ -2048,6 +2047,25 @@ static void EinkPresent(void) {
             ApplyLayered(&g_ov[i]);   /* never upload a buffer nothing refreshed */
 }
 
+/* Abandon DXGI for the GDI grab. One helper, because this exact sequence used
+ * to be written out three times in EinkTick and the policy then had to be
+ * right in three places: the 2026-10-07 round added the rotation fallback and
+ * got it wrong in the one copy it edited (an "every output unusable" test left
+ * a laptop panel plus rotated monitor set on DXGI), which is precisely the
+ * class a single copy removes.
+ *
+ * retry is the caller's permanence judgement: rotation never changes for a
+ * display, so that fallback is permanent; a lost access or an unsupported
+ * format may recover. dst is released here so no caller can forget it. */
+static void EinkFallBackToGdi(unsigned char *dst, int retry, const char *why) {
+    EinkCapEnd(0, dst);
+    g_dxgi_retry = retry;
+    EinkShutdownCapture();
+    g_gdi_only = 1;
+    g_dxgi_fail_at = GetTickCount();
+    if (why) L("eink: %s", why);
+}
+
 static void EinkTick(void) {
     unsigned char *dst;
     int got = 0;
@@ -2087,15 +2105,9 @@ static void EinkTick(void) {
         /* DXGI cannot express a rotated desktop (see DxgiInit): on a mixed set
          * one rotated output would leave its monitor showing stale pixels
          * while the identity outputs kept updating. Checked before polling, so
-         * an identity output producing a frame cannot mask it. Hand the whole
-         * desktop to the GDI grab instead. Rotation never changes for a
-         * display, so this fallback is permanent - no 2 s retry. */
-        EinkCapEnd(0, dst);
-        g_dxgi_retry = 0;
-        EinkShutdownCapture();
-        g_gdi_only = 1;
-        g_dxgi_fail_at = GetTickCount();
-        L("eink: rotated output present, GDI grab for the whole desktop");
+         * an identity output producing a frame cannot mask it. Rotation never
+         * changes for a display, so this fallback is permanent - no 2 s retry. */
+        EinkFallBackToGdi(dst, 0, "rotated output present, GDI grab for the whole desktop");
         return;
     }
     if (g_dxgi == 1) {
@@ -2103,9 +2115,10 @@ static void EinkTick(void) {
         got = DxgiPoll(dst);
         if (g_dxgi == 0) lost = 1;           /* DxgiPoll shut capture down */
         if (lost) {
-            EinkCapEnd(0, dst);
-            g_gdi_only = 1;
-            g_dxgi_retry = 1;                /* access can come back */
+            /* DxgiPoll already reported the loss; its own shutdown makes
+             * EinkFallBackToGdi's call a no-op on an empty output set, so
+             * no second line is logged here. */
+            EinkFallBackToGdi(dst, 1, NULL);
             return;
         }
         if (got == 0 && !DxgiHasUsableOutput()) {
@@ -2113,12 +2126,8 @@ static void EinkTick(void) {
              * never produce a frame. The GDI grab returns the composed desktop
              * (rotation already applied by Windows), so fall back to it
              * instead of letting e-ink freeze on the last frame. */
-            EinkCapEnd(0, dst);
-            g_dxgi_retry = DxgiRetryable();
-            EinkShutdownCapture();
-            g_gdi_only = 1;
-            g_dxgi_fail_at = GetTickCount();
-            L("eink: no usable duplication output, GDI fallback");
+            EinkFallBackToGdi(dst, DxgiRetryable(),
+                              "no usable duplication output, GDI fallback");
             return;
         }
     } else {

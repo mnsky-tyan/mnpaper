@@ -96,6 +96,27 @@ int main(void) {
     Check(!DlgCheck(dlg, 120, BST_CHECKED), "auto-update off is pushed to its checkbox");
     Check(DlgCheck(dlg, 113, BST_CHECKED), "share on is pushed to its checkbox");
 
+    /* The numeric readout beside each bar must show THAT bar's value. Nothing
+     * else asserts the label-to-bar pairing: UpdateVals' own ids[] table,
+     * WM_CREATE's g_val[k]/MkTrack(100+k) pairing, DlgSyncBars' field order and
+     * ReadBarsToSettings' field order all have to agree, and a drift in ids[]
+     * alone would silently swap two labels with every other check still green
+     * (2026-10-08 review). Bars carry distinct values here (23, 77, 6, 31, 12,
+     * 5, 41, 62), so a swap cannot pass by coincidence. */
+    {
+        static const int row_ids[8] = { 100, 101, 102, 103, 104, 105, 106, 107 };
+        int k, bad = 0;
+        for (k = 0; k < 8; k++) {
+            WCHAR label[16];
+            int pos = (int)SendMessageW(GetDlgItem(dlg, row_ids[k]), TBM_GETPOS, 0, 0);
+            label[0] = 0;
+            if (!g_val[k]) { bad++; continue; }
+            GetWindowTextW(g_val[k], label, 16);
+            if (_wtoi(label) != pos) bad++;
+        }
+        Check(bad == 0, "each numeric readout shows its own bar's value, not a neighbour's");
+    }
+
     /* E-ink mode grays the share box: that mode is always capture-excluded. */
     g_s.mode = MODE_EINK;
     DialogPushSettings(dlg);
