@@ -32,12 +32,13 @@ int main(void) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
 
-    /* Same scratch registry as the other suites (PID-suffixed): this suite
-     * only pushes settings into controls today, but any future click-driven
-     * check (e.g. checkbox 119) runs SaveSettings -> ApplyAutostart, and
-     * without the redirect that would write the REAL Run key with this test
-     * exe's path - a persistent autostart change surviving the run
-     * (2026-10-04 review). */
+    /* Isolated scratch hive, PID-suffixed under this suite's own name (every
+     * suite names its own, so two different suites started together cannot
+     * delete each other's live key - 2026-10-09 review): this suite only
+     * pushes settings into controls today, but any future click-driven check
+     * (e.g. checkbox 119) runs SaveSettings -> ApplyAutostart, and without the
+     * redirect that would write the REAL Run key with this test exe's path - a
+     * persistent autostart change surviving the run (2026-10-04 review). */
     {
         WCHAR scratch[128], run[160];
         swprintf(scratch, 128, L"Software\\mnPaper-dlgpush-%lu", GetCurrentProcessId());
