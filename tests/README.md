@@ -137,8 +137,11 @@ rebuild and run in one go, or exclude the temp directory.
   render, pointer swap, newest-wins, settings re-render on a static screen,
   idle quiescence, ring hygiene, stop/restart, that `PresentEinkRect` waits
   while the worker holds the swap lock (then copies a real frame), and the
-  `DxgiHasUsableOutput`/`DxgiRetryable` combination table over plain, rotated
-  and unsupported-format outputs.
+  `DxgiHasUsableOutput`/`DxgiRetryable`/`DxgiAnyRotated` combination table over
+  plain, rotated-only, unsupported-format-only, mixed (identity plus rotated)
+  and all-rotated output sets. The mixed row is the one the rotation policy
+  exists for: `DxgiAnyRotated` must force the whole-desktop GDI grab even
+  though a usable identity output is present.
 - `gdi_fallback.c` - the GDI capture fallback: DIB/DC persistence across
   ticks (no per-tick reallocation), exact whole-buffer change detection (an
   edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
