@@ -40,7 +40,7 @@ int main(void) {
      * (2026-10-04 review). */
     {
         WCHAR scratch[128], run[160];
-        swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+        swprintf(scratch, 128, L"Software\\mnPaper-dlgpush-%lu", GetCurrentProcessId());
         swprintf(run, 160, L"%s\\Run", scratch);
         REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
     }
@@ -146,7 +146,7 @@ int main(void) {
     DestroyWindow(g_host);
     {   /* leave no scratch behind */
         WCHAR scratch[128];
-        swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+        swprintf(scratch, 128, L"Software\\mnPaper-dlgpush-%lu", GetCurrentProcessId());
         RegDeleteTreeW(HKEY_CURRENT_USER, scratch);
     }
 

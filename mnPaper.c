@@ -357,7 +357,14 @@ static int NextPow2(int v) {
 
 #define MAX_MON 16
 
-#define MAX_STRIPS 8                /* per monitor; STRIP_H tall each      */
+/* Per monitor, STRIP_H tall each. The cap must exceed any plausible monitor
+ * height divided by STRIP_H: at 8 strips it was 3600px, so a 4K display in
+ * portrait (2160x3840), a 2880x5120 5K panel or an 8K TV got its bottom band
+ * left untextured with no log at all (2026-10-09 review). 32 strips covers
+ * 14400px, which every shipping panel is under. STRIP_H stays pinned to its
+ * measured value: raising the strip height is what risks the auto-hide
+ * taskbar raise (see the 450-vs-1800 measurement below). */
+#define MAX_STRIPS 32
 #define STRIP_H    450              /* < the shell's ~800-900px fullscreen
                                       * height trigger: a full-width window
                                       * this short never suppresses the
@@ -798,6 +805,12 @@ static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
             return 0;
         }
     }
+    /* The loop above stops at MAX_STRIPS. If the monitor is still taller than
+     * the strips cover, say so rather than silently leaving a bare band: this
+     * is the geometry a future panel could reach (see MAX_STRIPS). */
+    if (ov->n_strips * STRIP_H < ov->h)
+        L("overlay: monitor at %ld,%ld is %dpx tall but %d strips cover only %dpx",
+          ov->rc.left, ov->rc.top, ov->h, ov->n_strips, ov->n_strips * STRIP_H);
     ov->hwnd = ov->shwnd[0];
     ApplyCaptureState(ov);
 

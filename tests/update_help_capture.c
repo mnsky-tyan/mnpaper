@@ -142,7 +142,7 @@ int main(void) {
     g_s.autoupd = 1;       /* fresh-install default the dialog must reflect */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
-    swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+    swprintf(scratch, 128, L"Software\\mnPaper-updcap-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
     REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
 
