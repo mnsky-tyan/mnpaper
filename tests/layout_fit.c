@@ -92,9 +92,13 @@ static int RenderCtrl(HWND ctl, int w, int h, Render *r) {
 
 static int InkWidth(const Render *r) { return r->first < 0 ? 0 : r->last - r->first + 1; }
 
-static void WriteBmp(const char *path, const unsigned *px, int w, int h) {
+static int WriteBmp(const char *path, const unsigned *px, int w, int h) {
     BITMAPFILEHEADER fh; BITMAPINFOHEADER ih; FILE *f = fopen(path, "wb");
-    if (!f || !px) return;
+    if (!f || !px) {
+        printf("  WARN: BMP not written: %s\n", path);   /* never fail silently */
+        if (f) fclose(f);
+        return 0;
+    }
     memset(&fh, 0, sizeof fh); memset(&ih, 0, sizeof ih);
     fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih;
     fh.bfSize = fh.bfOffBits + (DWORD)w * h * 4;
@@ -104,6 +108,7 @@ static void WriteBmp(const char *path, const unsigned *px, int w, int h) {
     fwrite(&ih, sizeof ih, 1, f);
     fwrite(px, (size_t)w * h * 4, 1, f);
     fclose(f);
+    return 1;
 }
 
 
@@ -296,7 +301,7 @@ int main(void) {
                 HWND twin = CreateWindowExW(0, cls, buf, WS_CHILD | bst,
                                             14, 470, REF_W, r.bottom, g_dlg, (HMENU)9998,
                                             GetModuleHandleW(NULL), NULL);
-                Render ra, rb;
+                Render ra = { 0 }, rb = { 0 };
                 if (twin && RenderCtrl(c, r.right, r.bottom > 60 ? 60 : (int)r.bottom, &ra) &&
                             RenderCtrl(twin, REF_W, r.bottom > 60 ? 60 : (int)r.bottom, &rb)) {
                     int ca = InkWidth(&ra), cb = InkWidth(&rb), ok = abs(ca - cb) <= 1;
@@ -304,8 +309,10 @@ int main(void) {
                            ok ? "ok" : "CUT", id, (int)r.right, ca, cb, buf);
                     audited++;
                     if (!ok) mismatches++;
-                    free(ra.px); free(rb.px);
                 }
+                /* Outside the if: when the second render fails, the first one's
+                 * buffer is still live (a zero-initialised Render frees NULL). */
+                free(ra.px); free(rb.px);
                 if (twin) DestroyWindow(twin);
             }
             c = GetWindow(c, GW_HWNDNEXT);
@@ -407,7 +414,12 @@ int main(void) {
     }
     WriteBmp(bmp_old, rold.px, 352, 20);
     WriteBmp(bmp_new, rnew.px, 352, 20);
-    printf("  visual-check BMPs: %s , %s\n", bmp_old, bmp_new);
+    /* The four visual-check BMPs exist for a human to look at, but the standing
+     * rule is that nothing stays on the Windows side after the run, and %TEMP%
+     * is not an exception: delete them in the same operation. Nothing is printed
+     * about them, since they are gone by the time the console is read. */
+    DeleteFileA(bmp_old); DeleteFileA(bmp_new);
+    DeleteFileA(bmp_row); DeleteFileA(bmp_dlg);
 
     free(rold.px); free(rnew.px); free(roldref.px); free(rnewref.px);
     RegDeleteTreeW(HKEY_CURRENT_USER, scratch);

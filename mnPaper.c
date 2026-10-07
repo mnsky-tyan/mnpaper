@@ -410,6 +410,24 @@ static void ApplyCaptureState(OVL *ov) {
     }
 }
 
+/* Capture state is a property of the strip windows alone, so a change to it
+ * (the share toggle) needs no texture work: re-applying it must never cost a
+ * re-bake, which is what routing this through RepaintAll used to do. */
+static void ApplyCaptureAll(void) {
+    int i;
+    for (i = 0; i < g_n; i++) ApplyCaptureState(&g_ov[i]);
+}
+
+/* Lift one overlay's strips to the top of the topmost band. Add-only: never
+ * demote (a non-topmost insert-after clears WS_EX_TOPMOST and ping-pongs with
+ * the shell - see the unconditional-raise comment in Housekeeping). */
+static void RaiseOverlay(OVL *ov) {
+    int s;
+    for (s = 0; s < ov->n_strips; s++)
+        SetWindowPos(ov->shwnd[s], HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
 typedef struct {
     HMONITOR mon;
     RECT     rc;
@@ -620,7 +638,18 @@ static void SetChk(HWND ctl, int on) {
  * constant alpha back would instead flatten the paper's own transparency.
  *
  * So: save the rect's pixels, zero their alpha, upload, restore. The save is
- * only ever the hole rect (a taskbar strip), and it is freed here. */
+ * only ever the hole rect (a taskbar strip), and it is freed here.
+ *
+ * The punch itself is PunchHoleAlpha below, so paper and e-ink cannot drift
+ * apart on the row/stride geometry. */
+static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
+    int y;
+    if (!ov->bits || !on) return;
+    for (y = y0; y < y1; y++)
+        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
+               (size_t)(x1 - x0) * 4);
+}
+
 static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
     int on, x0, y0, x1, y1, y;
     size_t rowbytes;
@@ -635,11 +664,14 @@ static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, in
     *saved = (unsigned char *)malloc(rowbytes * (size_t)(y1 - y0));
     if (!*saved) return;                 /* cannot save: leave the texture alone */
     *saved_len = rowbytes * (size_t)(y1 - y0);
-    for (y = y0; y < y1; y++) {
-        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4;
-        memcpy(*saved + rowbytes * (size_t)(y - y0), row, rowbytes);
-        memset(row, 0, rowbytes);
-    }
+    for (y = y0; y < y1; y++)
+        memcpy(*saved + rowbytes * (size_t)(y - y0),
+               (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4,
+               rowbytes);
+    /* Punch the same rect that was just saved, never a re-read of the live
+     * hole: a punch wider than the save would zero alpha on pixels nothing
+     * restores, leaving a permanent transparent band. */
+    PunchHoleAlpha(ov, on, x0, y0, x1, y1);
 }
 
 /* Put the saved pixels back where they came from. Called after the upload, on
@@ -666,15 +698,6 @@ static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, in
  * pixels under the hole are disposable. ApplyLayered's paper path needs the
  * save/restore pair instead: Housekeeping re-uploads there without a rebuild,
  * so ov->bits must never stay mutated. */
-static void PunchHoleAlpha(OVL *ov) {
-    int on, x0, y0, x1, y1, y;
-    if (!ov->bits) return;
-    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
-    if (!on) return;
-    for (y = y0; y < y1; y++)
-        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
-               (size_t)(x1 - x0) * 4);
-}
 
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
  * preview here - this runs on the UI thread inside RepaintAll - and let the
@@ -726,7 +749,8 @@ static int ApplyLayered(OVL *ov) {
     return ok;
 }
 
-static void PresentEinkRect(OVL *ov);
+static int PresentEinkRect(OVL *ov);
+static void EinkFreeBuffers(void);   /* RepaintAll releases the ring on mode exit */
 
 static LRESULT CALLBACK OvlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -801,11 +825,16 @@ static void ShowOverlay(OVL *ov, int show) {
          * the gate lived only in conventions per test file. The hide branch
          * below stays reachable so tests can still verify teardown. */
         if (g_test_headless) return;
-        if (g_s.mode == MODE_PAPER)
+        if (g_s.mode == MODE_PAPER) {
             SeedPaperPreview(ov);   /* cheap; the worker bakes the exact one */
-        else
-            PresentEinkRect(ov);
-        ApplyLayered(ov);
+            ApplyLayered(ov);
+        } else if (PresentEinkRect(ov)) {
+            /* Upload only when a real frame was copied. At a paper->e-ink
+             * switch there may be none yet (no published frame, or none
+             * publishable), and uploading ov->bits then would put the paper
+             * texture on screen inside e-ink mode. */
+            ApplyLayered(ov);
+        }
         for (s = 0; s < ov->n_strips; s++)
             ShowWindow(ov->shwnd[s], SW_SHOWNA);
     } else {
@@ -986,6 +1015,18 @@ static HWND LiveDlg(void) {
  * when pressed. The comctl32 tooltip had crashed; the own tip popup worked
  * but popped unprompted while dragging. */
 
+/* Is this taskbar band a parked sliver? True for the thin reveal strip of an
+ * auto-hidden taskbar, which is short in the direction it hides along: a
+ * bottom-docked one leaves a short band, a left- or right-docked one leaves a
+ * full-height strip that is a few pixels WIDE. Testing only the height misses
+ * the side docks entirely, which classifies a parked side taskbar as revealed:
+ * a permanent see-through band down that edge, a pointless topmost raise on
+ * every tick, and tb_up latched so the z-order re-claim walk never runs again.
+ * The smaller extent is the one the taskbar hides along, so test that. */
+static int TbParked(const RECT *on) {
+    return min(on->bottom - on->top, on->right - on->left) <= 16;
+}
+
 static void ComputeHoles(void) {
     int i, j;
     RECT newh[MAX_MON];
@@ -1007,7 +1048,7 @@ static void ComputeHoles(void) {
         if (on.right  > g_ov[mon].rc.right)  on.right  = g_ov[mon].rc.right;
         if (on.top    < g_ov[mon].rc.top)    on.top    = g_ov[mon].rc.top;
         if (on.bottom > g_ov[mon].rc.bottom) on.bottom = g_ov[mon].rc.bottom;
-        if (on.bottom - on.top <= 16) {          /* parked sliver          */
+        if (TbParked(&on)) {                     /* parked sliver          */
             g_tb_state[j] = 1;                    /* unlatch: armed again   */
             continue;
         }
@@ -1112,12 +1153,7 @@ static void Housekeeping(void) {
             h = GetWindow(h, GW_HWNDNEXT); continue;
         }
         /* a real foreign window is above the veil: take the top back */
-        for (i = 0; i < g_n; i++) {
-            int s;
-            for (s = 0; s < g_ov[i].n_strips; s++)
-                SetWindowPos(g_ov[i].shwnd[s], HWND_TOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        }
+        for (i = 0; i < g_n; i++) RaiseOverlay(&g_ov[i]);
         {   /* keep the settings window above the veil too (ask, never assume) */
             HWND d = LiveDlg();
             if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1327,7 +1363,14 @@ static void RepaintAll(void) {
         if (!EinkBuffersReady()) EinkBuffersRestart();
         else EinkWorkerSet(1);
     } else {
-        EinkWorkerSet(0);
+        /* Leaving e-ink (or turning the effect off): release the ring buffers
+         * instead of only stopping the worker. They are up to ~5 virtual-
+         * screen bitmaps (~104 MB on a 2880x1800 desktop, ~166 MB at 4K) and
+         * the GDI grab pair besides; an eink->paper switch used to pin all of
+         * it until exit. EinkFreeBuffers stops the worker itself, and the
+         * e-ink branch above re-allocates on demand, so a round trip just
+         * pays two mallocs. */
+        EinkFreeBuffers();
     }
     for (i = 0; i < g_n; i++) {
         ApplyCaptureState(&g_ov[i]);
@@ -1454,7 +1497,7 @@ static void EinkFreeBuffers(void) {
     GdiResetGrabs();   /* the grab DC/DIB are bound to the thread that polls */
 }
 
-void EinkShutdownCapture(void);
+static void EinkShutdownCapture(void);
 
 /* Pure function of (src, dst, w, h): no globals read except the settings,
  * so it is safe to run on the worker thread and in the headless dump. */
@@ -1486,12 +1529,16 @@ static void EinkRender(const unsigned char *src, unsigned char *dst, int w, int 
     }
 }
 
-static void PresentEinkRect(OVL *ov) {
+/* Returns 1 when a frame was actually copied into ov->bits, 0 when there was
+ * nothing presentable (no published frame yet, or a geometry that does not fit
+ * the capture buffer). The caller must not upload on 0: ov->bits then still
+ * holds whatever the other mode left there. */
+static int PresentEinkRect(OVL *ov) {
     const unsigned char *show = g_eproc_show;   /* one coherent read */
     int x0 = ov->rc.left - g_vsx, y0 = ov->rc.top - g_vsy, y;
     if (!show || !g_eproc_valid || !ov->bits ||
         x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
-        return;
+        return 0;
     for (y = 0; y < ov->h; y++)
         memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
                show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
@@ -1500,7 +1547,10 @@ static void PresentEinkRect(OVL *ov) {
      * re-copied from g_eproc_show at the top of every present, so the pixels
      * under the hole are disposable. Housekeeping re-presents on every hole
      * change, so a parked taskbar cannot leave a stale band in the upload. */
-    PunchHoleAlpha(ov);
+    int hon, hx0, hy0, hx1, hy1;
+    LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
+    PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1);
+    return 1;
 }
 
 static void DxgiShutdown(void) {
@@ -1521,7 +1571,7 @@ static void EinkShutdownAll(void) {
     EinkFreeBuffers();
 }
 
-void EinkShutdownCapture(void) {
+static void EinkShutdownCapture(void) {
     DxgiShutdown();
     g_dxgi = 0;
     g_gdi_only = 0;
@@ -1902,10 +1952,9 @@ static int EinkCapEnd(int ok, unsigned char *p) {
 /* Present, on the UI thread: one memcpy per monitor and the upload. */
 static void EinkPresent(void) {
     int i;
-    for (i = 0; i < g_n; i++) {
-        PresentEinkRect(&g_ov[i]);
-        ApplyLayered(&g_ov[i]);
-    }
+    for (i = 0; i < g_n; i++)
+        if (PresentEinkRect(&g_ov[i]))
+            ApplyLayered(&g_ov[i]);   /* never upload a buffer nothing refreshed */
 }
 
 static void EinkTick(void) {
@@ -3073,7 +3122,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (LOWORD(wp) == 113) {
             g_s.share = IsDlgButtonChecked(hwnd, 113) == BST_CHECKED;
             SaveSettings();
-            RepaintAll();   /* re-applies the capture exclusion live */
+            ApplyCaptureAll();   /* re-applies the capture exclusion live */
             L("share=%d", g_s.share);
         } else if (LOWORD(wp) == 114 || LOWORD(wp) == 115) {
             int mode = (LOWORD(wp) == 114) ? MODE_PAPER : MODE_EINK;
@@ -3372,7 +3421,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_SHARE:
             g_s.share = g_s.share ? 0 : 1;
             SaveSettings();
-            RepaintAll();   /* re-applies the capture exclusion state */
+            ApplyCaptureAll();   /* re-applies the capture exclusion state */
             {
                 HWND dlg = LiveDlg();
                 if (dlg) SetChk(GetDlgItem(dlg, 113), g_s.share);

@@ -5,6 +5,8 @@
 *.log
 *.pdb
 *.ilk
+__pycache__/
+*.pyc
 samples/
 AGENTS.md
 probes/

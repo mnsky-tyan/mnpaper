@@ -111,8 +111,9 @@ link works, and the leak assertions only exist because of `/D_DEBUG`, so a
 build without that define silently drops them.
 
 Every suite is in the repository (`git ls-files tests/` is the truth): the
-loop above builds all of them from a fresh clone. The only gitignored file
-under tests/ is `release_guard.py`.
+block above builds all of them from a fresh clone (the loop builds seven, and
+the final `cl` line builds `update_help_capture.c` as `test_extra.exe`). The
+only gitignored file under tests/ is `release_guard.py`.
 
 Run every exe twice; `slider_latency.c` a third time (measured 1-in-16 flake
 above). Each is idempotent and leaves no windows behind.
@@ -139,3 +140,18 @@ rebuild and run in one go, or exclude the temp directory.
   ticks (no per-tick reallocation), exact whole-buffer change detection (an
   edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
   rebuild after a reset.
+- `hole_cycle.c` - the taskbar hole over a fixed geometry (2880x1800 monitor,
+  46px band): reveal/park cycles produce the right hole rect, the master
+  texture comes back byte-identical every time (full-byte hash), and 20 round
+  trips leave no residue.
+- `dialog_push.c` - one `DialogPushSettings` call drives every control from
+  the settings struct (sliders, checkboxes, the mode radio pair), and a
+  destroyed dialog is refused rather than pushed to.
+- `layout_fit.c` - the settings dialog at 402x402: every caption renders in
+  full at this display's scaling (ink width against a reference render), the
+  design positions hold, controls do not overlap, push buttons keep their
+  slack, and the real dialog is rendered for a visual check (the scratch BMPs
+  are deleted before the suite returns).
+- `verify_fixes.c` - the extracted feed-size cap (`FeedFits`) boundary, the
+  show path never falling back to a full synchronous build, the hole
+  save/restore being byte-identical, and the `LiveDlg` owner rule.
