@@ -153,8 +153,9 @@ rebuild and run in one go, or exclude the temp directory.
   driven directly for a bottom band, a left-docked sliver and a right-docked
   sliver (the side docks a height-only test used to misread as revealed).
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
-  the settings struct (sliders, checkboxes, the mode radio pair), and a
-  destroyed dialog is refused rather than pushed to.
+  the settings struct (sliders, checkboxes, the mode radio pair), each numeric
+  readout is asserted to show its own bar's value (the label-to-bar pairing no
+  other suite checks), and a destroyed dialog is refused rather than pushed to.
 - `layout_fit.c` - the settings dialog at 402x402: every caption renders in
   full at this display's scaling (ink width against a reference render), the
   design positions hold, controls do not overlap, push buttons keep their
