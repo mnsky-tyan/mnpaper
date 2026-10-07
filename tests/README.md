@@ -135,7 +135,10 @@ rebuild and run in one go, or exclude the temp directory.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker
   render, pointer swap, newest-wins, settings re-render on a static screen,
-  idle quiescence, ring hygiene, stop/restart.
+  idle quiescence, ring hygiene, stop/restart, that `PresentEinkRect` waits
+  while the worker holds the swap lock (then copies a real frame), and the
+  `DxgiHasUsableOutput`/`DxgiRetryable` combination table over plain, rotated
+  and unsupported-format outputs.
 - `gdi_fallback.c` - the GDI capture fallback: DIB/DC persistence across
   ticks (no per-tick reallocation), exact whole-buffer change detection (an
   edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
