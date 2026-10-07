@@ -1458,6 +1458,9 @@ static CRITICAL_SECTION g_ecs;
 static int   g_ecs_ready;
 static int  g_dxgi = 0;        /* 0 uninit, 1 live; the GDI fallback is g_gdi_only */
 static int  g_gdi_only = 0;     /* duplication unavailable: BitBlt fallback */
+static int  g_dxgi_retry = 1;   /* 0: the reason is permanent (every output
+                                 * rotated), so the 2 s retry would only
+                                 * re-arm DXGI to fall back again */
 static DWORD g_dxgi_fail_at;
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 
@@ -1691,6 +1694,17 @@ static int DxgiHasUsableOutput(void) {
     int i;
     for (i = 0; i < g_nout; i++)
         if (!g_out[i].rotated && !g_out[i].badfmt) return 1;
+    return 0;
+}
+
+/* Is a later DxgiInit worth trying? Rotation never changes for a display, so
+ * a set of rotated-only outputs is permanent; an unsupported desktop format
+ * may come back, and a plain init failure may be transient. Called before the
+ * outputs are torn down. */
+static int DxgiRetryable(void) {
+    int i;
+    for (i = 0; i < g_nout; i++)
+        if (!g_out[i].rotated) return 1;
     return 0;
 }
 
@@ -2023,10 +2037,11 @@ static void EinkTick(void) {
     if (g_dxgi == 0) {
         if (g_gdi_only) {
             /* retry duplication occasionally in case the reason is gone */
-            if (GetTickCount() - g_dxgi_fail_at > 2000) {
+            if (g_dxgi_retry && GetTickCount() - g_dxgi_fail_at > 2000) {
                 if (DxgiInit()) {
                     g_dxgi = 1;
                     g_gdi_only = 0;
+                    g_dxgi_retry = 1;
                     L("eink: duplication recovered");
                 } else {
                     g_dxgi_fail_at = GetTickCount();
@@ -2034,9 +2049,11 @@ static void EinkTick(void) {
             }
         } else if (DxgiInit()) {
             g_dxgi = 1;
+            g_dxgi_retry = 1;
             L("eink: dxgi duplication live");
         } else {
             g_gdi_only = 1;
+            g_dxgi_retry = 1;
             L("eink: duplication unavailable, GDI fallback");
             return;
         }
@@ -2053,6 +2070,7 @@ static void EinkTick(void) {
         if (lost) {
             EinkCapEnd(0, dst);
             g_gdi_only = 1;
+            g_dxgi_retry = 1;                /* access can come back */
             return;
         }
         if (got == 0 && !DxgiHasUsableOutput()) {
@@ -2061,7 +2079,8 @@ static void EinkTick(void) {
              * desktop (rotation already applied by Windows), so fall back to
              * it instead of letting e-ink freeze on the last frame. */
             EinkCapEnd(0, dst);
-            g_dxgi = 0;
+            g_dxgi_retry = DxgiRetryable();
+            EinkShutdownCapture();
             g_gdi_only = 1;
             g_dxgi_fail_at = GetTickCount();
             L("eink: no usable duplication output, GDI fallback");

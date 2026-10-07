@@ -209,15 +209,24 @@ int main(void) {
         memcpy(saved, g_out, sizeof saved);
         g_nout = 1; g_out[0].rotated = 0; g_out[0].badfmt = 0;
         Check(DxgiHasUsableOutput(), "a plain duplication output is usable");
+        Check(DxgiRetryable(), "a plain output is worth retrying");
         g_out[0].rotated = 1;
         Check(!DxgiHasUsableOutput(),
               "a rotated output alone is unusable (e-ink falls back to GDI)");
+        Check(!DxgiRetryable(),
+              "rotation is permanent, so a rotated-only set is never retried");
         g_out[0].rotated = 0; g_out[0].badfmt = 1;
         Check(!DxgiHasUsableOutput(),
               "an unsupported-format output alone is unusable");
+        Check(DxgiRetryable(),
+              "a bad-format output may recover, so it is still retried");
         g_nout = 2; g_out[0].rotated = 0; g_out[0].badfmt = 0;
         g_out[1].rotated = 1; g_out[1].badfmt = 0;
         Check(DxgiHasUsableOutput(), "one usable output among rotated ones is enough");
+        Check(DxgiRetryable(), "a non-rotated output keeps the retry alive");
+        g_nout = 2; g_out[0].rotated = 1; g_out[0].badfmt = 0;
+        g_out[1].rotated = 1; g_out[1].badfmt = 0;
+        Check(!DxgiRetryable(), "all outputs rotated is permanent, no retry");
         memcpy(g_out, saved, sizeof saved);
         g_nout = saved_n;
     }
