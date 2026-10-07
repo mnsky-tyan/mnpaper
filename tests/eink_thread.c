@@ -202,7 +202,7 @@ int main(void) {
         free(g_pp.ov.bits);
     }
 
-    /* --------- an unusable output set hands capture to the GDI grab ------- */
+    /* --------- a rotated output hands the whole desktop to GDI ------------ */
     {
         OUTINFO saved[MAX_OUT];
         int saved_n = g_nout;
@@ -210,20 +210,27 @@ int main(void) {
         g_nout = 1; g_out[0].rotated = 0; g_out[0].badfmt = 0;
         Check(DxgiHasUsableOutput(), "a plain duplication output is usable");
         Check(DxgiRetryable(), "a plain output is worth retrying");
+        Check(!DxgiAnyRotated(), "an all-identity output set stays on DXGI");
         g_out[0].rotated = 1;
         Check(!DxgiHasUsableOutput(),
               "a rotated output alone is unusable (e-ink falls back to GDI)");
         Check(!DxgiRetryable(),
               "rotation is permanent, so a rotated-only set is never retried");
+        Check(DxgiAnyRotated(),
+              "a rotated output hands the whole desktop to the GDI grab");
         g_out[0].rotated = 0; g_out[0].badfmt = 1;
         Check(!DxgiHasUsableOutput(),
               "an unsupported-format output alone is unusable");
         Check(DxgiRetryable(),
               "a bad-format output may recover, so it is still retried");
+        Check(!DxgiAnyRotated(),
+              "an unsupported format alone does not force the rotation fallback");
         g_nout = 2; g_out[0].rotated = 0; g_out[0].badfmt = 0;
         g_out[1].rotated = 1; g_out[1].badfmt = 0;
         Check(DxgiHasUsableOutput(), "one usable output among rotated ones is enough");
         Check(DxgiRetryable(), "a non-rotated output keeps the retry alive");
+        Check(DxgiAnyRotated(),
+              "one rotated output among identity ones still forces GDI (mixed set)");
         g_nout = 2; g_out[0].rotated = 1; g_out[0].badfmt = 0;
         g_out[1].rotated = 1; g_out[1].badfmt = 0;
         Check(!DxgiRetryable(), "all outputs rotated is permanent, no retry");

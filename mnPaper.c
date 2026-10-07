@@ -1462,6 +1462,7 @@ static int  g_dxgi_retry = 1;   /* 0: the reason is permanent (every output
                                  * rotated), so the 2 s retry would only
                                  * re-arm DXGI to fall back again */
 static DWORD g_dxgi_fail_at;
+static int g_rot_logged;    /* the rotated-output notice is a once-per-process line */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 
 static const int BAYER4[4][4] = {
@@ -1650,16 +1651,20 @@ static int DxgiInit(void) {
                      * express: the duplicated surface follows the rotated
                      * output, so for 90/270 its width and height are swapped
                      * against DesktopCoordinates (the 1:1 row copy would come
-                     * out transposed) and 180 flips it. Rather than publish
-                     * wrong pixels, mark the output and let EinkTick fall back
-                     * to the GDI grab, which returns the composed desktop in
-                     * desktop space and therefore needs no rotation at all. */
+                     * out transposed) and 180 flips it. Mark the output and let
+                     * EinkTick hand the whole desktop to the GDI grab, which
+                     * returns the composed desktop in desktop space and needs no
+                     * rotation at all. Logged once per process: DxgiInit is
+                     * retried every ~2 s when duplication is unavailable, and a
+                     * per-attempt line would flush the log on every cycle. */
                     g_out[g_nout].rotated =
                         (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY &&
                          desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED);
-                    if (g_out[g_nout].rotated)
-                        L("dxgi: output %d is rotated (%d), skipped in favour of the GDI grab",
+                    if (g_out[g_nout].rotated && !g_rot_logged) {
+                        g_rot_logged = 1;
+                        L("dxgi: output %d is rotated (%d), using the GDI grab for the whole desktop",
                           g_nout, (int)desc.Rotation);
+                    }
                     g_out[g_nout].r.left   = r.left   - g_vsx;
                     g_out[g_nout].r.top    = r.top    - g_vsy;
                     g_out[g_nout].r.right  = r.right  - g_vsx;
@@ -1686,14 +1691,29 @@ static int DxgiInit(void) {
     return g_nout > 0;
 }
 
-/* Is any output actually usable by the copy loop? A rotated one is not (see
- * DxgiInit), and neither is one whose desktop format is unsupported. When
- * every output is unusable the caller must switch to the GDI grab instead of
- * waiting forever for frames that will never arrive. */
+/* Is any output actually usable by the copy loop? A rotated one is not (any
+ * rotation is handled by the GDI handover before polling), and neither is one
+ * whose desktop format is unsupported. When every output is unusable the
+ * caller must switch to the GDI grab instead of waiting forever for frames
+ * that will never arrive. */
 static int DxgiHasUsableOutput(void) {
     int i;
     for (i = 0; i < g_nout; i++)
         if (!g_out[i].rotated && !g_out[i].badfmt) return 1;
+    return 0;
+}
+
+/* Is any output rotated? The DXGI copy loop only expresses an identity
+ * orientation (see DxgiInit), so a single rotated output makes the DXGI grab
+ * unusable for the WHOLE desktop: that monitor's region would keep whatever a
+ * previous frame left in the shared slot while the rest of the screen updates,
+ * i.e. permanently stale pixels on that display. The GDI grab returns the
+ * composed desktop (rotation already applied by Windows) for every monitor, so
+ * one rotated output hands capture over to it. */
+static int DxgiAnyRotated(void) {
+    int i;
+    for (i = 0; i < g_nout; i++)
+        if (g_out[i].rotated) return 1;
     return 0;
 }
 
@@ -1723,7 +1743,7 @@ static int DxgiPoll(unsigned char *dst) {
         long x, y;
         UINT pitch;
 
-        if (g_out[i].rotated) continue;   /* logged once at init; GDI covers it */
+        if (g_out[i].rotated) continue;   /* logged once; GDI covers the desktop */
 
         hr = g_out[i].dup->lpVtbl->AcquireNextFrame(g_out[i].dup, 0, &fi, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
@@ -2063,6 +2083,21 @@ static void EinkTick(void) {
 
     dst = EinkCapBegin();
     if (!dst) return;                        /* worker behind: coalesce, skip */
+    if (g_dxgi == 1 && DxgiAnyRotated()) {
+        /* DXGI cannot express a rotated desktop (see DxgiInit): on a mixed set
+         * one rotated output would leave its monitor showing stale pixels
+         * while the identity outputs kept updating. Checked before polling, so
+         * an identity output producing a frame cannot mask it. Hand the whole
+         * desktop to the GDI grab instead. Rotation never changes for a
+         * display, so this fallback is permanent - no 2 s retry. */
+        EinkCapEnd(0, dst);
+        g_dxgi_retry = 0;
+        EinkShutdownCapture();
+        g_gdi_only = 1;
+        g_dxgi_fail_at = GetTickCount();
+        L("eink: rotated output present, GDI grab for the whole desktop");
+        return;
+    }
     if (g_dxgi == 1) {
         int lost = 0;
         got = DxgiPoll(dst);
@@ -2074,10 +2109,10 @@ static void EinkTick(void) {
             return;
         }
         if (got == 0 && !DxgiHasUsableOutput()) {
-            /* Every output is rotated or has an unsupported format, so DXGI
-             * will never produce a frame. The GDI grab returns the composed
-             * desktop (rotation already applied by Windows), so fall back to
-             * it instead of letting e-ink freeze on the last frame. */
+            /* Every output has an unsupported desktop format, so DXGI will
+             * never produce a frame. The GDI grab returns the composed desktop
+             * (rotation already applied by Windows), so fall back to it
+             * instead of letting e-ink freeze on the last frame. */
             EinkCapEnd(0, dst);
             g_dxgi_retry = DxgiRetryable();
             EinkShutdownCapture();
