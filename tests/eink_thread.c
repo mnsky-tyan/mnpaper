@@ -20,6 +20,20 @@ static LRESULT CALLBACK TestHost(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+/* Present-serialization probe (2026-10-07 review): PresentEinkRect must hold
+ * g_ecs, because the worker swaps the show/build pointers under the same lock
+ * and then renders into the buffer it just handed back. */
+typedef struct { OVL ov; int rc; } PRESENT_PROBE;
+static PRESENT_PROBE g_pp;
+static volatile LONG g_pp_done;
+
+static DWORD WINAPI PresentProbeThread(LPVOID unused) {
+    (void)unused;
+    g_pp.rc = PresentEinkRect(&g_pp.ov);
+    InterlockedExchange(&g_pp_done, 1);
+    return 0;
+}
+
 /* wait up to timeout_ms for n presents */
 static int WaitForPresents(int want, int timeout_ms) {
     DWORD began = GetTickCount();
@@ -163,6 +177,51 @@ int main(void) {
     }
 
     /* ------------------------- stop path ---------------------------------- */
+    /* --------- present is serialized against the worker's swap ------------ */
+    {
+        HANDLE th;
+        DWORD w;
+        memset(&g_pp, 0, sizeof g_pp);
+        g_pp.ov.w = 64; g_pp.ov.h = 48;
+        g_pp.ov.rc.left = g_vsx; g_pp.ov.rc.top = g_vsy;
+        g_pp.ov.bits = (unsigned char *)malloc((size_t)64 * 48 * 4);
+        InterlockedExchange(&g_pp_done, 0);
+        Check(g_pp.ov.bits != NULL && g_eproc_show != NULL && g_eproc_valid,
+              "a published frame is available for the present check");
+        EnterCriticalSection(&g_ecs);          /* the worker, mid-swap, held */
+        th = CreateThread(NULL, 0, PresentProbeThread, NULL, 0, NULL);
+        Check(th != NULL, "the present probe thread starts");
+        w = WaitForSingleObject(th, 300);
+        Check(w == WAIT_TIMEOUT && g_pp_done == 0,
+              "a present waits while the worker holds the swap lock (no torn copy)");
+        LeaveCriticalSection(&g_ecs);
+        w = WaitForSingleObject(th, 3000);
+        Check(w == WAIT_OBJECT_0 && g_pp_done == 1 && g_pp.rc == 1,
+              "the present completes and copies a frame once the lock is free");
+        CloseHandle(th);
+        free(g_pp.ov.bits);
+    }
+
+    /* --------- an unusable output set hands capture to the GDI grab ------- */
+    {
+        OUTINFO saved[MAX_OUT];
+        int saved_n = g_nout;
+        memcpy(saved, g_out, sizeof saved);
+        g_nout = 1; g_out[0].rotated = 0; g_out[0].badfmt = 0;
+        Check(DxgiHasUsableOutput(), "a plain duplication output is usable");
+        g_out[0].rotated = 1;
+        Check(!DxgiHasUsableOutput(),
+              "a rotated output alone is unusable (e-ink falls back to GDI)");
+        g_out[0].rotated = 0; g_out[0].badfmt = 1;
+        Check(!DxgiHasUsableOutput(),
+              "an unsupported-format output alone is unusable");
+        g_nout = 2; g_out[0].rotated = 0; g_out[0].badfmt = 0;
+        g_out[1].rotated = 1; g_out[1].badfmt = 0;
+        Check(DxgiHasUsableOutput(), "one usable output among rotated ones is enough");
+        memcpy(g_out, saved, sizeof saved);
+        g_nout = saved_n;
+    }
+
     EinkWorkerSet(0);
     Check(g_ework == NULL, "the worker stops and joins");
     Check(EinkCapBegin() == NULL, "no capture slots are handed out with no worker");

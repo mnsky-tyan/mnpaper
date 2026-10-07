@@ -1411,6 +1411,7 @@ typedef struct {
     int stageW, stageH, stageFmt;
     int swapRB;
     int badfmt;             /* output skipped: format unsupported, logged once */
+    int rotated;            /* output skipped: not identity, logged once */
 } OUTINFO;
 
 static ID3D11Device        *g_dev;
@@ -1548,24 +1549,37 @@ static void EinkRender(const unsigned char *src, unsigned char *dst, int w, int 
 /* Returns 1 when a frame was actually copied into ov->bits, 0 when there was
  * nothing presentable (no published frame yet, or a geometry that does not fit
  * the capture buffer). The caller must not upload on 0: ov->bits then still
- * holds whatever the other mode left there. */
+ * holds whatever the other mode left there.
+ *
+ * The copy runs under g_ecs. The worker's publish swaps g_eproc_show/g_ebuild
+ * under the same lock and then renders into the buffer it just handed back, so
+ * without it the worker can start overwriting the very pixels being copied -
+ * a torn frame. The worker's own critical sections are microseconds long, so
+ * holding it for one rect copy costs nothing real. */
 static int PresentEinkRect(OVL *ov) {
-    const unsigned char *show = g_eproc_show;   /* one coherent read */
-    int x0 = ov->rc.left - g_vsx, y0 = ov->rc.top - g_vsy, y;
-    if (!show || !g_eproc_valid || !ov->bits ||
-        x0 < 0 || y0 < 0 || x0 + ov->w > g_vsw || y0 + ov->h > g_vsh)
-        return 0;
-    for (y = 0; y < ov->h; y++)
-        memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
-               show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
-               (size_t)ov->w * 4);
+    const unsigned char *show;
+    int x0, y0, y, got = 0;
+    if (!ov->bits || !g_ecs_ready) return 0;
+    x0 = ov->rc.left - g_vsx; y0 = ov->rc.top - g_vsy;
+    EnterCriticalSection(&g_ecs);
+    show = g_eproc_show;
+    if (show && g_eproc_valid &&
+        x0 >= 0 && y0 >= 0 && x0 + ov->w <= g_vsw && y0 + ov->h <= g_vsh) {
+        for (y = 0; y < ov->h; y++)
+            memcpy((unsigned char *)ov->bits + (size_t)y * ov->w * 4,
+                   show + 4 * ((size_t)(y0 + y) * g_vsw + x0),
+                   (size_t)ov->w * 4);
+        got = 1;
+    }
+    LeaveCriticalSection(&g_ecs);
+    if (!got) return 0;
     /* Same hole rule as the paper path, punched in place: this buffer is
      * re-copied from g_eproc_show at the top of every present, so the pixels
      * under the hole are disposable. Housekeeping re-presents on every hole
      * change, so a parked taskbar cannot leave a stale band in the upload. */
-    int hon, hx0, hy0, hx1, hy1;
-    LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
-    PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1);
+    { int hon, hx0, hy0, hx1, hy1;
+      LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
+      PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1); }
     return 1;
 }
 
@@ -1629,6 +1643,20 @@ static int DxgiInit(void) {
                 memset(&g_out[g_nout], 0, sizeof(OUTINFO));
                 if (SUCCEEDED(out1->lpVtbl->GetDesc(out1, &desc))) {
                     RECT r = desc.DesktopCoordinates;
+                    /* Identity is the only orientation the copy loop below can
+                     * express: the duplicated surface follows the rotated
+                     * output, so for 90/270 its width and height are swapped
+                     * against DesktopCoordinates (the 1:1 row copy would come
+                     * out transposed) and 180 flips it. Rather than publish
+                     * wrong pixels, mark the output and let EinkTick fall back
+                     * to the GDI grab, which returns the composed desktop in
+                     * desktop space and therefore needs no rotation at all. */
+                    g_out[g_nout].rotated =
+                        (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY &&
+                         desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED);
+                    if (g_out[g_nout].rotated)
+                        L("dxgi: output %d is rotated (%d), skipped in favour of the GDI grab",
+                          g_nout, (int)desc.Rotation);
                     g_out[g_nout].r.left   = r.left   - g_vsx;
                     g_out[g_nout].r.top    = r.top    - g_vsy;
                     g_out[g_nout].r.right  = r.right  - g_vsx;
@@ -1655,6 +1683,17 @@ static int DxgiInit(void) {
     return g_nout > 0;
 }
 
+/* Is any output actually usable by the copy loop? A rotated one is not (see
+ * DxgiInit), and neither is one whose desktop format is unsupported. When
+ * every output is unusable the caller must switch to the GDI grab instead of
+ * waiting forever for frames that will never arrive. */
+static int DxgiHasUsableOutput(void) {
+    int i;
+    for (i = 0; i < g_nout; i++)
+        if (!g_out[i].rotated && !g_out[i].badfmt) return 1;
+    return 0;
+}
+
 /* returns 1 when at least one output produced a new frame */
 static int DxgiPoll(unsigned char *dst) {
     int i, got = 0;
@@ -1669,6 +1708,8 @@ static int DxgiPoll(unsigned char *dst) {
         BYTE *srow, *drow;
         long x, y;
         UINT pitch;
+
+        if (g_out[i].rotated) continue;   /* logged once at init; GDI covers it */
 
         hr = g_out[i].dup->lpVtbl->AcquireNextFrame(g_out[i].dup, 0, &fi, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
@@ -2012,6 +2053,18 @@ static void EinkTick(void) {
         if (lost) {
             EinkCapEnd(0, dst);
             g_gdi_only = 1;
+            return;
+        }
+        if (got == 0 && !DxgiHasUsableOutput()) {
+            /* Every output is rotated or has an unsupported format, so DXGI
+             * will never produce a frame. The GDI grab returns the composed
+             * desktop (rotation already applied by Windows), so fall back to
+             * it instead of letting e-ink freeze on the last frame. */
+            EinkCapEnd(0, dst);
+            g_dxgi = 0;
+            g_gdi_only = 1;
+            g_dxgi_fail_at = GetTickCount();
+            L("eink: no usable duplication output, GDI fallback");
             return;
         }
     } else {
