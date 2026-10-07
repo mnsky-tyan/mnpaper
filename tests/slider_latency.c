@@ -467,6 +467,24 @@ g_test_headless = 1;   /* help + update windows must never become visible in tes
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
         g_s.master = saved_master;
         SyncMasterCheckbox();   /* the product's own mirror, same as SetMaster uses */
+
+        /* The sixth round made leaving e-ink release the ring, but that arm of
+         * RepaintAll needs master=1 (a master-off repaint only stops the
+         * worker), which every other switch in this suite avoids on purpose.
+         * Allocate the ring by hand, then let one paper-mode repaint with the
+         * effect ON release it - the property the whole fix exists for. */
+        SetMode(MODE_EINK);              /* master is still 0 here */
+        EinkBuffersRestart();            /* allocate the ring; no worker (master=0) */
+        Check(g_ecap[0] != NULL && g_eproc_show != NULL && g_ebuild != NULL,
+              "the e-ink ring is allocated for the release check");
+        g_s.master = 1;
+        SetMode(MODE_PAPER);             /* master=1: RepaintAll releases the ring */
+        Check(g_ecap[0] == NULL && g_eproc_show == NULL && g_ebuild == NULL,
+              "leaving e-ink with the effect on releases the e-ink ring");
+        g_s.master = 0;
+        RepaintAll();                    /* settle with the ring gone */
+        g_s.master = saved_master;
+        SyncMasterCheckbox();
     }
     /* Texture-on checkbox (118) and autostart checkbox (119): same handlers
      * as the tray items, fully isolated from the real Run key. */
