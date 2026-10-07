@@ -141,9 +141,11 @@ rebuild and run in one go, or exclude the temp directory.
   edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
   rebuild after a reset.
 - `hole_cycle.c` - the taskbar hole over a fixed geometry (2880x1800 monitor,
-  46px band): reveal/park cycles produce the right hole rect, the master
-  texture comes back byte-identical every time (full-byte hash), and 20 round
-  trips leave no residue.
+  48px band): reveal/park cycles produce the right hole rect, the master
+  texture comes back byte-identical every time (full-byte hash), 20 round
+  trips leave no residue, and `ComputeHoles`' parked/revealed decision is
+  driven directly for a bottom band, a left-docked sliver and a right-docked
+  sliver (the side docks a height-only test used to misread as revealed).
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
   the settings struct (sliders, checkboxes, the mode radio pair), and a
   destroyed dialog is refused rather than pushed to.
@@ -155,3 +157,8 @@ rebuild and run in one go, or exclude the temp directory.
 - `verify_fixes.c` - the extracted feed-size cap (`FeedFits`) boundary, the
   show path never falling back to a full synchronous build, the hole
   save/restore being byte-identical, and the `LiveDlg` owner rule.
+- `update_help_capture.c` - the update feed's version/hash parsing and the
+  help/update UI in a real (headless) window: the help window's contents, the
+  manual update path with its message box intercepted by a CBT hook (both the
+  decline path and the accept path, which switches to e-ink in place), and
+  that the suite leaves no window visible behind it.

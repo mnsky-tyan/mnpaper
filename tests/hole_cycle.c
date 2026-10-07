@@ -53,8 +53,8 @@ int main(void) {
     /* this scratch OVL has no strips, so ApplyLayered runs the hole
      * save/punch/restore around a no-op upload (it cannot fail - the
      * return value is not assertable here; the byte-identity hashes below
-     * are the real checks). That path is exactly what the 2.7.8 regression
-     * lived in. */
+     * are the real checks). That path is exactly where the regression that
+     * 2.7.7 introduced and 2.7.8 fixed lived. */
     ApplyLayered(&ov);
     revealed = H(px, (size_t)w * h * 4);
     Check(revealed == clean, "the upload for a revealed taskbar changes no master pixel");
@@ -78,6 +78,45 @@ int main(void) {
         g_hole_on[0] = 0; ApplyLayered(&ov);
     }
     Check(H(px, (size_t)w * h * 4) == clean, "20 reveal/park cycles leave the texture untouched");
+
+    /* ComputeHoles' parked/revealed decision (TbParked, 2026-10-06 review): an
+     * auto-hidden taskbar leaves a short band when docked to the bottom, but a
+     * full-height few-pixel-WIDE strip when docked left or right. The old
+     * height-only test read the side docks as revealed, which left a permanent
+     * see-through band down that edge and latched the z-order walk off. Drive
+     * the classifier directly on all three geometries. */
+    {
+        g_n = 1;
+        g_ov[0].rc = mon;
+        g_ntb = 1;
+        g_tbw[0] = NULL;          /* no taskbar window: the raise is skipped */
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+
+        SetRect(&g_tb[0], mon.left, 1752, mon.right, mon.bottom);   /* revealed bottom band */
+        ComputeHoles();
+        Check(g_tb_state[0] == 2 && g_hole_on[0] == 1 &&
+              g_hole[0].bottom == 1800 && g_hole[0].top == 1752,
+              "a revealed bottom taskbar band opens the hole");
+
+        SetRect(&g_tb[0], 0, 0, 6, 1800);                            /* parked, docked LEFT */
+        ComputeHoles();
+        Check(g_tb_state[0] == 1 && g_hole_on[0] == 0,
+              "a left-docked parked sliver is parked, never a hole (full height, 6px wide)");
+
+        SetRect(&g_tb[0], 2874, 0, 2880, 1800);                      /* parked, docked RIGHT */
+        ComputeHoles();
+        Check(g_tb_state[0] == 1 && g_hole_on[0] == 0,
+              "a right-docked parked sliver is parked (full height, 6px wide)");
+
+        SetRect(&g_tb[0], 0, 1784, 2880, 1800);                      /* 16px: the parked threshold */
+        ComputeHoles();
+        Check(g_tb_state[0] == 1 && g_hole_on[0] == 0,
+              "a 16px bottom sliver counts as parked (the stated threshold)");
+
+        g_ntb = 0;                /* leave no synthesized taskbar behind */
+        g_hole_on[0] = 0;
+    }
+
     free(px);
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;

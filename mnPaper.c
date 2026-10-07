@@ -816,6 +816,8 @@ static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
     return 1;
 }
 
+static void RequestEinkRender(void);
+
 static void ShowOverlay(OVL *ov, int show) {
     int s;
     if (!ov->hwnd) return;
@@ -833,6 +835,14 @@ static void ShowOverlay(OVL *ov, int show) {
              * switch there may be none yet (no published frame, or none
              * publishable), and uploading ov->bits then would put the paper
              * texture on screen inside e-ink mode. */
+            ApplyLayered(ov);
+        } else if (ov->bits) {
+            /* Nothing presentable yet. The strips are already visible from
+             * the previous mode, so simply skipping the upload would leave
+             * the paper texture on screen until the first e-ink frame lands.
+             * Blank the overlay to fully transparent (premultiplied BGRA
+             * zero) and upload once; the next published frame repaints it. */
+            memset(ov->bits, 0, (size_t)ov->w * ov->h * 4);
             ApplyLayered(ov);
         }
         for (s = 0; s < ov->n_strips; s++)
@@ -1000,7 +1010,7 @@ static void CollectTaskbars(void) {
     EnumWindows(TbEnumProc, 0);
 }
 
-static HWND g_dlg;   /* settings window, declared below */
+static HWND g_dlg;   /* settings window (LiveDlg below and the UI block both use it) */
 
 /* Is the settings window still alive? It can be closed - or destroyed by a
  * completed self-update - while an update worker is still running, so every
@@ -1154,11 +1164,6 @@ static void Housekeeping(void) {
         }
         /* a real foreign window is above the veil: take the top back */
         for (i = 0; i < g_n; i++) RaiseOverlay(&g_ov[i]);
-        {   /* keep the settings window above the veil too (ask, never assume) */
-            HWND d = LiveDlg();
-            if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        }
         break;
         }
     }
@@ -1355,23 +1360,34 @@ static void EinkBuffersRestart(void);
 static LONG g_eset_gen;               /* bumped whenever settings change */
 static LONG g_egen_done;              /* generation the worker has rendered */
 
+/* Ask for a fresh e-ink frame without touching the overlays: bumps the
+ * generation so a static screen still re-renders, and makes sure the ring and
+ * its worker are up. Used by the settings sliders (whose changes only need a
+ * re-render, not a re-present of the current frame) and by RepaintAll. */
+static void RequestEinkRender(void) {
+    InterlockedIncrement(&g_eset_gen);
+    if (!EinkBuffersReady()) EinkBuffersRestart();
+    else EinkWorkerSet(1);
+}
+
 static void RepaintAll(void) {
     int i;
     PaperWorkerStop();  /* A mode/master/CLI change invalidates old snapshots. */
-    if (g_s.master && g_s.mode == MODE_EINK) {
-        InterlockedIncrement(&g_eset_gen);   /* re-render even with a static screen */
-        if (!EinkBuffersReady()) EinkBuffersRestart();
-        else EinkWorkerSet(1);
-    } else {
-        /* Leaving e-ink (or turning the effect off): release the ring buffers
-         * instead of only stopping the worker. They are up to ~5 virtual-
-         * screen bitmaps (~104 MB on a 2880x1800 desktop, ~166 MB at 4K) and
-         * the GDI grab pair besides; an eink->paper switch used to pin all of
-         * it until exit. EinkFreeBuffers stops the worker itself, and the
-         * e-ink branch above re-allocates on demand, so a round trip just
-         * pays two mallocs. */
+    if (g_s.master && g_s.mode == MODE_EINK)
+        RequestEinkRender();
+    else if (g_s.mode != MODE_EINK)
+        /* Leaving e-ink: release the ring buffers instead of only stopping the
+         * worker. They are up to ~5 virtual-screen bitmaps (~104 MB on a
+         * 2880x1800 desktop, ~166 MB at 4K) and the GDI grab pair besides; an
+         * eink->paper switch used to pin all of it until exit. EinkFreeBuffers
+         * stops the worker itself, and RequestEinkRender re-allocates on
+         * demand, so a round trip just pays two mallocs. */
         EinkFreeBuffers();
-    }
+    else
+        /* E-ink with the effect off: stop the worker but KEEP the ring. Toggling
+         * the effect between paper and e-ink (Ctrl+Alt+P) must not free and then
+         * immediately rebuild ~104 MB just because master changed. */
+        EinkWorkerSet(0);
     for (i = 0; i < g_n; i++) {
         ApplyCaptureState(&g_ov[i]);
         ShowOverlay(&g_ov[i], g_s.master);
@@ -1439,7 +1455,7 @@ static HANDLE g_ework, g_ewake;
 static volatile LONG g_estop;
 static CRITICAL_SECTION g_ecs;
 static int   g_ecs_ready;
-static int  g_dxgi = 0;        /* 0 uninit, 1 live, -1 failed (use GDI) */
+static int  g_dxgi = 0;        /* 0 uninit, 1 live; the GDI fallback is g_gdi_only */
 static int  g_gdi_only = 0;     /* duplication unavailable: BitBlt fallback */
 static DWORD g_dxgi_fail_at;
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
@@ -2107,7 +2123,6 @@ static void DumpEink(const char *path, int w, int h) {
 
 /* ---------------------------------------------------------- settings UI --- */
 
-static HWND g_dlg;
 static HWND g_tb_intensity, g_tb_warmth, g_tb_grain, g_tb_fibre, g_tb_blotch;
 static HWND g_tb_shades, g_tb_contrast, g_tb_dither, g_btn_adv;
 static HWND g_chk_share;   /* settings-window mirror of the tray share toggle */
@@ -3098,6 +3113,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateVals(hwnd);
         if (g_s.mode == MODE_PAPER && g_s.master)
             RequestPaperPreview();
+        else if (g_s.mode == MODE_EINK && g_s.master)
+            RequestEinkRender();   /* re-render only; never re-present here */
         else
             RepaintAll();
         SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, NULL);
@@ -3110,6 +3127,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SaveSettings();
             if (g_s.mode == MODE_PAPER && g_s.master)
                 RequestPaper();          /* refine the already-visible preview */
+            else if (g_s.mode == MODE_EINK && g_s.master)
+                RequestEinkRender();
             else
                 RepaintAll();
         }

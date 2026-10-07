@@ -28,7 +28,7 @@ static void Check(int c, const char *what) {
 
 int main(void) {
     RECT rc;
-    WCHAR scratch[128];
+    WCHAR scratch[128], runkey[160];
     printf("VERIFIER STARTED\n"); fflush(stdout);
     ULONGLONG t0, t1;
     HKEY k;
@@ -37,14 +37,17 @@ int main(void) {
     g_test_headless = 1;   /* same safety pin as the other suites */
     /* isolated scratch hive, PID-suffixed like the other suites: never the
      * captain's live settings, and REG_KEY is redirected too, so even a
-     * SaveSettings lands in the scratch tree */
+     * SaveSettings lands in the scratch tree. The Run key gets the same
+     * PID suffix so two concurrent runs (or a crashed one) cannot collide. */
     swprintf(scratch, 128, L"Software\\mnPaperVerifyFixes-%lu",
              (unsigned long)GetCurrentProcessId());
     r = RegCreateKeyExW(HKEY_CURRENT_USER, scratch, 0, NULL,
                         0, KEY_ALL_ACCESS, NULL, &k, NULL);
     if (r == ERROR_SUCCESS) RegCloseKey(k);
     REG_KEY = scratch;
-    wcscpy(g_run_key, L"Software\\mnPaperVerifyFixes-Run");
+    swprintf(runkey, 160, L"Software\\mnPaperVerifyFixes-Run-%lu",
+             (unsigned long)GetCurrentProcessId());
+    lstrcpynW(g_run_key, runkey, 160);
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 0, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
@@ -170,7 +173,7 @@ int main(void) {
     /* leave no scratch behind: the 2026-10-03 review caught this suite
      * leaking its key into the captain's real hive on every run */
     RegDeleteTreeW(HKEY_CURRENT_USER, scratch);
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\mnPaperVerifyFixes-Run");
+    RegDeleteTreeW(HKEY_CURRENT_USER, runkey);
 
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;
