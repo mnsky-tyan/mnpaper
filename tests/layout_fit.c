@@ -414,10 +414,10 @@ int main(void) {
     }
     WriteBmp(bmp_old, rold.px, 352, 20);
     WriteBmp(bmp_new, rnew.px, 352, 20);
-    printf("  visual-check BMPs: %s , %s\n", bmp_old, bmp_new);
     /* The four visual-check BMPs exist for a human to look at, but the standing
      * rule is that nothing stays on the Windows side after the run, and %TEMP%
-     * is not an exception: delete them in the same operation. */
+     * is not an exception: delete them in the same operation. Nothing is printed
+     * about them, since they are gone by the time the console is read. */
     DeleteFileA(bmp_old); DeleteFileA(bmp_new);
     DeleteFileA(bmp_row); DeleteFileA(bmp_dlg);
 

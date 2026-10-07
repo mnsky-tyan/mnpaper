@@ -642,7 +642,14 @@ static void SetChk(HWND ctl, int on) {
  *
  * The punch itself is PunchHoleAlpha below, so paper and e-ink cannot drift
  * apart on the row/stride geometry. */
-static void PunchHoleAlpha(OVL *ov);
+static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
+    int y;
+    if (!ov->bits || !on) return;
+    for (y = y0; y < y1; y++)
+        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
+               (size_t)(x1 - x0) * 4);
+}
+
 static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
     int on, x0, y0, x1, y1, y;
     size_t rowbytes;
@@ -661,7 +668,10 @@ static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, in
         memcpy(*saved + rowbytes * (size_t)(y - y0),
                (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4,
                rowbytes);
-    PunchHoleAlpha(ov);   /* the punch itself: one rule for both paths */
+    /* Punch the same rect that was just saved, never a re-read of the live
+     * hole: a punch wider than the save would zero alpha on pixels nothing
+     * restores, leaving a permanent transparent band. */
+    PunchHoleAlpha(ov, on, x0, y0, x1, y1);
 }
 
 /* Put the saved pixels back where they came from. Called after the upload, on
@@ -688,15 +698,6 @@ static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, in
  * pixels under the hole are disposable. ApplyLayered's paper path needs the
  * save/restore pair instead: Housekeeping re-uploads there without a rebuild,
  * so ov->bits must never stay mutated. */
-static void PunchHoleAlpha(OVL *ov) {
-    int on, x0, y0, x1, y1, y;
-    if (!ov->bits) return;
-    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
-    if (!on) return;
-    for (y = y0; y < y1; y++)
-        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
-               (size_t)(x1 - x0) * 4);
-}
 
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
  * preview here - this runs on the UI thread inside RepaintAll - and let the
@@ -1546,7 +1547,9 @@ static int PresentEinkRect(OVL *ov) {
      * re-copied from g_eproc_show at the top of every present, so the pixels
      * under the hole are disposable. Housekeeping re-presents on every hole
      * change, so a parked taskbar cannot leave a stale band in the upload. */
-    PunchHoleAlpha(ov);
+    int hon, hx0, hy0, hx1, hy1;
+    LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
+    PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1);
     return 1;
 }
 
