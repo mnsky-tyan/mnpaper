@@ -117,6 +117,216 @@ int main(void) {
         g_hole_on[0] = 0;
     }
 
+    /* --------------- clipping at the hole/hole's-bounds boundary -----------
+     * Round-10 review extracted the four hand-written "clip a RECT into a
+     * bound" chains into ClipRect(). The equivalence that matters is not the
+     * helper's source but what the two pure-logic call sites now do with an
+     * overhanging rect, so drive them: an off-screen taskbar band through
+     * ComputeHoles (clip into the monitor), and an off-screen hole through
+     * LocalHole / ClearHoleAlpha (clip into the overlay). Both are the real
+     * production functions, and both fail if ClipRect's semantics drift from
+     * the clamp chains it replaced. */
+    {
+        RECT band = { mon.left - 500, mon.top - 300, mon.right + 700, mon.bottom + 400 };
+        unsigned char *saved = NULL;
+        size_t saved_len = 0;
+        int rx0, ry0, rx1, ry1, x, y, clipped_ok;
+
+        g_n = 1;
+        g_ov[0].rc = mon;
+        g_ntb = 1;
+        g_tbw[0] = NULL;
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        g_tb[0] = band;                       /* overhangs the monitor on all four sides */
+        ComputeHoles();
+        Check(g_ov[0].rc.left == 0 && g_ov[0].rc.right == 2880 &&
+              g_ov[0].rc.top == 0 && g_ov[0].rc.bottom == 1800,
+              "the boundary case really does overhang the reference monitor");
+        Check(g_hole_on[0] == 1 &&
+              g_hole[0].left == mon.left && g_hole[0].top == mon.top &&
+              g_hole[0].right == mon.right && g_hole[0].bottom == mon.bottom,
+              "an off-screen taskbar band opens a hole clipped to the monitor");
+
+        /* the same overhang through the overlay-local path: a hole wider and
+         * taller than the strip must punch only the intersection and then put
+         * the master texture back untouched. */
+        g_hole_on[0] = 1;
+        SetRect(&g_hole[0], mon.left - 400, mon.top - 200,
+                            mon.right + 250, mon.bottom + 150);
+        ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
+        Check(rx0 == 0 && ry0 == 0 && rx1 == w && ry1 == h,
+              "LocalHole clips an off-screen hole into the overlay extent");
+        clipped_ok = 1;
+        for (y = 0; y < h; y += 37)
+            for (x = 0; x < w; x += 41) {
+                unsigned char a = px[((size_t)y * w + x) * 4 + 3];
+                if (a != 0) clipped_ok = 0;   /* every on-overlay pixel is punched */
+            }
+        Check(clipped_ok,
+              "every pixel inside the clipped hole has its alpha punched");
+        RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
+        /* RestoreHoleAlpha frees saved itself (by the saved rect's length). */
+        Check(H(px, (size_t)w * h * 4) == clean,
+              "after the overhanging hole closes the master texture is restored byte for byte");
+
+        /* a hole wholly off the overlay must be a no-op, not an inverted rect
+         * punched at the wrong edge (the failure ClipRect explicitly avoids
+         * by leaving an empty result inverted rather than clamping it) */
+        g_hole_on[0] = 1;
+        SetRect(&g_hole[0], mon.right + 10, mon.bottom + 10,
+                            mon.right + 90, mon.bottom + 90);
+        ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
+        Check(saved == NULL && rx0 == 0 && ry0 == 0 && rx1 == 0 && ry1 == 0,
+              "a hole entirely off the overlay punches nothing (no inverted rect)");
+        Check(H(px, (size_t)w * h * 4) == clean,
+              "the wholly-off-screen hole leaves every master pixel alone");
+
+        g_ntb = 0;
+        g_hole_on[0] = 0;
+    }
+
+    /* --------------------- taskbar slots cover every monitor ----------------
+     * TB_MAX used to be 4 while MAX_MON was 16, so a desk with 5+ displays
+     * each showing a taskbar silently dropped taskbars 5..N: TbEnumProc
+     * stopped enumerating, ComputeHoles never saw them, no hole was punched
+     * and no raise happened, so the veil painted straight over them with
+     * nothing in the log (2026-10-08 round-10 review). The capacity fix is
+     * TB_MAX = MAX_MON; what is asserted here is the half that can regress
+     * quietly - that the cap is not below the monitor cap, and that hitting
+     * the cap is reported rather than silent. */
+    Check(TB_MAX >= MAX_MON,
+          "taskbar slots cover every monitor the veil can have (TB_MAX >= MAX_MON)");
+    /* ------------------- the symptom itself, end to end -------------------
+     * The constant above is a static invariant and the gate review (round 10)
+     * was right that it exercises no code path. This is the runtime half, and
+     * it drives the REAL production chain: windows whose class the product
+     * recognises as a taskbar -> EnumWindows(TbEnumProc) -> CollectTaskbars ->
+     * ComputeHoles -> a hole per taskbar. Five fakes is one past the old
+     * TB_MAX of 4, so with that value back the fifth and sixth never enter
+     * g_tb and this fails on the count, which is exactly the reported symptom
+     * (taskbars 5..N textured over, nothing logged) rather than on a proxy
+     * for it. The fakes are parked outside every virtual screen and are
+     * destroyed before the suite returns, so nothing paints for the user. */
+    {
+        WNDCLASSW fc = {0};   /* zeroed: an uninitialised hbrBackground is a garbage brush the fake windows paint with */
+        HWND fake[5];
+        int made = 0, k, found = 0;
+        RECT mon5 = { -32000, -32000, -31000, -31000 };   /* covers the fakes */
+        fc.hInstance = GetModuleHandleW(NULL);
+        fc.lpfnWndProc = DefWindowProcW;
+        fc.lpszClassName = L"Shell_TrayWnd";   /* what IsTaskbarWnd matches */
+        if (RegisterClassW(&fc)) {
+            for (k = 0; k < 5; k++) {
+                fake[k] = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                          L"Shell_TrayWnd", L"t",
+                                          WS_POPUP | WS_VISIBLE,
+                                          -32000 + k * 40, -32000, 30, 30,
+                                          NULL, NULL, fc.hInstance, NULL);
+                if (fake[k]) made++;
+            }
+        }
+        if (made == 5) {
+            FILE *f = fopen("hole_cycle_tbcap.log", "w");
+            char buf[512];
+            BOOL r;
+            g_test_headless = 1;
+            /* the table exactly full: TbEnumProc's only FALSE path is the cap,
+             * and since the cap is tested after the visibility and taskbar
+             * filters, a FALSE here additionally proves fake[0] passed them
+             * as a real taskbar (the product logs "a further taskbar gets no
+             * hole" only for a taskbar it actually refuses) */
+            g_ntb = TB_MAX;
+            Check(f != NULL, "cap log file could be opened");
+            if (f) {
+                g_log = f;
+                r = TbEnumProc(fake[0], 0);
+                g_log = NULL;
+                fflush(f); fclose(f);
+                f = fopen("hole_cycle_tbcap.log", "r");
+                memset(buf, 0, sizeof buf);
+                if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+                DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
+                printf("  .. log: %s\n", buf[0] ? buf : "(empty)");
+                Check(r == FALSE, "a taskbar past the cap stops the enumeration (nothing is stored)");
+                Check(g_ntb == TB_MAX, "the cap is not overrun: no slot is written past the end");
+                Check(buf[0] != '\0',
+                      "hitting the taskbar cap writes a log line (a dropped taskbar is diagnosable)");
+                Check(strstr(buf, "TB_MAX") != NULL,
+                      "the cap log identifies the bound it stopped at (TB_MAX)");
+                /* the wording is contractual, not incidental: the ninth-round
+                 * lesson is that a silent cap is the bug, so the line must say
+                 * what is lost, not just which bound it stopped at */
+                Check(strstr(buf, "no hole") != NULL,
+                      "the cap log says what is lost, not just that a bound was reached");
+            }
+            /* now the real chain, with five taskbars on one monitor */
+            g_n = 1;
+            g_ov[0].rc = mon5; g_ov[0].idx = 0;
+            g_hole_on[0] = 0; g_hole_dirty = 0;
+            CollectTaskbars();
+            ComputeHoles();
+            for (k = 0; k < 5; k++) {
+                int j;
+                for (j = 0; j < g_ntb; j++)
+                    if (g_tb[j].left == -32000 + k * 40 && g_tb[j].top == -32000) { found++; break; }
+            }
+            printf("  .. %d of 5 fake taskbars collected (g_ntb=%d), hole_on=%d\n",
+                   found, g_ntb, g_hole_on[0]);
+            Check(found == 5,
+                  "all five taskbars survive enumeration (the old TB_MAX=4 dropped the fifth)");
+            Check(g_hole_on[0] == 1,
+                  "the taskbars past the old cap get their hole punched, not painted over");
+            /* a full table must not make ordinary windows trigger the claim:
+             * the cap sits behind the taskbar filters now, so a non-taskbar
+             * window enumerated on a full table passes through with no FALSE
+             * and no log (it used to be the first statement, so ANY window
+             * after the fill logged "a further taskbar gets no hole") */
+            {
+                WNDCLASSW pc = {0};
+                HWND plain;
+                FILE *pf = fopen("hole_cycle_tbcap.log", "w");
+                char pbuf[512];
+                BOOL pr;
+                pc.hInstance = fc.hInstance;
+                pc.lpfnWndProc = DefWindowProcW;
+                pc.lpszClassName = L"MnCyclePlainWnd";
+                plain = RegisterClassW(&pc)
+                      ? CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"MnCyclePlainWnd",
+                                        L"p", WS_POPUP | WS_VISIBLE, -31900, -31900, 20, 20,
+                                        NULL, NULL, pc.hInstance, NULL)
+                      : NULL;
+                Check(plain != NULL, "a plain non-taskbar window could be created");
+                g_ntb = TB_MAX;   /* table full: the case the old order got wrong */
+                Check(pf != NULL, "plain-window log file could be opened");
+                if (plain && pf) {
+                    g_log = pf;
+                    pr = TbEnumProc(plain, 0);
+                    g_log = NULL;
+                    fflush(pf); fclose(pf);
+                    pf = fopen("hole_cycle_tbcap.log", "r");
+                    memset(pbuf, 0, sizeof pbuf);
+                    if (pf) { fread(pbuf, 1, sizeof pbuf - 1, pf); fclose(pf); }
+                    Check(pr == TRUE,
+                          "a non-taskbar window on a full table is passed through, not refused");
+                    Check(pbuf[0] == '\0',
+                          "no cap line is logged for a window that is not a taskbar");
+                }
+                DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
+                if (plain) DestroyWindow(plain);
+                g_ntb = 0;
+            }
+            for (k = 0; k < 5; k++) if (fake[k]) DestroyWindow(fake[k]);
+        } else {
+            printf("  NOTE could not create five fake taskbar windows (%d made) - "
+                   "the end-to-end half of this check is skipped\n", made);
+            for (k = 0; k < 5; k++) if (k < made && fake[k]) DestroyWindow(fake[k]);
+        }
+        g_n = 1;
+        g_ov[0].rc = mon;          /* restore the suite's reference geometry */
+        g_ntb = 0;                /* leave no synthesized taskbar behind */
+        g_hole_on[0] = 0;
+    }
+
     free(px);
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;
