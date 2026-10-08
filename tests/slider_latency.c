@@ -80,11 +80,11 @@ int main(void) {
     unsigned final_gen;
     int i;
     SETTINGS before = g_s;
-g_test_headless = 1;   /* help + update windows must never become visible in tests */
+    g_test_headless = 1;   /* help + update windows must never become visible in tests */
     /* no g_log here: L() reaches DbgView, and a hardcoded profile path does not belong in a test */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     InitCommonControls();
-    swprintf(scratch, 128, L"Software\\mnPaper-validation-%lu", GetCurrentProcessId());
+    swprintf(scratch, 128, L"Software\\mnPaper-slider-%lu", GetCurrentProcessId());
     swprintf(run, 160, L"%s\\Run", scratch);
     REG_KEY = scratch; lstrcpynW(g_run_key, run, 160);
     wc.hInstance = GetModuleHandleW(NULL);

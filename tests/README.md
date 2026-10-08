@@ -99,7 +99,7 @@ all suites on a Windows box with VS2022 (any edition) is:
 call "C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Auxiliary\Build\vcvars64.bat"
 rc /nologo mnPaper.rc
 cl /nologo /O2 /W3 mnPaper.c mnPaper.res /FemnPaper.exe
-for %%f in (layout_fit slider_latency verify_fixes hole_cycle dialog_push gdi_fallback eink_thread) do ^
+for %%f in (layout_fit slider_latency verify_fixes hole_cycle dialog_push gdi_fallback eink_thread tall_coverage) do ^
   cl /nologo /O2 /W3 tests\%%f.c /Fe%%f.exe
 cl /nologo /O2 /W3 /MTd /D_DEBUG tests\update_help_capture.c /Fetest_extra.exe
 ```
@@ -111,12 +111,12 @@ link works, and the leak assertions only exist because of `/D_DEBUG`, so a
 build without that define silently drops them.
 
 Every suite is in the repository (`git ls-files tests/` is the truth): the
-block above builds all of them from a fresh clone (the loop builds seven, and
+block above builds all of them from a fresh clone (the loop builds eight, and
 the final `cl` line builds `update_help_capture.c` as `test_extra.exe`). The
 only gitignored file under tests/ is `release_guard.py`.
 
 Run every exe twice; `slider_latency.c` a third time (measured 1-in-16 flake
-above). Each is idempotent and leaves no windows behind.
+above). Each is idempotent and leaves no windows or scratch files behind.
 
 If a freshly built test exe will not start or vanishes between build and
 run, check Windows Defender before suspecting the build: its ML heuristics
@@ -164,6 +164,15 @@ rebuild and run in one go, or exclude the temp directory.
 - `verify_fixes.c` - the extracted feed-size cap (`FeedFits`) boundary, the
   show path never falling back to a full synchronous build, the hole
   save/restore being byte-identical, and the `LiveDlg` owner rule.
+- `tall_coverage.c` - the strip stack over tall monitors: it drives the real
+  `MakeOverlay` on 4K-portrait, 5K-portrait, 8K and very-tall rects and walks
+  each created strip window's own `GetWindowRect` to prove the union covers the
+  monitor edge to edge with no gap, no overlap and no oversize strip (the old
+  `MAX_STRIPS` of 8 left the bottom 240px of a 3840px-tall monitor untextured,
+  silently). It also drives a monitor past the cap to prove the boundary is
+  real rather than silently overrun, and checks the shortfall is logged with the
+  monitor's rect, its height and the height the strips reach. Its scratch log
+  file is deleted before the suite returns.
 - `update_help_capture.c` - the update feed's version/hash parsing and the
   help/update UI in a real (headless) window: the help window's contents, the
   manual update path with its message box intercepted by a CBT hook (both the
