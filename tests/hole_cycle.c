@@ -117,6 +117,74 @@ int main(void) {
         g_hole_on[0] = 0;
     }
 
+    /* --------------- clipping at the hole/hole's-bounds boundary -----------
+     * Round-10 review extracted the four hand-written "clip a RECT into a
+     * bound" chains into ClipRect(). The equivalence that matters is not the
+     * helper's source but what the two pure-logic call sites now do with an
+     * overhanging rect, so drive them: an off-screen taskbar band through
+     * ComputeHoles (clip into the monitor), and an off-screen hole through
+     * LocalHole / ClearHoleAlpha (clip into the overlay). Both are the real
+     * production functions, and both fail if ClipRect's semantics drift from
+     * the clamp chains it replaced. */
+    {
+        RECT band = { mon.left - 500, mon.top - 300, mon.right + 700, mon.bottom + 400 };
+        unsigned char *saved = NULL;
+        size_t saved_len = 0;
+        int rx0, ry0, rx1, ry1, x, y, clipped_ok;
+
+        g_n = 1;
+        g_ov[0].rc = mon;
+        g_ntb = 1;
+        g_tbw[0] = NULL;
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        g_tb[0] = band;                       /* overhangs the monitor on all four sides */
+        ComputeHoles();
+        Check(g_ov[0].rc.left == 0 && g_ov[0].rc.right == 2880 &&
+              g_ov[0].rc.top == 0 && g_ov[0].rc.bottom == 1800,
+              "the boundary case really does overhang the reference monitor");
+        Check(g_hole_on[0] == 1 &&
+              g_hole[0].left == mon.left && g_hole[0].top == mon.top &&
+              g_hole[0].right == mon.right && g_hole[0].bottom == mon.bottom,
+              "an off-screen taskbar band opens a hole clipped to the monitor");
+
+        /* the same overhang through the overlay-local path: a hole wider and
+         * taller than the strip must punch only the intersection and then put
+         * the master texture back untouched. */
+        g_hole_on[0] = 1;
+        SetRect(&g_hole[0], mon.left - 400, mon.top - 200,
+                            mon.right + 250, mon.bottom + 150);
+        ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
+        Check(rx0 == 0 && ry0 == 0 && rx1 == w && ry1 == h,
+              "LocalHole clips an off-screen hole into the overlay extent");
+        clipped_ok = 1;
+        for (y = 0; y < h; y += 37)
+            for (x = 0; x < w; x += 41) {
+                unsigned char a = px[((size_t)y * w + x) * 4 + 3];
+                if (a != 0) clipped_ok = 0;   /* every on-overlay pixel is punched */
+            }
+        Check(clipped_ok,
+              "every pixel inside the clipped hole has its alpha punched");
+        RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
+        /* RestoreHoleAlpha frees saved itself (by the saved rect's length). */
+        Check(H(px, (size_t)w * h * 4) == clean,
+              "after the overhanging hole closes the master texture is restored byte for byte");
+
+        /* a hole wholly off the overlay must be a no-op, not an inverted rect
+         * punched at the wrong edge (the failure ClipRect explicitly avoids
+         * by leaving an empty result inverted rather than clamping it) */
+        g_hole_on[0] = 1;
+        SetRect(&g_hole[0], mon.right + 10, mon.bottom + 10,
+                            mon.right + 90, mon.bottom + 90);
+        ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
+        Check(saved == NULL && rx0 == 0 && ry0 == 0 && rx1 == 0 && ry1 == 0,
+              "a hole entirely off the overlay punches nothing (no inverted rect)");
+        Check(H(px, (size_t)w * h * 4) == clean,
+              "the wholly-off-screen hole leaves every master pixel alone");
+
+        g_ntb = 0;
+        g_hole_on[0] = 0;
+    }
+
     /* --------------------- taskbar slots cover every monitor ----------------
      * TB_MAX used to be 4 while MAX_MON was 16, so a desk with 5+ displays
      * each showing a taskbar silently dropped taskbars 5..N: TbEnumProc
