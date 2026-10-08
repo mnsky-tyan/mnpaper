@@ -1497,6 +1497,8 @@ static int  g_dxgi_retry = 1;   /* 0: the reason is permanent (every output
                                  * re-arm DXGI to fall back again */
 static DWORD g_dxgi_fail_at;
 static int g_rot_logged;    /* the rotated-output notice is a once-per-process line */
+static int g_cap_logged;    /* likewise for the adapter enumeration cap */
+static int g_out_cap_logged;/* likewise for the output enumeration cap */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1673,10 +1675,23 @@ static int DxgiInit(void) {
         if (FAILED(hr)) break;
         nadapt++;
     }
-    if (nadapt == 8)
-        L("dxgi: stopped at 8 adapters - outputs on a further adapter are never duplicated");
+    if (nadapt == 8) {
+        /* nadapt == 8 only says eight adapters enumerated; a ninth may or may
+         * not exist, so probe one past the cap before claiming anything was
+         * dropped. Once per process: the 2 s retry would otherwise re-log. */
+        IDXGIAdapter1 *extra = NULL;
+        HRESULT xhr = factory->lpVtbl->EnumAdapters1(factory, 8, &extra);
+        if (xhr == S_OK && extra) {
+            if (!g_cap_logged) {
+                g_cap_logged = 1;
+                L("dxgi: stopped at 8 adapters - outputs on a further adapter are never duplicated");
+            }
+            extra->lpVtbl->Release(extra);
+        }
+    }
     for (a = 0; a < nadapt; a++) {
         IDXGIOutput *out = NULL;
+        int cap_hit = 0;
         o = 0;
         while (g_nout < MAX_OUT) {
             HRESULT ehr;
@@ -1721,6 +1736,26 @@ static int DxgiInit(void) {
             }
             out->lpVtbl->Release(out);
             out = NULL;
+            if (g_nout >= MAX_OUT) { cap_hit = 1; break; }
+        }
+        if (cap_hit && !g_out_cap_logged) {
+            /* The count reaching MAX_OUT is not proof an output was dropped:
+             * probe for a next output on this adapter and on any adapter not
+             * reached yet, which is the whole set the cap made unreachable. */
+            int k = a;
+            IDXGIOutput *extra = NULL;
+            while (k < nadapt) {
+                int start = (k == a) ? o : 0;
+                if (adapters[k]->lpVtbl->EnumOutputs(adapters[k], start, &extra) == S_OK && extra)
+                    break;
+                extra = NULL;
+                k++;
+            }
+            if (extra) {
+                g_out_cap_logged = 1;
+                L("dxgi: stopped at MAX_OUT=%d - an output past the cap is never refreshed", MAX_OUT);
+                extra->lpVtbl->Release(extra);
+            }
         }
         adapters[a]->lpVtbl->Release(adapters[a]);
     }
@@ -1729,13 +1764,6 @@ static int DxgiInit(void) {
         L("dxgi: no duplication outputs");
         DxgiShutdown();
     } else {
-        /* An output past MAX_OUT is never duplicated, so its monitor keeps
-         * whatever the last frame left in the shared slot - permanently stale
-         * pixels, and DxgiAnyRotated() sees nothing wrong with the set so the
-         * GDI fallback never rescues it. Log the shortfall rather than
-         * printing a count that reads as the machine's real output total. */
-        if (g_nout == MAX_OUT)
-            L("dxgi: stopped at MAX_OUT=%d - an output past the cap is never refreshed", MAX_OUT);
         L("dxgi: %d duplication output(s)", g_nout);
     }
     return g_nout > 0;
