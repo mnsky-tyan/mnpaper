@@ -117,6 +117,43 @@ int main(void) {
         g_hole_on[0] = 0;
     }
 
+    /* --------------------- taskbar slots cover every monitor ----------------
+     * TB_MAX used to be 4 while MAX_MON was 16, so a desk with 5+ displays
+     * each showing a taskbar silently dropped taskbars 5..N: TbEnumProc
+     * stopped enumerating, ComputeHoles never saw them, no hole was punched
+     * and no raise happened, so the veil painted straight over them with
+     * nothing in the log (2026-10-08 round-10 review). The capacity fix is
+     * TB_MAX = MAX_MON; what is asserted here is the half that can regress
+     * quietly - that the cap is not below the monitor cap, and that hitting
+     * the cap is reported rather than silent. */
+    Check(TB_MAX >= MAX_MON,
+          "taskbar slots cover every monitor the veil can have (TB_MAX >= MAX_MON)");
+    {
+        FILE *f = fopen("hole_cycle_tbcap.log", "w");
+        char buf[512];
+        BOOL r;
+        Check(f != NULL, "cap log file could be opened");
+        if (f) {
+            g_log = f;
+            g_ntb = TB_MAX;              /* the table is exactly full */
+            r = TbEnumProc(g_host, 0);   /* any HWND: the cap is tested first */
+            g_log = NULL;
+            fflush(f); fclose(f);
+            f = fopen("hole_cycle_tbcap.log", "r");
+            memset(buf, 0, sizeof buf);
+            if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+            DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
+            printf("  .. log: %s\n", buf[0] ? buf : "(empty)");
+            Check(r == FALSE, "a taskbar past the cap stops the enumeration (nothing is stored)");
+            Check(g_ntb == TB_MAX, "the cap is not overrun: no slot is written past the end");
+            Check(strstr(buf, "stopped at TB_MAX") != NULL,
+                  "hitting the taskbar cap is logged, not silent (a dropped taskbar is diagnosable)");
+            Check(strstr(buf, "no hole") != NULL,
+                  "the cap log says what is lost, not just that a bound was reached");
+        }
+        g_ntb = 0;
+    }
+
     free(px);
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;

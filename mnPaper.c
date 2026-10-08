@@ -355,6 +355,10 @@ static int NextPow2(int v) {
 
 /* ------------------------------------------------------------- overlays --- */
 
+/* The veil covers every monitor, so a monitor past MAX_MON would get no
+ * texture at all. Windows itself tops out well under this, but a silent stop
+ * is the failure the 2026-10-09 round fixed for MAX_STRIPS: say which bound
+ * was hit and what was dropped. */
 #define MAX_MON 16
 
 /* Per monitor, STRIP_H tall each. The cap must exceed any plausible monitor
@@ -609,17 +613,23 @@ static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp) 
 }
 
 
+/* ClipRect is defined with GrowRect in the housekeeping section, below
+ * LocalHole - forward-declared here rather than splitting the pair. */
+static void ClipRect(RECT *r, const RECT *to);
+
 /* hole rect in overlay-local coordinates, 0 if none */
 static void LocalHole(const OVL *ov, int *on, int *x0, int *y0, int *x1, int *y1) {
+    RECT full, local;
     *on = 0; *x0 = *y0 = *x1 = *y1 = 0;
     if (ov->idx >= 0 && ov->idx < MAX_MON && g_hole_on[ov->idx]) {
-        int a = g_hole[ov->idx].left - ov->rc.left, b = g_hole[ov->idx].top - ov->rc.top;
-        int c = g_hole[ov->idx].right - ov->rc.left, d = g_hole[ov->idx].bottom - ov->rc.top;
-        if (a < 0) a = 0;
-        if (b < 0) b = 0;
-        if (c > ov->w) c = ov->w;
-        if (d > ov->h) d = ov->h;
-        if (c > a && d > b) { *on = 1; *x0 = a; *y0 = b; *x1 = c; *y1 = d; }
+        SetRect(&full, 0, 0, ov->w, ov->h);          /* the overlay's own extent */
+        local = g_hole[ov->idx];
+        OffsetRect(&local, -ov->rc.left, -ov->rc.top);   /* into overlay-local space */
+        ClipRect(&local, &full);
+        if (local.right > local.left && local.bottom > local.top) {
+            *on = 1;
+            *x0 = local.left; *y0 = local.top; *x1 = local.right; *y1 = local.bottom;
+        }
     }
 }
 
@@ -699,12 +709,6 @@ static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, in
     }
     free(saved);
 }
-
-/* Punch the hole in place with no save: for the e-ink present path, whose
- * buffer is re-copied from g_eproc_show at the top of every present, so the
- * pixels under the hole are disposable. ApplyLayered's paper path needs the
- * save/restore pair instead: Housekeeping re-uploads there without a rebuild,
- * so ov->bits must never stay mutated. */
 
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
  * preview here - this runs on the UI thread inside RepaintAll - and let the
@@ -867,7 +871,10 @@ static void ShowOverlay(OVL *ov, int show) {
 }
 
 static BOOL CALLBACK MonRectCb(HMONITOR hm, HDC hdc, LPRECT rc, LPARAM lp) {
-    if (g_nmi >= MAX_MON) return FALSE;
+    if (g_nmi >= MAX_MON) {
+        L("monitors: stopped at MAX_MON=%d - a further display would get no veil", MAX_MON);
+        return FALSE;
+    }
     g_mi[g_nmi].mon = hm;
     g_mi[g_nmi].rc = *rc;
     g_nmi++;
@@ -920,7 +927,12 @@ static void SyncOverlays(void) {
  * the order is already correct the call is a no-op. The whole screen is
  * supposed to stay textured, so the veil never withdraws - not even where the
  * taskbar reveals. */
-#define TB_MAX 4
+/* One taskbar slot per monitor, not per screenful: Windows shows a taskbar
+ * on every display when that option is on, so this has to track MAX_MON or a
+ * 5-monitor desk silently drops taskbars 5..N - no hole punched, no add-only
+ * raise, and the veil paints straight over them with nothing logged
+ * (2026-10-08 round-10 review). */
+#define TB_MAX MAX_MON
 static RECT g_tb[TB_MAX];
 static HWND g_tbw[TB_MAX];
 static int  g_ntb;
@@ -944,6 +956,18 @@ static void GrowRect(RECT *into, const RECT *r) {
     if (r->top    < into->top)    into->top    = r->top;
     if (r->right  > into->right)  into->right  = r->right;
     if (r->bottom > into->bottom) into->bottom = r->bottom;
+}
+
+/* shrink *r to the part of it that lies inside *to. The union direction got
+ * GrowRect above; this is its sibling, and four sites were hand-writing it
+ * (2026-10-08 round-10 review): LocalHole, RefinePillHole, ComputeHoles and
+ * DxgiPoll's on-slot bound. An empty result is left as an inverted rect for
+ * the caller to test, never silently clamped to something non-empty. */
+static void ClipRect(RECT *r, const RECT *to) {
+    if (r->left   < to->left)   r->left   = to->left;
+    if (r->top    < to->top)    r->top    = to->top;
+    if (r->right  > to->right)  r->right  = to->right;
+    if (r->bottom > to->bottom) r->bottom = to->bottom;
 }
 
 static BOOL CALLBACK PillEnumProc(HWND hwnd, LPARAM lp) {
@@ -977,10 +1001,7 @@ static void RefinePillHole(HWND taskbar, RECT *hole) {
     }
     if (!have) return;                       /* keep the full band */
     u.left -= m; u.top -= m; u.right += m; u.bottom += m;
-    if (u.left   < hole->left)   u.left   = hole->left;
-    if (u.top    < hole->top)    u.top    = hole->top;
-    if (u.right  > hole->right)  u.right  = hole->right;
-    if (u.bottom > hole->bottom) u.bottom = hole->bottom;
+    ClipRect(&u, hole);                        /* the margin may reach outside */
     if (u.right > u.left && u.bottom > u.top) *hole = u;
 }
 
@@ -989,7 +1010,10 @@ static void EinkPresent(void);   /* e-ink arm of the hole-dirty refresh below */
 
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     RECT r;
-    if (g_ntb >= TB_MAX) return FALSE;
+    if (g_ntb >= TB_MAX) {
+        L("taskbars: stopped at TB_MAX=%d - a further taskbar gets no hole and stays textured over", TB_MAX);
+        return FALSE;
+    }
     if (!IsWindowVisible(hwnd)) return TRUE;
     /* IsTaskbarWnd also matches SecondaryTrayWnd: taskbars shown on secondary
      * displays (Windows 10 all-displays mode, Windows 11 secondary trays) used
@@ -1067,10 +1091,7 @@ static void ComputeHoles(void) {
             }
         if (mon < 0) continue;
         on = g_tb[j];
-        if (on.left   < g_ov[mon].rc.left)   on.left   = g_ov[mon].rc.left;
-        if (on.right  > g_ov[mon].rc.right)  on.right  = g_ov[mon].rc.right;
-        if (on.top    < g_ov[mon].rc.top)    on.top    = g_ov[mon].rc.top;
-        if (on.bottom > g_ov[mon].rc.bottom) on.bottom = g_ov[mon].rc.bottom;
+        ClipRect(&on, &g_ov[mon].rc);            /* the band, inside this monitor */
         if (TbParked(&on)) {                     /* parked sliver          */
             g_tb_state[j] = 1;                    /* unlatch: armed again   */
             continue;
@@ -1148,38 +1169,38 @@ static void Housekeeping(void) {
         for (j = 0; j < g_ntb; j++)      /* only slots this cycle produced */
             if (g_tb_state[j] == 2) { tb_up = 1; break; }
         if (!tb_up) {
-    h = GetTopWindow(NULL);
-    walked = 0;
-    while (h && walked < 24) {     /* cap the walk; ours sits near the top */
-        int ours = 0;
-        walked++;
-        RECT r;
-        DWORD pid = 0;
-        if (g_ov[0].hwnd == h) break;             /* reached the top overlay */
-        for (i = 0; i < g_n; i++) {
-            int s;
-            if (g_ov[i].hwnd == h) { ours = 1; break; }
-            for (s = 0; s < g_ov[i].n_strips; s++)
-                if (g_ov[i].shwnd[s] == h) { ours = 1; break; }
-            if (ours) break;
+            h = GetTopWindow(NULL);
+            walked = 0;
+            while (h && walked < 24) {     /* cap the walk; ours sits near the top */
+                int ours = 0;
+                walked++;
+                RECT r;
+                DWORD pid = 0;
+                if (g_ov[0].hwnd == h) break;             /* reached the top overlay */
+                for (i = 0; i < g_n; i++) {
+                    int s;
+                    if (g_ov[i].hwnd == h) { ours = 1; break; }
+                    for (s = 0; s < g_ov[i].n_strips; s++)
+                        if (g_ov[i].shwnd[s] == h) { ours = 1; break; }
+                    if (ours) break;
+                }
+                if (ours) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+                GetWindowThreadProcessId(h, &pid);
+                if (pid == mypid) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+                if (!IsWindowVisible(h)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+                if (!GetWindowRect(h, &r)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+                if (r.right - r.left < 8 || r.bottom - r.top < 8) {
+                    h = GetWindow(h, GW_HWNDNEXT); continue;
+                }
+                if (r.right <= vs.left || r.left >= vs.right ||
+                    r.bottom <= vs.top || r.top >= vs.bottom) {
+                    h = GetWindow(h, GW_HWNDNEXT); continue;
+                }
+                /* a real foreign window is above the veil: take the top back */
+                for (i = 0; i < g_n; i++) RaiseOverlay(&g_ov[i]);
+                break;
+            }
         }
-        if (ours) { h = GetWindow(h, GW_HWNDNEXT); continue; }
-        GetWindowThreadProcessId(h, &pid);
-        if (pid == mypid) { h = GetWindow(h, GW_HWNDNEXT); continue; }
-        if (!IsWindowVisible(h)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
-        if (!GetWindowRect(h, &r)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
-        if (r.right - r.left < 8 || r.bottom - r.top < 8) {
-            h = GetWindow(h, GW_HWNDNEXT); continue;
-        }
-        if (r.right <= vs.left || r.left >= vs.right ||
-            r.bottom <= vs.top || r.top >= vs.bottom) {
-            h = GetWindow(h, GW_HWNDNEXT); continue;
-        }
-        /* a real foreign window is above the veil: take the top back */
-        for (i = 0; i < g_n; i++) RaiseOverlay(&g_ov[i]);
-        break;
-        }
-    }
     }
 
     /* No z-order fight with the taskbar any more: the veil simply stops
@@ -1484,6 +1505,19 @@ static const int BAYER4[4][4] = {
     { 15, 7, 13,  5 }
 };
 
+/* Release the whole e-ink buffer set and leave every pointer NULL, so no
+ * caller can hand a freed buffer to the worker or to a present. Three sites
+ * need exactly this sequence - EinkEnsureBuffers' rebuild path, its
+ * partial-allocation failure path, and EinkFreeBuffers - and writing it out
+ * three times is the same shape that let the 2026-10-07 rotation fix land in
+ * one copy of a three-copy sequence (see EinkFallBackToGdi below). */
+static void EinkDropBuffers(void) {
+    int i;
+    for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; }
+    free(g_eproc_a); free(g_eproc_b);
+    g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
+}
+
 static void EinkEnsureBuffers(void) {
     int i;
     size_t n;
@@ -1495,9 +1529,7 @@ static void EinkEnsureBuffers(void) {
     }
     g_eproc_valid = 0;      /* rebuilding: nothing publishable until the
                              * worker's next frame lands */
-    for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; }
-    free(g_eproc_a); free(g_eproc_b);
-    g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
+    EinkDropBuffers();
     g_vsx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     g_vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -1511,8 +1543,7 @@ static void EinkEnsureBuffers(void) {
     }
     g_eproc_a = (unsigned char *)malloc(n);
     g_eproc_b = (unsigned char *)malloc(n);
-    if (!g_eproc_a || !g_eproc_b) { free(g_eproc_a); free(g_eproc_b); g_eproc_a = g_eproc_b = NULL; 
-        for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; } return; }
+    if (!g_eproc_a || !g_eproc_b) { EinkDropBuffers(); return; }
     memset(g_eproc_a, 0xFF, n);
     memset(g_eproc_b, 0xFF, n);
     g_eproc_show = g_eproc_a;
@@ -1523,9 +1554,7 @@ static void EinkEnsureBuffers(void) {
 
 static void EinkFreeBuffers(void) {
     EinkWorkerSet(0);           /* never free a live worker's buffers */
-    { int i; for (i = 0; i < EINK_SLOTS; i++) { free(g_ecap[i]); g_ecap[i] = NULL; } }
-    free(g_eproc_a); free(g_eproc_b);
-    g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
+    EinkDropBuffers();
     { int i; for (i = 0; i < EINK_SLOTS; i++) g_ecap_state[i] = 0; }
     GdiResetGrabs();   /* the grab DC/DIB are bound to the thread that polls */
 }
@@ -1644,6 +1673,8 @@ static int DxgiInit(void) {
         if (FAILED(hr)) break;
         nadapt++;
     }
+    if (nadapt == 8)
+        L("dxgi: stopped at 8 adapters - outputs on a further adapter are never duplicated");
     for (a = 0; a < nadapt; a++) {
         IDXGIOutput *out = NULL;
         o = 0;
@@ -1698,6 +1729,13 @@ static int DxgiInit(void) {
         L("dxgi: no duplication outputs");
         DxgiShutdown();
     } else {
+        /* An output past MAX_OUT is never duplicated, so its monitor keeps
+         * whatever the last frame left in the shared slot - permanently stale
+         * pixels, and DxgiAnyRotated() sees nothing wrong with the set so the
+         * GDI fallback never rescues it. Log the shortfall rather than
+         * printing a count that reads as the machine's real output total. */
+        if (g_nout == MAX_OUT)
+            L("dxgi: stopped at MAX_OUT=%d - an output past the cap is never refreshed", MAX_OUT);
         L("dxgi: %d duplication output(s)", g_nout);
     }
     return g_nout > 0;
@@ -1825,11 +1863,9 @@ static int DxgiPoll(unsigned char *dst) {
          * output has no on-slot pixels and is skipped. */
         {
             RECT c = g_out[i].r;
+            RECT slot = { 0, 0, g_vsw, g_vsh };   /* the ring slot's extent */
             long cw, ch;
-            if (c.left < 0) c.left = 0;
-            if (c.top < 0) c.top = 0;
-            if (c.right > g_vsw) c.right = g_vsw;
-            if (c.bottom > g_vsh) c.bottom = g_vsh;
+            ClipRect(&c, &slot);
             cw = c.right - c.left;
             ch = c.bottom - c.top;
             if (cw > (long)td.Width) cw = (long)td.Width;
