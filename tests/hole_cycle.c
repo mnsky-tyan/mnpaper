@@ -230,8 +230,11 @@ int main(void) {
             char buf[512];
             BOOL r;
             g_test_headless = 1;
-            /* the table exactly full: the cap is the first thing TbEnumProc
-             * tests, so a FALSE here can only have come from the cap */
+            /* the table exactly full: TbEnumProc's only FALSE path is the cap,
+             * and since the cap is tested after the visibility and taskbar
+             * filters, a FALSE here additionally proves fake[0] passed them
+             * as a real taskbar (the product logs "a further taskbar gets no
+             * hole" only for a taskbar it actually refuses) */
             g_ntb = TB_MAX;
             Check(f != NULL, "cap log file could be opened");
             if (f) {
@@ -250,6 +253,11 @@ int main(void) {
                       "hitting the taskbar cap writes a log line (a dropped taskbar is diagnosable)");
                 Check(strstr(buf, "TB_MAX") != NULL,
                       "the cap log identifies the bound it stopped at (TB_MAX)");
+                /* the wording is contractual, not incidental: the ninth-round
+                 * lesson is that a silent cap is the bug, so the line must say
+                 * what is lost, not just which bound it stopped at */
+                Check(strstr(buf, "no hole") != NULL,
+                      "the cap log says what is lost, not just that a bound was reached");
             }
             /* now the real chain, with five taskbars on one monitor */
             g_n = 1;
@@ -268,6 +276,45 @@ int main(void) {
                   "all five taskbars survive enumeration (the old TB_MAX=4 dropped the fifth)");
             Check(g_hole_on[0] == 1,
                   "the taskbars past the old cap get their hole punched, not painted over");
+            /* a full table must not make ordinary windows trigger the claim:
+             * the cap sits behind the taskbar filters now, so a non-taskbar
+             * window enumerated on a full table passes through with no FALSE
+             * and no log (it used to be the first statement, so ANY window
+             * after the fill logged "a further taskbar gets no hole") */
+            {
+                WNDCLASSW pc = {0};
+                HWND plain;
+                FILE *pf = fopen("hole_cycle_tbcap.log", "w");
+                char pbuf[512];
+                BOOL pr;
+                pc.hInstance = fc.hInstance;
+                pc.lpfnWndProc = DefWindowProcW;
+                pc.lpszClassName = L"MnCyclePlainWnd";
+                plain = RegisterClassW(&pc)
+                      ? CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"MnCyclePlainWnd",
+                                        L"p", WS_POPUP | WS_VISIBLE, -31900, -31900, 20, 20,
+                                        NULL, NULL, pc.hInstance, NULL)
+                      : NULL;
+                Check(plain != NULL, "a plain non-taskbar window could be created");
+                g_ntb = TB_MAX;   /* table full: the case the old order got wrong */
+                Check(pf != NULL, "plain-window log file could be opened");
+                if (plain && pf) {
+                    g_log = pf;
+                    pr = TbEnumProc(plain, 0);
+                    g_log = NULL;
+                    fflush(pf); fclose(pf);
+                    pf = fopen("hole_cycle_tbcap.log", "r");
+                    memset(pbuf, 0, sizeof pbuf);
+                    if (pf) { fread(pbuf, 1, sizeof pbuf - 1, pf); fclose(pf); }
+                    Check(pr == TRUE,
+                          "a non-taskbar window on a full table is passed through, not refused");
+                    Check(pbuf[0] == '\0',
+                          "no cap line is logged for a window that is not a taskbar");
+                }
+                DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
+                if (plain) DestroyWindow(plain);
+                g_ntb = 0;
+            }
             for (k = 0; k < 5; k++) if (fake[k]) DestroyWindow(fake[k]);
         } else {
             printf("  NOTE could not create five fake taskbar windows (%d made) - "

@@ -1010,15 +1010,21 @@ static void EinkPresent(void);   /* e-ink arm of the hole-dirty refresh below */
 
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     RECT r;
-    if (g_ntb >= TB_MAX) {
-        L("taskbars: stopped at TB_MAX=%d - a further taskbar gets no hole and stays textured over", TB_MAX);
-        return FALSE;
-    }
     if (!IsWindowVisible(hwnd)) return TRUE;
     /* IsTaskbarWnd also matches SecondaryTrayWnd: taskbars shown on secondary
      * displays (Windows 10 all-displays mode, Windows 11 secondary trays) used
      * to be skipped here, so the veil painted straight over them. */
     if (!IsTaskbarWnd(hwnd)) return TRUE;
+    /* The cap is tested only once a real taskbar wants the slot. It used to be
+     * the callback's first statement, so on a desk whose table was exactly full
+     * the first window enumerated AFTER the fill - any window, taskbar or not -
+     * stopped the walk and logged "a further taskbar gets no hole", a claim
+     * about a taskbar that was never refused (gate round-10 review; same class
+     * as the DXGI caps, which probe past the bound before logging a drop). */
+    if (g_ntb >= TB_MAX) {
+        L("taskbars: stopped at TB_MAX=%d - a further taskbar gets no hole and stays textured over", TB_MAX);
+        return FALSE;
+    }
     if (!GetWindowRect(hwnd, &r)) return TRUE;
     if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
     g_tb[g_ntb] = r;
