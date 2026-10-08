@@ -151,7 +151,17 @@ rebuild and run in one go, or exclude the temp directory.
   texture comes back byte-identical every time (full-byte hash), 20 round
   trips leave no residue, and `ComputeHoles`' parked/revealed decision is
   driven directly for a bottom band, a left-docked sliver and a right-docked
-  sliver (the side docks a height-only test used to misread as revealed).
+  sliver (the side docks a height-only test used to misread as revealed). It
+  also drives the `ClipRect` helper directly: an overhanging taskbar band
+  through `ComputeHoles` and an overhanging/wholly off-screen hole through
+  `LocalHole`/`ClearHoleAlpha` must clip to the monitor/overlay, punch only the
+  intersection and restore the master byte for byte. Finally it registers a
+  process-local `Shell_TrayWnd` class, creates five visible fake taskbar
+  windows parked outside every virtual screen and drives the real production
+  chain (`EnumWindows` -> `TbEnumProc` -> `CollectTaskbars` -> `ComputeHoles`),
+  so the taskbar slot cap (`TB_MAX >= MAX_MON`) is exercised as behaviour and
+  hitting the cap is proven to log what was dropped; the fakes are destroyed
+  before the suite returns and never intersect the virtual screen.
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
   the settings struct (sliders, checkboxes, the mode radio pair), each numeric
   readout is asserted to show its own bar's value (the label-to-bar pairing no
