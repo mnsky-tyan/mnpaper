@@ -85,6 +85,7 @@ static void CheckShortfallLogged(void) {
     RECT rc = { 12, 34, 1452, 34 + 16000 };
     FILE *f = fopen("tall_coverage.log", "w");
     char buf[512];
+    if (!f) { Check(0, "shortfall log file could be opened"); return; }
     g_log = f;
     MakeOverlay(&ov, NULL, &rc);
     g_log = NULL;
@@ -92,6 +93,7 @@ static void CheckShortfallLogged(void) {
     f = fopen("tall_coverage.log", "r");
     memset(buf, 0, sizeof buf);
     if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+    DeleteFileA("tall_coverage.log");   /* no residue: the log was scratch */
     printf("  .. log: %s\n", buf[0] ? buf : "(empty)");
     Check(strstr(buf, "monitor at 12,34") != NULL, "shortfall log names the monitor rect");
     Check(strstr(buf, "16000px tall") != NULL, "shortfall log names the real monitor height");
