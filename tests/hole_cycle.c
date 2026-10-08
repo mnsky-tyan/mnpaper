@@ -128,30 +128,87 @@ int main(void) {
      * the cap is reported rather than silent. */
     Check(TB_MAX >= MAX_MON,
           "taskbar slots cover every monitor the veil can have (TB_MAX >= MAX_MON)");
+    /* ------------------- the symptom itself, end to end -------------------
+     * The constant above is a static invariant and the gate review (round 10)
+     * was right that it exercises no code path. This is the runtime half, and
+     * it drives the REAL production chain: windows whose class the product
+     * recognises as a taskbar -> EnumWindows(TbEnumProc) -> CollectTaskbars ->
+     * ComputeHoles -> a hole per taskbar. Five fakes is one past the old
+     * TB_MAX of 4, so with that value back the fifth and sixth never enter
+     * g_tb and this fails on the count, which is exactly the reported symptom
+     * (taskbars 5..N textured over, nothing logged) rather than on a proxy
+     * for it. The fakes are parked outside every virtual screen and are
+     * destroyed before the suite returns, so nothing paints for the user. */
     {
-        FILE *f = fopen("hole_cycle_tbcap.log", "w");
-        char buf[512];
-        BOOL r;
-        Check(f != NULL, "cap log file could be opened");
-        if (f) {
-            g_log = f;
-            g_ntb = TB_MAX;              /* the table is exactly full */
-            r = TbEnumProc(g_host, 0);   /* any HWND: the cap is tested first */
-            g_log = NULL;
-            fflush(f); fclose(f);
-            f = fopen("hole_cycle_tbcap.log", "r");
-            memset(buf, 0, sizeof buf);
-            if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-            DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
-            printf("  .. log: %s\n", buf[0] ? buf : "(empty)");
-            Check(r == FALSE, "a taskbar past the cap stops the enumeration (nothing is stored)");
-            Check(g_ntb == TB_MAX, "the cap is not overrun: no slot is written past the end");
-            Check(strstr(buf, "stopped at TB_MAX") != NULL,
-                  "hitting the taskbar cap is logged, not silent (a dropped taskbar is diagnosable)");
-            Check(strstr(buf, "no hole") != NULL,
-                  "the cap log says what is lost, not just that a bound was reached");
+        WNDCLASSW fc = {0};   /* zeroed: an uninitialised hbrBackground is a garbage brush the fake windows paint with */
+        HWND fake[5];
+        int made = 0, k, found = 0;
+        RECT mon5 = { -32000, -32000, -31000, -31000 };   /* covers the fakes */
+        fc.hInstance = GetModuleHandleW(NULL);
+        fc.lpfnWndProc = DefWindowProcW;
+        fc.lpszClassName = L"Shell_TrayWnd";   /* what IsTaskbarWnd matches */
+        if (RegisterClassW(&fc)) {
+            for (k = 0; k < 5; k++) {
+                fake[k] = CreateWindowExW(0, L"Shell_TrayWnd", L"t",
+                                          WS_POPUP | WS_VISIBLE,
+                                          -32000 + k * 40, -32000, 30, 30,
+                                          NULL, NULL, fc.hInstance, NULL);
+                if (fake[k]) made++;
+            }
         }
-        g_ntb = 0;
+        if (made == 5) {
+            FILE *f = fopen("hole_cycle_tbcap.log", "w");
+            char buf[512];
+            BOOL r;
+            g_test_headless = 1;
+            /* the table exactly full: the cap is the first thing TbEnumProc
+             * tests, so a FALSE here can only have come from the cap */
+            g_ntb = TB_MAX;
+            Check(f != NULL, "cap log file could be opened");
+            if (f) {
+                g_log = f;
+                r = TbEnumProc(fake[0], 0);
+                g_log = NULL;
+                fflush(f); fclose(f);
+                f = fopen("hole_cycle_tbcap.log", "r");
+                memset(buf, 0, sizeof buf);
+                if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+                DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
+                printf("  .. log: %s\n", buf[0] ? buf : "(empty)");
+                Check(r == FALSE, "a taskbar past the cap stops the enumeration (nothing is stored)");
+                Check(g_ntb == TB_MAX, "the cap is not overrun: no slot is written past the end");
+                Check(strstr(buf, "stopped at TB_MAX") != NULL,
+                      "hitting the taskbar cap is logged, not silent (a dropped taskbar is diagnosable)");
+                Check(strstr(buf, "no hole") != NULL,
+                      "the cap log says what is lost, not just that a bound was reached");
+            }
+            /* now the real chain, with five taskbars on one monitor */
+            g_n = 1;
+            g_ov[0].rc = mon5; g_ov[0].idx = 0;
+            g_hole_on[0] = 0; g_hole_dirty = 0;
+            CollectTaskbars();
+            ComputeHoles();
+            for (k = 0; k < 5; k++) {
+                int j;
+                for (j = 0; j < g_ntb; j++)
+                    if (g_tb[j].left == -32000 + k * 40 && g_tb[j].top == -32000) { found++; break; }
+            }
+            printf("  .. %d of 5 fake taskbars collected (g_ntb=%d), hole_on=%d\n",
+                   found, g_ntb, g_hole_on[0]);
+            Check(found == 5,
+                  "all five taskbars survive enumeration (the old TB_MAX=4 dropped the fifth)");
+            Check(g_hole_on[0] == 1,
+                  "the taskbars past the old cap get their hole punched, not painted over");
+            for (k = 0; k < 5; k++) if (fake[k]) DestroyWindow(fake[k]);
+        } else {
+            printf("  NOTE could not create five fake taskbar windows (%d made) - "
+                   "the end-to-end half of this check is skipped\n", made);
+            for (k = 0; k < 5; k++) if (k < made && fake[k]) DestroyWindow(fake[k]);
+        }
+        g_n = 1;
+        g_ov[0].rc = mon;          /* restore the suite's reference geometry */
+        g_ntb = 0;                /* leave no synthesized taskbar behind */
+        g_hole_on[0] = 0;
     }
 
     free(px);
