@@ -221,7 +221,7 @@ static void ClampSettings(void) {
 
 static void ApplyAutostart(void) {
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) {
         L("autostart: cannot open Run key, err %lu", (unsigned long)GetLastError());
         return;
     }
@@ -237,7 +237,16 @@ static void ApplyAutostart(void) {
               (unsigned long)n);
         /* a transient path-read failure here must not silently disable autostart */
     } else {
-        RegDeleteValueW(k, L"mnPaper");
+        /* Remove the entry only when it is absent or names this exe. A copy at
+         * another path derives autostart=0 from the installed copy's entry
+         * (LoadSettings), so an unconditional delete would remove an entry
+         * that belongs to a different exe. */
+        WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
+        DWORD sz = sizeof(path), t = 0;
+        GetModuleFileNameW(NULL, mine, MAX_PATH);
+        if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) != ERROR_SUCCESS ||
+            t != REG_SZ || _wcsicmp(path, mine) == 0)
+            RegDeleteValueW(k, L"mnPaper");
     }
     RegCloseKey(k);
 }
