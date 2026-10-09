@@ -1528,7 +1528,8 @@ static int g_rot_logged;    /* the rotated-output notice is a once-per-process l
 static int g_cap_logged;    /* likewise for the adapter enumeration cap */
 static int g_out_cap_logged;/* likewise for the output enumeration cap */
 static int g_dupfail_logged;/* likewise: an output duplication that failed */
-static int g_nodup_logged;   /* likewise: duplication init failed outright */
+static int g_devfail_logged; /* likewise: the D3D11 device could not be created */
+static int g_noout_logged;   /* likewise: no output could be duplicated */
 static int g_acqfail_logged;/* likewise: a per-frame acquire keeps failing */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
@@ -1701,7 +1702,7 @@ static int DxgiInit(void) {
         return 0;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
                                  D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx)) || !g_dev) {
-        if (!g_nodup_logged) { g_nodup_logged = 1; L("d3d11 device failed"); }
+        if (!g_devfail_logged) { g_devfail_logged = 1; L("d3d11 device failed"); }
         factory->lpVtbl->Release(factory);
         DxgiShutdown();
         return 0;
@@ -1811,7 +1812,7 @@ static int DxgiInit(void) {
         /* the 2 s retry re-runs DxgiInit forever on machines without
          * duplication (RDP, some VMs): say it once, like the other
          * retry-cycle lines in this family */
-        if (!g_nodup_logged) { g_nodup_logged = 1; L("dxgi: no duplication outputs"); }
+        if (!g_noout_logged) { g_noout_logged = 1; L("dxgi: no duplication outputs"); }
         DxgiShutdown();
     } else {
         L("dxgi: %d duplication output(s)", g_nout);
