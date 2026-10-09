@@ -1593,7 +1593,9 @@ static void EinkFreeBuffers(void) {
      * desktop-sized staging texture per output would otherwise stay pinned
      * for the rest of the session while nothing reads them. DxgiShutdown is
      * idempotent (EinkShutdownAll may have run it already), and re-entering
-     * e-ink re-initializes in EinkTick. */
+     * e-ink re-initializes in EinkTick - unless the GDI-only latch holds the
+     * capture (every output rotated: g_dxgi_retry stays permanently 0 by
+     * decision, so re-entry stays on the GDI grab). */
     DxgiShutdown();
     g_dxgi = 0;
 }
