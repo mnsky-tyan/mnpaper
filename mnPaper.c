@@ -2278,7 +2278,8 @@ static void EinkTick(void) {
                     if (!g_recover_logged) {
                         g_recover_logged = 1;
                         L("eink: duplication recovered");
-                    }                } else {
+                    }
+                } else {
                     g_dxgi_fail_at = GetTickCount();
                 }
             }
