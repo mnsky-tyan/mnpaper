@@ -180,6 +180,12 @@ int main(void) {
     /* ------------------------- update-check results ---------------------- */
     g_cbt = SetWindowsHookExW(WH_CBT, CbtProc, NULL, GetCurrentThreadId());
     Check(g_cbt != NULL, "message-box trap installed so validation paints nothing");
+    if (!g_cbt) {
+        /* without the trap every Deliver below raises a REAL modal box on the
+         * working desktop and the suite hangs inside it - stop immediately */
+        printf("RESULT %d failure(s)\n", failures);
+        return 1;
+    }
 
     Deliver(UPT_SAME, NULL, NULL, 1, IDOK, 2000);
     Check(g_box_seen == 1, "up-to-date result opens exactly one message box");
