@@ -327,6 +327,38 @@ int main(void) {
         g_hole_on[0] = 0;
     }
 
+    /* ------------- the monitor cap is logged, like its siblings -------------
+     * MonRectCb is the one round-10 "silent cap" that no suite pinned:
+     * TB_MAX's log wording is asserted above, MAX_STRIPS's in tall_coverage.
+     * It never dereferences the monitor handle, so it drives headlessly the
+     * same way TbEnumProc does. */
+    {
+        FILE *f = fopen("hole_cycle_moncap.log", "w");
+        RECT r = { 100, 100, 200, 200 };
+        int saved_nmi = g_nmi, r1, r2;
+        char buf[512];
+        Check(f != NULL, "moncap log file could be opened");
+        if (f) {
+            g_log = f;
+            g_nmi = MAX_MON;
+            r1 = MonRectCb(NULL, NULL, &r, 0);   /* table full: cap hits */
+            g_nmi = MAX_MON - 1;
+            r2 = MonRectCb(NULL, NULL, &r, 0);   /* one slot free: stored */
+            g_log = NULL;
+            fflush(f); fclose(f);
+            f = fopen("hole_cycle_moncap.log", "r");
+            memset(buf, 0, sizeof buf);
+            if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+            DeleteFileA("hole_cycle_moncap.log");   /* no residue */
+            Check(r1 == FALSE, "a monitor past the cap stops the enumeration");
+            Check(r2 == TRUE && g_nmi == MAX_MON,
+                  "a monitor with one slot free is stored (the cap is not off by one)");
+            Check(strstr(buf, "MAX_MON") != NULL && strstr(buf, "no veil") != NULL,
+                  "hitting the monitor cap logs what is lost (the veil), like the sibling caps");
+        }
+        g_nmi = saved_nmi;
+    }
+
     free(px);
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;
