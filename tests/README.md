@@ -162,8 +162,10 @@ rebuild and run in one go, or exclude the temp directory.
   windows parked outside every virtual screen and drives the real production
   chain (`EnumWindows` -> `TbEnumProc` -> `CollectTaskbars` -> `ComputeHoles`),
   so the taskbar slot cap (`TB_MAX >= MAX_MON`) is exercised as behaviour and
-  hitting the cap is proven to log what was dropped; the fakes are destroyed
-  before the suite returns and never intersect the virtual screen.
+  hitting the cap is proven to log what was dropped, and `MonRectCb` is driven
+  headlessly past `MAX_MON` to prove the monitor cap stores a monitor with one
+  slot free and logs what is lost; the fakes are destroyed before the suite
+  returns and never intersect the virtual screen.
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
   the settings struct (sliders, checkboxes, the mode radio pair), each numeric
   readout is asserted to show its own bar's value (the label-to-bar pairing no

@@ -1441,9 +1441,9 @@ static void RepaintAll(void) {
          * worker. They are up to ~5 virtual-screen bitmaps (~104 MB on a
          * 2880x1800 desktop, ~166 MB at 4K), the GDI grab pair, and the whole
          * DXGI duplication set besides; an eink->paper switch used to pin all
-         * of it until exit. EinkFreeBuffers
-         * stops the worker itself, and RequestEinkRender re-allocates on
-         * demand, so a round trip just pays two mallocs. */
+         * of it until exit. EinkFreeBuffers stops the worker itself, and
+         * RequestEinkRender re-allocates on demand, so a round trip just pays
+         * two mallocs. */
         EinkFreeBuffers();
     else
         /* E-ink with the effect off: stop the worker but KEEP the ring. Toggling
