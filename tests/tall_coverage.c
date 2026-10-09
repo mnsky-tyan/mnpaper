@@ -16,8 +16,10 @@
  * to prove the boundary is real (the loop genuinely has a cap) and is not
  * silently overrun.
  *
- * All windows are created off the visible desktop and never shown (the same
- * hidden-target pattern the other suites use), and the registry is left alone
+ * The strips MakeOverlay creates carry no WS_VISIBLE and nothing here ever
+ * shows one - that structural fact, not the case rects, is what keeps the
+ * run invisible (several cases sit at {0,0} on the visible desktop); same
+ * hidden-target pattern as the other suites. The registry is left alone
  * (no settings are written). */
 #define _CRT_SECURE_NO_WARNINGS 1
 #include <windows.h>

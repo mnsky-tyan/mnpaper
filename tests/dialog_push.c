@@ -158,23 +158,27 @@ int main(void) {
         FILE *f = fopen("dialog_push_tb.log", "w");
         char buf[256];
         Check(tb != 0 && f != NULL, "TaskbarCreated registered and the log file opened");
-        if (tb && f) {
-            MSG m;
-            g_msg_taskbar = tb;
-            g_log = f;
-            PostMessageW(g_host, tb, 0, 0);
-            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&m);
-                DispatchMessageW(&m);
+        if (f) {   /* the delete below must run even on the failing path:
+                    * the run being debugged is the one that must not litter */
+            if (tb) {
+                MSG m;
+                g_msg_taskbar = tb;
+                g_log = f;
+                PostMessageW(g_host, tb, 0, 0);
+                while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+                g_log = NULL;
             }
-            g_log = NULL;
             fflush(f); fclose(f);
             f = fopen("dialog_push_tb.log", "r");
             memset(buf, 0, sizeof buf);
             if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-            DeleteFileA("dialog_push_tb.log");   /* no residue */
-            Check(strstr(buf, "TaskbarCreated") != NULL,
-                  "a TaskbarCreated message takes the re-add branch (logged in headless runs)");
+            if (tb)
+                Check(strstr(buf, "TaskbarCreated") != NULL,
+                      "a TaskbarCreated message takes the re-add branch (logged in headless runs)");
+            DeleteFileA("dialog_push_tb.log");   /* no residue, success or not */
         }
     }
 
