@@ -146,6 +146,38 @@ int main(void) {
     Check(LiveDlg() == NULL, "a destroyed dialog is dead to LiveDlg (the push's own guard)");
     DialogPushSettings(dlg);
     Check(!IsWindow(dlg), "the push left the dead dialog dead (no resurrection, no crash)");
+    /* TaskbarCreated re-add: the branch the round-11 tray fix added, until
+     * now unpinned. wWinMain never runs here, so the suite stores the same
+     * registered value the real init would (RegisterWindowMessageW returns
+     * one atom per string per session), posts the message, and asserts the
+     * branch logs - headless runs suppress the real Shell_NotifyIconW call
+     * (no tray icon may appear for a test process) but must still take the
+     * branch and say so. */
+    {
+        UINT tb = RegisterWindowMessageW(L"TaskbarCreated");
+        FILE *f = fopen("dialog_push_tb.log", "w");
+        char buf[256];
+        Check(tb != 0 && f != NULL, "TaskbarCreated registered and the log file opened");
+        if (tb && f) {
+            MSG m;
+            g_msg_taskbar = tb;
+            g_log = f;
+            PostMessageW(g_host, tb, 0, 0);
+            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            g_log = NULL;
+            fflush(f); fclose(f);
+            f = fopen("dialog_push_tb.log", "r");
+            memset(buf, 0, sizeof buf);
+            if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+            DeleteFileA("dialog_push_tb.log");   /* no residue */
+            Check(strstr(buf, "TaskbarCreated") != NULL,
+                  "a TaskbarCreated message takes the re-add branch (logged in headless runs)");
+        }
+    }
+
     DestroyWindow(g_host);
     {   /* leave no scratch behind */
         WCHAR scratch[128];

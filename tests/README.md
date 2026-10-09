@@ -189,6 +189,8 @@ rebuild and run in one go, or exclude the temp directory.
   file is deleted before the suite returns.
 - `update_help_capture.c` - the help/update UI in a real (headless) window:
   the help window's contents, the manual update path with its message box
-  intercepted by a CBT hook (both the
-  decline path and the accept path, which switches to e-ink in place), and
+  intercepted by a CBT hook (the decline path; the install-accept is
+  deliberately never driven - a download must not happen inside validation),
+  and the e-ink radio's confirmation, whose accept switches to e-ink in
+  place, and
   that the suite leaves no window visible behind it.
