@@ -409,6 +409,33 @@ int main(void) {
               !ParseVersionTriple("2.", &ma, &mi, &pa) &&
               !ParseVersionTriple("2", &ma, &mi, &pa),
               "version parse rejects garbage and incomplete feeds");
+        /* FindHash64 is the C half of the release-pin contract - the class of
+         * break that shipped 2.7.14 with every suite green - and had no
+         * direct coverage at all. A pin is a run of EXACTLY 64 hex chars: a
+         * 63-char run extracts nothing and a 65-char run refuses rather than
+         * reading its tail. */
+        {
+            static const char PIN[] = "0123456789abcdef0123456789abcdef"
+                                      "0123456789abcdef0123456789abcdef";
+            WCHAR got[68];
+            char feed[192];
+            int ok, ci;
+            Check(sizeof PIN - 1 == 64, "the fixture pin is 64 hex chars");
+            sprintf(feed, "{\"sha256\": \"%s\", \"size\": 1}", PIN);
+            ok = FindHash64(feed, got);
+            if (ok) for (ci = 0; ci < 64; ci++) if (got[ci] != (WCHAR)PIN[ci]) { ok = 0; break; }
+            Check(ok && got[64] == 0,
+                  "the feed's pin is extracted intact from the middle of a JSON-ish body");
+            strcpy(feed, PIN); strcat(feed, "\nmore");
+            Check(FindHash64(feed, got) == 1, "a pin at the very start is found (terminated by a non-hex byte)");
+            strcpy(feed, "pin="); strcat(feed, PIN);
+            Check(FindHash64(feed, got) == 1, "a pin at the very end is found (end-of-string terminator)");
+            strcpy(feed, PIN); feed[63] = 0;
+            Check(FindHash64(feed, got) == 0, "a 63-char run extracts nothing");
+            strcpy(feed, PIN); strcat(feed, "0");
+            Check(FindHash64(feed, got) == 0, "a 65-char run is rejected, not read as its first/last 64");
+            Check(FindHash64("", got) == 0, "an empty body has no pin");
+        }
         /* Deliberately NO click on 117 and no WinHTTP call in tests: the live
          * path performs a real network request and its result opens a real
          * MessageBox - both would disturb the working user. The thread flow

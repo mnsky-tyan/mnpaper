@@ -228,8 +228,13 @@ static void ApplyAutostart(void) {
     if (g_s.autostart) {
         WCHAR path[MAX_PATH];
         DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
-        if (n > 0)
+        if (n > 0 && n < MAX_PATH)
             RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)path, (n + 1) * sizeof(WCHAR));
+        else
+            /* n == MAX_PATH means GetModuleFileNameW null-truncated: writing
+             * it would create a Run entry naming a path that does not exist */
+            L("autostart: module path unusable (%lu) - Run entry not written",
+              (unsigned long)n);
         /* a transient path-read failure here must not silently disable autostart */
     } else {
         RegDeleteValueW(k, L"mnPaper");
@@ -830,6 +835,22 @@ static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
     ov->mem = CreateCompatibleDC(screen);
     SelectObject(ov->mem, ov->dib);
     ReleaseDC(NULL, screen);
+    /* The strip failure above tears down and reports; a failed DIB must too,
+     * or the monitor still counts as covered and the first texture write goes
+     * through a NULL ov->bits (ApplyPaperResult gates on hwnd, not bits) - an
+     * access violation on the UI thread instead of one untextured monitor. */
+    if (!ov->dib || !ov->mem || !ov->bits) {
+        int k;
+        if (ov->dib) DeleteObject(ov->dib);
+        if (ov->mem) DeleteDC(ov->mem);
+        ov->dib = NULL; ov->mem = NULL; ov->bits = NULL;
+        for (k = 0; k < ov->n_strips; k++) { DestroyWindow(ov->shwnd[k]); ov->shwnd[k] = NULL; }
+        ov->n_strips = 0;
+        ov->hwnd = NULL;
+        L("overlay: monitor at %ld,%ld %dx%d has no DIB - monitor left untextured",
+          ov->rc.left, ov->rc.top, ov->w, ov->h);
+        return 0;
+    }
     return 1;
 }
 
@@ -1418,8 +1439,9 @@ static void RepaintAll(void) {
     else if (g_s.mode != MODE_EINK)
         /* Leaving e-ink: release the ring buffers instead of only stopping the
          * worker. They are up to ~5 virtual-screen bitmaps (~104 MB on a
-         * 2880x1800 desktop, ~166 MB at 4K) and the GDI grab pair besides; an
-         * eink->paper switch used to pin all of it until exit. EinkFreeBuffers
+         * 2880x1800 desktop, ~166 MB at 4K), the GDI grab pair, and the whole
+         * DXGI duplication set besides; an eink->paper switch used to pin all
+         * of it until exit. EinkFreeBuffers
          * stops the worker itself, and RequestEinkRender re-allocates on
          * demand, so a round trip just pays two mallocs. */
         EinkFreeBuffers();
@@ -1505,6 +1527,7 @@ static DWORD g_dxgi_fail_at;
 static int g_rot_logged;    /* the rotated-output notice is a once-per-process line */
 static int g_cap_logged;    /* likewise for the adapter enumeration cap */
 static int g_out_cap_logged;/* likewise for the output enumeration cap */
+static int g_dupfail_logged;/* likewise: an output duplication that failed */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1560,11 +1583,19 @@ static void EinkEnsureBuffers(void) {
     L("buffers %dx%d (3 capture slots, 2 processed)", g_vsw, g_vsh);
 }
 
+static void DxgiShutdown(void);     /* defined with DxgiInit, below */
 static void EinkFreeBuffers(void) {
     EinkWorkerSet(0);           /* never free a live worker's buffers */
     EinkDropBuffers();
     { int i; for (i = 0; i < EINK_SLOTS; i++) g_ecap_state[i] = 0; }
     GdiResetGrabs();   /* the grab DC/DIB are bound to the thread that polls */
+    /* Leaving e-ink releases the capture set too: an open duplication and a
+     * desktop-sized staging texture per output would otherwise stay pinned
+     * for the rest of the session while nothing reads them. DxgiShutdown is
+     * idempotent (EinkShutdownAll may have run it already), and re-entering
+     * e-ink re-initializes in EinkTick. */
+    DxgiShutdown();
+    g_dxgi = 0;
 }
 
 static void EinkShutdownCapture(void);
@@ -1733,9 +1764,19 @@ static int DxgiInit(void) {
                     g_out[g_nout].r.top    = r.top    - g_vsy;
                     g_out[g_nout].r.right  = r.right  - g_vsx;
                     g_out[g_nout].r.bottom = r.bottom - g_vsy;
-                    if (SUCCEEDED(out1->lpVtbl->DuplicateOutput(out1, (IUnknown *)g_dev, &g_out[g_nout].dup)) &&
-                        g_out[g_nout].dup) {
+                    HRESULT dhr = out1->lpVtbl->DuplicateOutput(out1, (IUnknown *)g_dev, &g_out[g_nout].dup);
+                    if (SUCCEEDED(dhr) && g_out[g_nout].dup) {
                         g_nout++;
+                    } else if (!g_dupfail_logged) {
+                        /* The device lives on the default adapter, so every
+                         * output of a second adapter fails here; those monitors
+                         * would silently keep a seed-gray capture while the
+                         * count below reads healthy. Cross-adapter duplication
+                         * (one device per adapter) is plan-scale; the log is
+                         * the fix of its class. */
+                        g_dupfail_logged = 1;
+                        L("dxgi: an output could not be duplicated (hr 0x%08lx) - its monitor gets no live capture",
+                          (unsigned long)dhr);
                     }
                 }
                 out1->lpVtbl->Release(out1);
@@ -1949,12 +1990,14 @@ static HDC    g_gdi_dc;
 static HBITMAP g_gdi_bmp;
 static unsigned char *g_gdi_bits;   /* the DIB's pixels, written by BitBlt */
 static unsigned char *g_gdi_prev;  /* previous grab, owned by this module */
+static int g_gdi_w, g_gdi_h;       /* size the grab set was created for */
 
 static void GdiResetGrabs(void) {
     if (g_gdi_bmp) DeleteObject(g_gdi_bmp);
     if (g_gdi_dc)  DeleteDC(g_gdi_dc);
     free(g_gdi_prev);
     g_gdi_bmp = NULL; g_gdi_dc = NULL; g_gdi_bits = NULL; g_gdi_prev = NULL;
+    g_gdi_w = 0; g_gdi_h = 0;
 }
 
 static int GdiPoll(unsigned char *dst) {
@@ -1965,7 +2008,7 @@ static int GdiPoll(unsigned char *dst) {
 
     if (w <= 0 || h <= 0 || !dst) return 0;
     n = (size_t)w * h * 4;
-    if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) {
+    if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits || g_gdi_w != w || g_gdi_h != h) {
         GdiResetGrabs();
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1982,6 +2025,7 @@ static int GdiPoll(unsigned char *dst) {
         g_gdi_prev = (unsigned char *)malloc(n);
         if (!g_gdi_prev) { GdiResetGrabs(); return 0; }
         SelectObject(g_gdi_dc, g_gdi_bmp);
+        g_gdi_w = w; g_gdi_h = h;
         memset(g_gdi_prev, 0, n);   /* force the first comparison to differ */
     }
     screen = GetDC(NULL);
@@ -2021,6 +2065,7 @@ static DWORD WINAPI EinkWorker(LPVOID unused) {
     for (;;) {
         int i, pick = -1;
         unsigned char *src = NULL;
+        LONG rendered_gen;
         EnterCriticalSection(&g_ecs);
         for (i = 0; i < EINK_SLOTS; i++)
             if (g_ecap_state[i] == 1) { pick = i; break; }            /* newest */
@@ -2039,7 +2084,11 @@ static DWORD WINAPI EinkWorker(LPVOID unused) {
             continue;
         }
         /* the heavy step, outside the lock: nobody else touches the build
-         * buffer while the worker owns it */
+         * buffer while the worker owns it. Snapshot the generation first: a
+         * settings bump landing mid-render must survive the write-back, or
+         * the frame built from the old settings is published as up to date
+         * and the adjustment is lost until an unrelated capture arrives. */
+        rendered_gen = g_eset_gen;
         EinkRender(src, g_ebuild, g_vsw, g_vsh);
         EnterCriticalSection(&g_ecs);
         {   /* publish: what was the build buffer becomes the shown one */
@@ -2051,7 +2100,7 @@ static DWORD WINAPI EinkWorker(LPVOID unused) {
         for (i = 0; i < EINK_SLOTS; i++)
             if (g_ecap_state[i] == 3) g_ecap_state[i] = 0;            /* previous kept */
         if (pick >= 0) g_ecap_state[pick] = 3;                        /* keep this frame */
-        g_egen_done = g_eset_gen;
+        g_egen_done = rendered_gen;
         LeaveCriticalSection(&g_ecs);
         if (g_host) PostMessageW(g_host, WM_APP_EINK, 0, 0);
     }
@@ -2456,6 +2505,7 @@ static void OpenHelp(HWND owner) {
 static volatile LONG g_update_busy;   /* one check at a time */
 static int g_upd_manual;              /* does the pending check answer to a click? */
 static NOTIFYICONDATAW g_nid;
+static UINT g_msg_taskbar;  /* "TaskbarCreated": explorer restarts, re-add */
 
 /* Parse "[v] 3.2.1 ..." -> 1 on success. Rejects empty/garbage feeds. */
 static int ParseVersionTriple(const char *s, int *ma, int *mi, int *pa) {
@@ -3533,6 +3583,8 @@ static void TrayMenu(void) {
     GetCursorPos(&pt);
     SetForegroundWindow(g_host);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_host, NULL);
+    PostMessageW(g_host, WM_NULL, 0, 0);   /* KB135788: dismiss cleanly if the
+                                            * foreground window changed */
     DestroyMenu(sub);
     DestroyMenu(m);
 }
@@ -3540,6 +3592,12 @@ static void TrayMenu(void) {
 /* one-shot self check on a live desktop: styles, click-through, taskbar, guard */
 
 static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    /* explorer restarts destroy every tray icon; without this the app's only
+     * mouse entry point is gone for the rest of the session */
+    if (g_msg_taskbar && msg == g_msg_taskbar) {
+        Shell_NotifyIconW(NIM_ADD, &g_nid);
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE:
         return 0;
@@ -3899,7 +3957,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     g_nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpyW(g_nid.szTip, L"mnPaper");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+        /* the handler below re-adds when the shell is ready; at a logon race
+         * the shell may simply not exist yet */
+        L("tray: icon add failed (err %lu)", (unsigned long)GetLastError());
 
     if (!RegisterHotKey(g_host, HOTKEY_MASTER, MOD_CONTROL | MOD_ALT, 'P'))
         g_hotkey_failed = 1;

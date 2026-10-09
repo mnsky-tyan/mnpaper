@@ -130,7 +130,9 @@ rebuild and run in one go, or exclude the temp directory.
   METRIC lines), the final bitmap, worker preemption, close-before-timer, the
   taskbar hole cycle (hole moves/parks with no texture rebuild, master
   byte-identical - every byte), odd preview sizes, warmth/grain/fibre/blotch
-  structure, help window, update-feed parsing, and the share/mode/texture-on/
+  structure, help window, update-feed parsing (ParseVersionTriple,
+  CompareVersion and FindHash64 driven directly: pin at start/middle/end,
+  63/65-char runs refused), and the share/mode/texture-on/
   autostart controls against a PID-suffixed scratch hive.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker
@@ -183,8 +185,8 @@ rebuild and run in one go, or exclude the temp directory.
   real rather than silently overrun, and checks the shortfall is logged with the
   monitor's rect, its height and the height the strips reach. Its scratch log
   file is deleted before the suite returns.
-- `update_help_capture.c` - the update feed's version/hash parsing and the
-  help/update UI in a real (headless) window: the help window's contents, the
-  manual update path with its message box intercepted by a CBT hook (both the
+- `update_help_capture.c` - the help/update UI in a real (headless) window:
+  the help window's contents, the manual update path with its message box
+  intercepted by a CBT hook (both the
   decline path and the accept path, which switches to e-ink in place), and
   that the suite leaves no window visible behind it.
