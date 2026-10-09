@@ -170,6 +170,11 @@ rebuild and run in one go, or exclude the temp directory.
   the settings struct (sliders, checkboxes, the mode radio pair), each numeric
   readout is asserted to show its own bar's value (the label-to-bar pairing no
   other suite checks), and a destroyed dialog is refused rather than pushed to.
+  It also pins the tray's explorer-restart branch end to end: it stores the
+  real `TaskbarCreated` message value, posts it to the host window and asserts
+  the branch reports itself (headless runs suppress the real
+  `Shell_NotifyIconW` re-add, so the log line is the observable), and deletes
+  its scratch log file before the suite returns.
 - `layout_fit.c` - the settings dialog at 402x402: every caption renders in
   full at this display's scaling (ink width against a reference render), the
   design positions hold, controls do not overlap, push buttons keep their
@@ -189,6 +194,8 @@ rebuild and run in one go, or exclude the temp directory.
   file is deleted before the suite returns.
 - `update_help_capture.c` - the help/update UI in a real (headless) window:
   the help window's contents, the manual update path with its message box
-  intercepted by a CBT hook (both the
-  decline path and the accept path, which switches to e-ink in place), and
+  intercepted by a CBT hook (the decline path; the install-accept is
+  deliberately never driven - a download must not happen inside validation),
+  and the e-ink radio's confirmation, whose accept switches to e-ink in
+  place, and
   that the suite leaves no window visible behind it.

@@ -143,14 +143,14 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
 /* crash forensics: minidump for offline stack mapping */
 static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
     HANDLE f;
-    char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH - 19);
-    char *slash;
+    WCHAR path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH - 19);
+    WCHAR *slash;
     path[n] = 0;
-    slash = strrchr(path, '\\');
+    slash = wcsrchr(path, L'\\');
     if (slash) *slash = 0;
-    lstrcatA(path, "\\mnpaper-crash.dmp");
-    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+    lstrcatW(path, L"\\mnpaper-crash.dmp");
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                     FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
         MINIDUMP_EXCEPTION_INFORMATION mei;
@@ -1528,6 +1528,9 @@ static int g_rot_logged;    /* the rotated-output notice is a once-per-process l
 static int g_cap_logged;    /* likewise for the adapter enumeration cap */
 static int g_out_cap_logged;/* likewise for the output enumeration cap */
 static int g_dupfail_logged;/* likewise: an output duplication that failed */
+static int g_devfail_logged; /* likewise: the D3D11 device could not be created */
+static int g_noout_logged;   /* likewise: no output could be duplicated */
+static int g_acqfail_logged;/* likewise: a per-frame acquire keeps failing */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1549,15 +1552,11 @@ static void EinkDropBuffers(void) {
     g_eproc_a = g_eproc_b = g_eproc_show = g_ebuild = NULL;
 }
 
+static int EinkBuffersReady(void);  /* defined with EinkBuffersRestart, below */
 static void EinkEnsureBuffers(void) {
     int i;
     size_t n;
-    if (g_ecap[0] && g_eproc_show) {
-        /* size may have changed */
-        int vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        if (vsw == g_vsw && vsh == g_vsh) return;
-    }
+    if (EinkBuffersReady()) return;   /* ring present AND desktop rect current */
     g_eproc_valid = 0;      /* rebuilding: nothing publishable until the
                              * worker's next frame lands */
     EinkDropBuffers();
@@ -1703,7 +1702,7 @@ static int DxgiInit(void) {
         return 0;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
                                  D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx)) || !g_dev) {
-        L("d3d11 device failed");
+        if (!g_devfail_logged) { g_devfail_logged = 1; L("d3d11 device failed"); }
         factory->lpVtbl->Release(factory);
         DxgiShutdown();
         return 0;
@@ -1810,7 +1809,10 @@ static int DxgiInit(void) {
     }
     factory->lpVtbl->Release(factory);
     if (g_nout == 0) {
-        L("dxgi: no duplication outputs");
+        /* the 2 s retry re-runs DxgiInit forever on machines without
+         * duplication (RDP, some VMs): say it once, like the other
+         * retry-cycle lines in this family */
+        if (!g_noout_logged) { g_noout_logged = 1; L("dxgi: no duplication outputs"); }
         DxgiShutdown();
     } else {
         L("dxgi: %d duplication output(s)", g_nout);
@@ -1880,7 +1882,15 @@ static int DxgiPoll(unsigned char *dst) {
             EinkShutdownCapture();
             return 0;
         }
-        if (FAILED(hr)) { if (res) res->lpVtbl->Release(res); continue; }
+        if (FAILED(hr)) {
+            if (!g_acqfail_logged) {
+                g_acqfail_logged = 1;
+                L("dxgi: AcquireNextFrame failed 0x%08lx - that monitor stops refreshing",
+                  (unsigned long)hr);
+            }
+            if (res) res->lpVtbl->Release(res);
+            continue;
+        }
 
         if (FAILED(res->lpVtbl->QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex)) || !tex) {
             res->lpVtbl->Release(res);
@@ -2047,7 +2057,14 @@ static int GdiPoll(unsigned char *dst) {
  * only (re)allocated with the worker stopped, so every call site that can
  * change the buffer set goes through EinkBuffersRestart below. */
 static int EinkBuffersReady(void) {
-    return g_ecap[0] && g_eproc_show && g_vsw == GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    /* The origin is load-bearing: PresentEinkRect, DxgiInit and GdiPoll all
+     * map through g_vsx/g_vsy, so a desktop rearrangement that moved the
+     * top-left corner without changing the size would otherwise leave the
+     * e-ink desktop showing where the monitors used to be. */
+    return g_ecap[0] && g_eproc_show
+        && g_vsx == GetSystemMetrics(SM_XVIRTUALSCREEN)
+        && g_vsy == GetSystemMetrics(SM_YVIRTUALSCREEN)
+        && g_vsw == GetSystemMetrics(SM_CXVIRTUALSCREEN)
         && g_vsh == GetSystemMetrics(SM_CYVIRTUALSCREEN);
 }
 
@@ -2954,7 +2971,7 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
     sf = CreateFileW(cmdf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                      FILE_ATTRIBUTE_NORMAL, NULL);
     if (sf == INVALID_HANDLE_VALUE) return 0;
-    if (!WriteFile(sf, ansi, (DWORD)n - 1, &wrote, NULL)) {
+    if (!WriteFile(sf, ansi, (DWORD)n - 1, &wrote, NULL) || wrote != (DWORD)n - 1) {
         CloseHandle(sf);
         return 0;
     }
@@ -3574,8 +3591,9 @@ static void TrayMenu(void) {
     AppendMenuW(m, MF_STRING | (g_s.mode == MODE_PAPER ? MF_CHECKED : 0), IDM_PAPER, L"Paper texture");
     AppendMenuW(m, MF_STRING | (g_s.mode == MODE_EINK  ? MF_CHECKED : 0), IDM_EINK,  L"E-ink");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (g_s.share ? MF_CHECKED : 0), IDM_SHARE,
-                L"Texture in shares/screenshots");
+    AppendMenuW(m, MF_STRING | (g_s.share ? MF_CHECKED : 0)
+                     | (g_s.mode == MODE_EINK ? MF_GRAYED : 0), IDM_SHARE,
+                L"Texture in shares/screenshots");   /* e-ink always hides: match the dialog */
     AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"Settings...");
     AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_STRING | (g_s.autoupd ? MF_CHECKED : 0), IDM_AUTOUPD,
@@ -3597,7 +3615,11 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     /* explorer restarts destroy every tray icon; without this the app's only
      * mouse entry point is gone for the rest of the session */
     if (g_msg_taskbar && msg == g_msg_taskbar) {
-        Shell_NotifyIconW(NIM_ADD, &g_nid);
+        if (g_test_headless)
+            L("tray: TaskbarCreated re-add suppressed in headless tests");
+        else if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+            L("tray: icon re-add after explorer restart failed (err %lu)",
+              (unsigned long)GetLastError());
         return 0;
     }
     switch (msg) {
@@ -3801,6 +3823,13 @@ static void ApplySets(SETTINGS *s) {
 static int SendToRunning(void) {
     HWND h = FindWindowW(L"MnPaperHost", NULL);
     COPYDATASTRUCT cd;
+    int tries;
+    /* the first instance creates its mutex before its host window, so an
+     * immediate command can land in that gap: poll briefly before giving up */
+    for (tries = 0; !h && tries < 8; tries++) {
+        Sleep(150);
+        h = FindWindowW(L"MnPaperHost", NULL);
+    }
     if (!h) {
         L("send: host window not found");
         return 0;
@@ -3917,7 +3946,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
             g_cli_settings = g_s;
             ApplySets(&g_cli_settings);
         }
-        SendToRunning();
+        if (!SendToRunning()) {
+            L("send: command not delivered");
+            if (g_log) fclose(g_log);
+            return 2;   /* nonzero: the caller's command was dropped */
+        }
         if (g_log) fclose(g_log);
         return 0;
     }
@@ -3965,9 +3998,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
          * the shell may simply not exist yet */
         L("tray: icon add failed (err %lu)", (unsigned long)GetLastError());
 
-    if (!RegisterHotKey(g_host, HOTKEY_MASTER, MOD_CONTROL | MOD_ALT, 'P'))
+    if (!RegisterHotKey(g_host, HOTKEY_MASTER, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P'))
         g_hotkey_failed = 1;
-    if (!RegisterHotKey(g_host, HOTKEY_EINK, MOD_CONTROL | MOD_ALT, 'E'))
+    if (!RegisterHotKey(g_host, HOTKEY_EINK, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'E'))
         g_hotkey_failed = 1;
     if (g_hotkey_failed)
         L("hotkey registration failed (another app owns it?)");
