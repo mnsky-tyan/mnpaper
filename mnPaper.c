@@ -1465,6 +1465,8 @@ static void RepaintAll(void) {
 /* ----------------------------------------------------------------- e-ink --- */
 
 #define MAX_OUT 8
+#define MAX_DXGI_ADAPTERS 8   /* the adapter array bound: keep the cap check, the
+                               * probe index and the log on this one constant */
 
 typedef struct {
     IDXGIOutputDuplication *dup;
@@ -1531,6 +1533,9 @@ static int g_dupfail_logged;/* likewise: an output duplication that failed */
 static int g_devfail_logged; /* likewise: the D3D11 device could not be created */
 static int g_noout_logged;   /* likewise: no output could be duplicated */
 static int g_acqfail_logged;/* likewise: a per-frame acquire keeps failing */
+static int g_badfmt_logged; /* likewise: an unsupported desktop format */
+static int g_fallback_logged;/* likewise: the GDI fallback's reason line */
+static int g_recover_logged;/* likewise: duplication recovered after GDI */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1694,7 +1699,7 @@ static void EinkShutdownCapture(void) {
 
 static int DxgiInit(void) {
     IDXGIFactory1 *factory = NULL;
-    IDXGIAdapter1 *adapters[8];
+    IDXGIAdapter1 *adapters[MAX_DXGI_ADAPTERS];
     int nadapt = 0, a, o;
 
     g_dxgi_fail_at = GetTickCount();
@@ -1707,22 +1712,24 @@ static int DxgiInit(void) {
         DxgiShutdown();
         return 0;
     }
-    for (a = 0; a < 8; a++) {
+    for (a = 0; a < MAX_DXGI_ADAPTERS; a++) {
         HRESULT hr = factory->lpVtbl->EnumAdapters1(factory, a, &adapters[a]);
         if (hr == DXGI_ERROR_NOT_FOUND) break;
         if (FAILED(hr)) break;
         nadapt++;
     }
-    if (nadapt == 8) {
-        /* nadapt == 8 only says eight adapters enumerated; a ninth may or may
-         * not exist, so probe one past the cap before claiming anything was
-         * dropped. Once per process: the 2 s retry would otherwise re-log. */
+    if (nadapt == MAX_DXGI_ADAPTERS) {
+        /* nadapt == MAX only says that many adapters enumerated; a further
+         * one may or may not exist, so probe one past the cap before claiming
+         * anything was dropped. Once per process: the 2 s retry would
+         * otherwise re-log. */
         IDXGIAdapter1 *extra = NULL;
-        HRESULT xhr = factory->lpVtbl->EnumAdapters1(factory, 8, &extra);
+        HRESULT xhr = factory->lpVtbl->EnumAdapters1(factory, MAX_DXGI_ADAPTERS, &extra);
         if (xhr == S_OK && extra) {
             if (!g_cap_logged) {
                 g_cap_logged = 1;
-                L("dxgi: stopped at 8 adapters - outputs on a further adapter are never duplicated");
+                L("dxgi: stopped at %d adapters - outputs on a further adapter are never duplicated",
+                  MAX_DXGI_ADAPTERS);
             }
             extra->lpVtbl->Release(extra);
         }
@@ -1909,8 +1916,13 @@ static int DxgiPoll(unsigned char *dst) {
                  * output goes stale - log it once so it is not silent */
                 if (!g_out[i].badfmt) {
                     g_out[i].badfmt = 1;
-                    L("dxgi: output %d desktop format %d unsupported, output not refreshed",
-                      i, (int)td.Format);
+                    /* per-struct: reset by every DxgiInit's memset, so the
+                     * retry cycle would re-log - the process latch stops that */
+                    if (!g_badfmt_logged) {
+                        g_badfmt_logged = 1;
+                        L("dxgi: output %d desktop format %d unsupported, output not refreshed",
+                          i, (int)td.Format);
+                    }
                 }
                 tex->lpVtbl->Release(tex);
                 g_out[i].dup->lpVtbl->ReleaseFrame(g_out[i].dup);
@@ -2069,12 +2081,28 @@ static int EinkBuffersReady(void) {
 }
 
 static void EinkBuffersRestart(void) {
+    static DWORD retry_at;      /* a failed allocate is retried at 1 Hz, not 20 Hz */
+    static int last_want = -1;
+    int had_ring = (g_ecap[0] != NULL);
     int want;
+    DWORD now = GetTickCount();
+    if (!had_ring && now < retry_at) return;   /* nothing changed since the last failure */
     EinkWorkerSet(0);
     EinkEnsureBuffers();
+    if (had_ring)
+        /* The ring was just re-anchored to fresh desktop metrics, but
+         * DxgiInit mapped every g_out[i].r against the OLD origin: without
+         * re-init, a geometry change that never delivered WM_DISPLAYCHANGE
+         * leaves DXGI frames landing in the wrong slot regions (the GDI grab
+         * re-derives its own origin). EinkTick re-inits within a tick. */
+        EinkShutdownCapture();
+    if (!g_ecap[0]) retry_at = now + 1000;
     want = (g_ecap[0] && g_eproc_show && g_s.master && g_s.mode == MODE_EINK);
     EinkWorkerSet(want);
-    L("eink buffers %s (worker=%d)", want ? "armed" : "idle", g_ework ? 1 : 0);
+    if (want != last_want) {   /* a persistent not-ready state ticks at 20 Hz: say it once */
+        L("eink buffers %s (worker=%d)", want ? "armed" : "idle", g_ework ? 1 : 0);
+        last_want = want;
+    }
 }
 
 /* ------------------------------- e-ink worker thread --------------------- */
@@ -2214,7 +2242,10 @@ static void EinkFallBackToGdi(unsigned char *dst, int retry, const char *why) {
     EinkShutdownCapture();
     g_gdi_only = 1;
     g_dxgi_fail_at = GetTickCount();
-    if (why) L("eink: %s", why);
+    if (why && !g_fallback_logged) {
+        g_fallback_logged = 1;
+        L("eink: %s", why);
+    }
 }
 
 static void EinkTick(void) {
@@ -2231,8 +2262,10 @@ static void EinkTick(void) {
                     g_dxgi = 1;
                     g_gdi_only = 0;
                     g_dxgi_retry = 1;
-                    L("eink: duplication recovered");
-                } else {
+                    if (!g_recover_logged) {
+                        g_recover_logged = 1;
+                        L("eink: duplication recovered");
+                    }                } else {
                     g_dxgi_fail_at = GetTickCount();
                 }
             }
@@ -2276,7 +2309,8 @@ static void EinkTick(void) {
             /* Every output has an unsupported desktop format, so DXGI will
              * never produce a frame. The GDI grab returns the composed desktop
              * (rotation already applied by Windows), so fall back to it
-             * instead of letting e-ink freeze on the last frame. */
+             * instead of letting e-ink freeze on the last frame. Retryable is
+             * 1 here by construction: any rotated output was handled above. */
             EinkFallBackToGdi(dst, DxgiRetryable(),
                               "no usable duplication output, GDI fallback");
             return;
@@ -3012,8 +3046,13 @@ static void InstallResult(InstInfo *in) {
     DWORD len, wrote;
     HANDLE f;
     HWND owner = LiveDlg();
+    DWORD exe_len;
     if (!in) return;
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    exe_len = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (exe_len == 0 || exe_len >= MAX_PATH)
+        /* same null-truncation rule as ApplyAutostart: a truncated path does
+         * not name this exe, so the swap must not touch whatever it does name */
+        return;
     if (in->result == UPD_DL_MISMATCH) {
         free(in->buf);
         free(in);
@@ -3088,11 +3127,14 @@ static void InstallResult(InstInfo *in) {
             L"try again in a moment, or download manually from the releases page.");
         return;
     }
-    if (!RelaunchAfterSwap(exe))
+    if (!RelaunchAfterSwap(exe)) {
         UpdNote(owner, L"mnPaper - update",
             L"The update is installed, but mnPaper could not start itself again.\n"
             L"Please start mnPaper from your shortcut or the Start menu.");
-    L("self-update: swapped and relaunching");
+        L("self-update: swapped, but the relaunch failed");
+    } else {
+        L("self-update: swapped and relaunching");
+    }
     { HWND dlg = LiveDlg(); if (dlg) DestroyWindow(dlg); }
     DestroyWindow(g_host);   /* clean shutdown: SaveSettings, tray removal */
 }
@@ -3480,6 +3522,7 @@ static void FitClient(HWND h, int cw, int ch) {
 static void OpenSettings(void) {
     RECT rc;
     WNDCLASSEXW wc;
+    if (g_test_headless) return;   /* the gate's contract: no window on the working desktop */
     L("open settings");
     {
         HWND have = LiveDlg();   /* ask rather than assume: the dialog can die between ticks */
@@ -3676,7 +3719,10 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COPYDATA: {
         COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
         if (cd && cd->dwData == CMD_SYNC && cd->cbData == sizeof(SETTINGS)) {
+            int own_autostart = g_s.autostart;   /* derived from THIS exe's path
+             * against the Run key; a sender at another path cannot know it */
             g_s = *(SETTINGS *)cd->lpData;
+            if (g_s.autostart < 0) g_s.autostart = own_autostart;
             ClampSettings();
             SaveSettings();
             if (g_s.mode == MODE_EINK)
@@ -3824,6 +3870,7 @@ static int SendToRunning(void) {
     HWND h = FindWindowW(L"MnPaperHost", NULL);
     COPYDATASTRUCT cd;
     int tries;
+    int ok = 1;
     /* the first instance creates its mutex before its host window, so an
      * immediate command can land in that gap: poll briefly before giving up */
     for (tries = 0; !h && tries < 8; tries++) {
@@ -3839,11 +3886,13 @@ static int SendToRunning(void) {
         cd.dwData = CMD_SYNC;
         cd.cbData = sizeof(SETTINGS);
         cd.lpData = &g_cli_settings;
-        SendMessageW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd);
+        if (!SendMessageW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd))
+            ok = 0;   /* the handler returns TRUE only when it processed us */
     }
     if (g_cmd)
-        PostMessageW(h, WM_APP_CMD, (WPARAM)g_cmd, 0);
-    return 1;
+        if (!PostMessageW(h, WM_APP_CMD, (WPARAM)g_cmd, 0))
+            ok = 0;
+    return ok;
 }
 
 /* ---------------------------------------------------------------- main --- */
@@ -3943,8 +3992,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         LoadSettings();                       /* registry mirrors the live app */
         if (g_nsets) {
+            int i, autoset = 0;
             g_cli_settings = g_s;
             ApplySets(&g_cli_settings);
+            /* autostart is path-derived on whichever exe reads the registry:
+             * a sender at another path cannot know the installed copy's truth,
+             * so it is only sent when explicitly requested (-1 = keep ours) */
+            for (i = 0; i < g_nsets; i++)
+                if (_wcsnicmp(g_sets[i], L"autostart=", 10) == 0) autoset = 1;
+            if (!autoset)
+                g_cli_settings.autostart = -1;
         }
         if (!SendToRunning()) {
             L("send: command not delivered");
