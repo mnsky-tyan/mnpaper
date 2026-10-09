@@ -170,13 +170,14 @@ int main(void) {
                     DispatchMessageW(&m);
                 }
                 g_log = NULL;
-                fflush(f); fclose(f);
-                f = fopen("dialog_push_tb.log", "r");
-                memset(buf, 0, sizeof buf);
-                if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+            }
+            fflush(f); fclose(f);
+            f = fopen("dialog_push_tb.log", "r");
+            memset(buf, 0, sizeof buf);
+            if (f) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+            if (tb)
                 Check(strstr(buf, "TaskbarCreated") != NULL,
                       "a TaskbarCreated message takes the re-add branch (logged in headless runs)");
-            }
             DeleteFileA("dialog_push_tb.log");   /* no residue, success or not */
         }
     }

@@ -2084,17 +2084,21 @@ static void EinkBuffersRestart(void) {
     static DWORD retry_at;      /* a failed allocate is retried at 1 Hz, not 20 Hz */
     static int last_want = -1;
     int had_ring = (g_ecap[0] != NULL);
+    int was_ready = EinkBuffersReady();
     int want;
     DWORD now = GetTickCount();
     if (!had_ring && now < retry_at) return;   /* nothing changed since the last failure */
     EinkWorkerSet(0);
     EinkEnsureBuffers();
-    if (had_ring)
+    if (g_dxgi && !was_ready)
         /* The ring was just re-anchored to fresh desktop metrics, but
          * DxgiInit mapped every g_out[i].r against the OLD origin: without
          * re-init, a geometry change that never delivered WM_DISPLAYCHANGE
          * leaves DXGI frames landing in the wrong slot regions (the GDI grab
-         * re-derives its own origin). EinkTick re-inits within a tick. */
+         * re-derives its own origin). Keyed on the rebuild, not on the ring's
+         * prior presence: a ring absent while capture is live still leaves
+         * stale rects behind when it is finally built. EinkTick re-inits
+         * within a tick. */
         EinkShutdownCapture();
     if (!g_ecap[0]) retry_at = now + 1000;
     want = (g_ecap[0] && g_eproc_show && g_s.master && g_s.mode == MODE_EINK);
@@ -3049,10 +3053,16 @@ static void InstallResult(InstInfo *in) {
     DWORD exe_len;
     if (!in) return;
     exe_len = GetModuleFileNameW(NULL, exe, MAX_PATH);
-    if (exe_len == 0 || exe_len >= MAX_PATH)
+    if (exe_len == 0 || exe_len >= MAX_PATH) {
         /* same null-truncation rule as ApplyAutostart: a truncated path does
          * not name this exe, so the swap must not touch whatever it does name */
+        free(in->buf);
+        free(in);
+        UpdNote(owner, L"mnPaper - update",
+            L"The update could not be applied. Nothing was changed - "
+            L"download manually from the releases page.");
         return;
+    }
     if (in->result == UPD_DL_MISMATCH) {
         free(in->buf);
         free(in);
@@ -3811,6 +3821,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 static int  g_cmd;
 static int  g_has_set;
+static int  g_autostart_set;   /* the last ApplySets parsed an autostart entry */
 static SETTINGS g_cli_settings;
 
 static WCHAR g_sets[16][80];
@@ -3845,7 +3856,7 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
     else if (!_wcsicmp(key, L"contrast")) s->contrast = v;
     else if (!_wcsicmp(key, L"dither")) s->dither = v;
     else if (!_wcsicmp(key, L"mode")) s->mode = v ? MODE_EINK : MODE_PAPER;
-    else if (!_wcsicmp(key, L"autostart")) s->autostart = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"autostart")) { s->autostart = v ? 1 : 0; g_autostart_set = 1; }
     else if (!_wcsicmp(key, L"share")) s->share = v ? 1 : 0;
     else if (!_wcsicmp(key, L"autoupd")) s->autoupd = v ? 1 : 0;
     else if (!_wcsicmp(key, L"master")) s->master = v ? 1 : 0;
@@ -3856,6 +3867,7 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
 
 static void ApplySets(SETTINGS *s) {
     int i;
+    g_autostart_set = 0;
     for (i = 0; i < g_nsets; i++) {
         WCHAR buf[80];
         wcsncpy(buf, g_sets[i], 79);
@@ -3992,15 +4004,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         LoadSettings();                       /* registry mirrors the live app */
         if (g_nsets) {
-            int i, autoset = 0;
             g_cli_settings = g_s;
             ApplySets(&g_cli_settings);
             /* autostart is path-derived on whichever exe reads the registry:
              * a sender at another path cannot know the installed copy's truth,
-             * so it is only sent when explicitly requested (-1 = keep ours) */
-            for (i = 0; i < g_nsets; i++)
-                if (_wcsnicmp(g_sets[i], L"autostart=", 10) == 0) autoset = 1;
-            if (!autoset)
+             * so it is only sent when an entry actually parsed (-1 = keep ours) */
+            if (!g_autostart_set)
                 g_cli_settings.autostart = -1;
         }
         if (!SendToRunning()) {
