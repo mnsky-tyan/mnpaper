@@ -46,7 +46,8 @@ Covered:
   created but never shown, re-click reuses it, closing clears it.
 - Version parsing/comparison for the update check as pure functions, plus
   button 117 existence. The live WinHTTP check is deliberately NOT exercised
-  in tests (real network + a real MessageBox would disturb the working user).
+  in standard test builds (real network + a real MessageBox would disturb the
+  working user; only an optional /DMN_VAL_NETWORK build opts in).
 - Preview structure metrics: grain measured with fibre and blotch off keeps
   alpha-std above 2 over the whole trackbar range (grain 2-12), and its
   pixel-level detail falls as the grain coarsens - the full build does the
@@ -74,8 +75,9 @@ Build it in a debug configuration to enable the heap-leak assertions
 cl /nologo /Od /W3 /D_DEBUG /MDd tests\update_help_capture.c /Fetests\update_help_capture.exe
 ```
 
-The live WinHTTP check is still deliberately NOT clicked by either test: it
-performs a real network request and its result opens a real box.
+The live WinHTTP check is still deliberately NOT clicked by either test in
+standard builds: it performs a real network request and its result opens a real
+box (an opt-in /DMN_VAL_NETWORK build is documented in update_help_capture.c).
 
 Before the repair, the same slider regression recorded a 2469ms first update,
 one frame, a lost final request and an incorrect final bitmap. The repaired

@@ -219,6 +219,23 @@ static void ClampSettings(void) {
     ClampSettingsOf(&g_s);
 }
 
+static int RunEntryMatchesExe(const WCHAR *entry, const WCHAR *exe) {
+    if (_wcsicmp(entry, exe) == 0) return 1;
+    if (entry[0] == L'"') {
+        int len = lstrlenW(entry);
+        if (len >= 2 && entry[len - 1] == L'"') {
+            WCHAR unq[MAX_PATH];
+            int n = len - 2;
+            if (n < MAX_PATH) {
+                wcsncpy(unq, entry + 1, n);
+                unq[n] = 0;
+                if (_wcsicmp(unq, exe) == 0) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void ApplyAutostart(void) {
     HKEY k;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, g_run_key, 0, NULL, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) {
@@ -226,11 +243,13 @@ static void ApplyAutostart(void) {
         return;
     }
     if (g_s.autostart) {
-        WCHAR path[MAX_PATH];
+        WCHAR path[MAX_PATH], qpath[MAX_PATH + 4];
         DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
-        if (n > 0 && n < MAX_PATH)
-            RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)path, (n + 1) * sizeof(WCHAR));
-        else
+        if (n > 0 && n < MAX_PATH) {
+            _snwprintf(qpath, MAX_PATH + 4, L"\"%s\"", path);
+            RegSetValueExW(k, L"mnPaper", 0, REG_SZ, (BYTE *)qpath,
+                           (DWORD)((lstrlenW(qpath) + 1) * sizeof(WCHAR)));
+        } else
             /* n == MAX_PATH means GetModuleFileNameW null-truncated: writing
              * it would create a Run entry naming a path that does not exist */
             L("autostart: module path unusable (%lu) - Run entry not written",
@@ -250,7 +269,7 @@ static void ApplyAutostart(void) {
          * older build */
         if (n > 0 && n < MAX_PATH &&
             (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) != ERROR_SUCCESS ||
-             t != REG_SZ || _wcsicmp(path, mine) == 0))
+             t != REG_SZ || RunEntryMatchesExe(path, mine)))
             RegDeleteValueW(k, L"mnPaper");
     }
     RegCloseKey(k);
@@ -317,7 +336,7 @@ static void LoadSettings(void) {
         DWORD sz = sizeof(path), t = 0;
         if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
             DWORD n = GetModuleFileNameW(NULL, mine, MAX_PATH);
-            if (n > 0 && n < MAX_PATH && _wcsicmp(path, mine) == 0) g_s.autostart = 1;
+            if (n > 0 && n < MAX_PATH && RunEntryMatchesExe(path, mine)) g_s.autostart = 1;
             else g_s.autostart = 0;
         }
         RegCloseKey(k);
