@@ -3086,8 +3086,8 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
 }
 
 /* A path that has to live inside a batch file, or on a cmd command line,
- * must round-trip through the active code page: the file holds ANSI bytes
- * and an unrepresentable character is silently written as '?'. */
+ * must round-trip through the active OEM code page: the file holds OEM bytes
+ * matching cmd.exe and an unrepresentable character is silently written as '?'. */
 static int BatchSafePath(const WCHAR *p) {
     char a[2 * MAX_PATH + 2];
     WCHAR back[MAX_PATH + 2];
@@ -3120,7 +3120,7 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
         !BatchSafePath(exe8)) {
         /* On volumes where 8.3 alias generation is disabled (the default on
          * non-system volumes), GetShortPathNameW fails. Fall back to the plain
-         * path if it is already safe for batch (.cmd ANSI round-trip). */
+         * path if it is already safe for batch (.cmd OEM round-trip). */
         if (!BatchSafePath(exe)) return 0;
         lstrcpynW(exe8, exe, MAX_PATH);
     }

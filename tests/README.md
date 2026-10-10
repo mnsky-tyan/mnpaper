@@ -40,10 +40,12 @@ Covered:
 - The Start-with-Windows checkbox (id 119) persists autostart and drives the
   isolated Run key via ApplyAutostart: checking it gains the mnPaper entry,
   unchecking removes it only when that entry names this exe (an entry naming
-  a copy at another path is left in place) - the real HKCU Run key is never
-  touched.
+  a copy at another path is left in place; expandable environment-variable
+  entries naming this exe are expanded and matched) - the real HKCU Run key is
+  never touched.
 - The ? button (id 116) opens one shared help window; in headless mode it is
-  created but never shown, re-click reuses it, closing clears it.
+  created but never shown, re-click reuses and restores it if minimized,
+  closing clears it.
 - Version parsing/comparison for the update check as pure functions, plus
   button 117 existence. The live WinHTTP check is deliberately NOT exercised
   in standard test builds (real network + a real MessageBox would disturb the
