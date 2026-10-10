@@ -540,10 +540,11 @@ int main(void) {
         Pump(50);
         Check(g_s.autostart == 1, "checking Start with Windows persists autostart=1");
         if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &key) == ERROR_SUCCESS) {
-            WCHAR path[MAX_PATH] = L"";
+            WCHAR path[MAX_PATH + 4] = L"";
             sz = sizeof path;
-            Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS,
-                  "Run key carries the mnPaper entry when autostart is on");
+            Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS &&
+                  path[0] == L'"',
+                  "Run key carries the quoted mnPaper entry when autostart is on");
             RegCloseKey(key);
         } else Check(0, "scratch Run key exists when autostart is on");
         SendMessageW(GetDlgItem(g_dlg, 119), BM_SETCHECK, BST_UNCHECKED, 0);
@@ -571,13 +572,23 @@ int main(void) {
                   _wcsicmp(seen, foreign) == 0,
                   "a copy at another path leaves a foreign Run entry in place");
             GetModuleFileNameW(NULL, mine, MAX_PATH);
-            RegSetValueExW(key, L"mnPaper", 0, REG_SZ, (BYTE *)mine,
-                           (DWORD)((lstrlenW(mine) + 1) * sizeof(WCHAR)));
+            WCHAR qmine[MAX_PATH + 4];
+            _snwprintf(qmine, MAX_PATH + 4, L"\"%s\"", mine);
+            RegSetValueExW(key, L"mnPaper", 0, REG_SZ, (BYTE *)qmine,
+                           (DWORD)((lstrlenW(qmine) + 1) * sizeof(WCHAR)));
             g_s.autostart = 0;
             SaveSettings();
             sz = sizeof seen;
             Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, NULL, &sz) != ERROR_SUCCESS,
-                  "an entry naming this exe is removed when autostart is off");
+                  "a quoted entry naming this exe is removed when autostart is off");
+            /* Expandable environment-variable entries naming this exe are also matched */
+            RegSetValueExW(key, L"mnPaper", 0, REG_EXPAND_SZ, (BYTE *)qmine,
+                           (DWORD)((lstrlenW(qmine) + 1) * sizeof(WCHAR)));
+            g_s.autostart = 0;
+            SaveSettings();
+            sz = sizeof seen;
+            Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, NULL, &sz) != ERROR_SUCCESS,
+                  "an expandable entry naming this exe is removed when autostart is off");
             RegCloseKey(key);
         } else Check(0, "scratch Run key writable for the ownership check");
         g_s.master = saved_master; g_s.autostart = saved_auto;

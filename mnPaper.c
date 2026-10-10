@@ -220,6 +220,11 @@ static void ClampSettings(void) {
 }
 
 static int RunEntryMatchesExe(const WCHAR *entry, const WCHAR *exe) {
+    WCHAR exp[MAX_PATH + 4];
+    if (wcschr(entry, L'%')) {
+        DWORD n = ExpandEnvironmentStringsW(entry, exp, MAX_PATH + 4);
+        if (n > 0 && n < MAX_PATH + 4) entry = exp;
+    }
     if (_wcsicmp(entry, exe) == 0) return 1;
     if (entry[0] == L'"') {
         int len = lstrlenW(entry);
