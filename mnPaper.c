@@ -316,8 +316,8 @@ static void LoadSettings(void) {
         WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
         DWORD sz = sizeof(path), t = 0;
         if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
-            GetModuleFileNameW(NULL, mine, MAX_PATH);
-            if (_wcsicmp(path, mine) == 0) g_s.autostart = 1;
+            DWORD n = GetModuleFileNameW(NULL, mine, MAX_PATH);
+            if (n > 0 && n < MAX_PATH && _wcsicmp(path, mine) == 0) g_s.autostart = 1;
             else g_s.autostart = 0;
         }
         RegCloseKey(k);
@@ -1552,6 +1552,8 @@ static int g_badfmt_logged; /* likewise: an unsupported desktop format */
 static int g_fallback_logged;/* likewise: the GDI fallback's reason line */
 static int g_recover_logged;/* likewise: duplication recovered after GDI */
 static int g_init_logged;   /* likewise: the first successful duplication init */
+static int g_live_logged;   /* likewise: e-ink duplication live banner */
+static int g_eworkfail_logged;/* likewise: eink worker creation failure */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -2113,7 +2115,6 @@ static int EinkRingBackoff(void) {
 
 static void EinkBuffersRestart(void) {
     static int last_want = -1;
-    int had_ring = (g_ecap[0] != NULL);
     int was_ready = EinkBuffersReady();
     int want;
     DWORD now = GetTickCount();
@@ -2194,11 +2195,14 @@ static void EinkWorkerSet(int want) {
         if (!g_ecs_ready) { InitializeCriticalSection(&g_ecs); g_ecs_ready = 1; }
         InterlockedExchange(&g_estop, 0);
         g_ewake = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!g_ewake) { L("eink worker wake event failed: %lu", GetLastError()); return; }
+        if (!g_ewake) {
+            if (!g_eworkfail_logged) { g_eworkfail_logged = 1; L("eink worker wake event failed: %lu", GetLastError()); }
+            return;
+        }
         g_ework = CreateThread(NULL, 0, EinkWorker, NULL, 0, NULL);
         if (!g_ework) {
             CloseHandle(g_ewake); g_ewake = NULL;
-            L("eink worker thread failed: %lu", GetLastError());
+            if (!g_eworkfail_logged) { g_eworkfail_logged = 1; L("eink worker thread failed: %lu", GetLastError()); }
             return;
         }
         return;
@@ -2304,6 +2308,9 @@ static void EinkTick(void) {
     static int nf;
 
     if (!g_s.master || g_s.mode != MODE_EINK) { EinkWorkerSet(0); return; }
+    /* Buffers must be allocated and ready before capture is stood up; if buffer
+     * allocation fails or is backing off, return before touching DXGI. */
+    if (!EinkBuffersReady()) { EinkBuffersRestart(); return; }
     if (g_dxgi == 0) {
         if (g_gdi_only) {
             /* retry duplication occasionally in case the reason is gone */
@@ -2320,16 +2327,11 @@ static void EinkTick(void) {
                     g_dxgi_fail_at = GetTickCount();
                 }
             }
-        } else if (EinkRingBackoff()) {
-            /* the ring failed to allocate and is backing off: standing up
-             * duplication now would pair with the re-anchor shutdown in
-             * EinkBuffersRestart into a 1 Hz full create/destroy cycle with
-             * its own log flood - wait for the window to expire */
         } else if (DxgiInit()) {
             g_dxgi = 1;
             g_dxgi_retry = 1;
-            if (!g_init_logged) {
-                g_init_logged = 1;
+            if (!g_live_logged) {
+                g_live_logged = 1;
                 L("eink: dxgi duplication live");
             }
         } else {
@@ -2339,7 +2341,6 @@ static void EinkTick(void) {
             return;
         }
     }
-    if (!EinkBuffersReady()) { EinkBuffersRestart(); return; }
     {
         static int rect_tick;
         if (++rect_tick >= 64) {   /* ~3 s: g_out[].r is mapped once at init, so a
@@ -2786,11 +2787,16 @@ static int HttpGetToMem(const WCHAR *url, DWORD max_bytes, DWORD recv_ms,
         if (!WinHttpReadData(req, buf + total, got, &got)) goto done;
         total += got;
     }
-    /* A body that filled the cap exactly is complete and legitimate - the loop
-     * above stops the moment total reaches max_bytes. Only a body with bytes
-     * still to read is over the cap, and that case is refused inside the loop.
-     * The old `total >= max_bytes` check here counted a body of exactly the cap
-     * as oversized and threw away a good download. */
+    if (total == max_bytes) {
+        DWORD remaining = 0;
+        if (WinHttpQueryDataAvailable(req, &remaining) && remaining > 0) {
+            if (too_big) *too_big = 1;
+            goto done;
+        }
+    }
+    /* A body that filled the cap exactly and has no more pending data is
+     * complete and legitimate. The old `total >= max_bytes` check here counted
+     * a body of exactly the cap as oversized and threw away a good download. */
     if (buf && total) {
         *out_buf = buf;
         *out_len = total;
@@ -3064,8 +3070,13 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     if (!GetShortPathNameW(exe, exe8, MAX_PATH) || !exe8[0] ||
-        !BatchSafePath(exe8))
-        return 0;
+        !BatchSafePath(exe8)) {
+        /* On volumes where 8.3 alias generation is disabled (the default on
+         * non-system volumes), GetShortPathNameW fails. Fall back to the plain
+         * path if it is already safe for batch (.cmd ANSI round-trip). */
+        if (!BatchSafePath(exe)) return 0;
+        lstrcpynW(exe8, exe, MAX_PATH);
+    }
     if (!GetTempPathW(MAX_PATH, tdir) || !tdir[0]) return 0;
     _snwprintf(cmdf, MAX_PATH + 32, L"%smnpaper-upd.cmd", tdir);
     line[j++] = L'@'; line[j++] = L'"';
