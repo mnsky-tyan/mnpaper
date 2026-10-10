@@ -3096,8 +3096,10 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
     }
     CloseHandle(sf);
     if (!GetShortPathNameW(cmdf, cmd8, MAX_PATH + 32) || !cmd8[0] ||
-        !BatchSafePath(cmd8))
-        return 0;
+        !BatchSafePath(cmd8)) {
+        if (!BatchSafePath(cmdf)) return 0;
+        lstrcpynW(cmd8, cmdf, MAX_PATH + 32);
+    }
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
     ZeroMemory(&pi, sizeof pi);
     _snwprintf(cmd, 2 * MAX_PATH + 64, L"/c ping -n 3 127.0.0.1 >nul & \"%s\"", cmd8);
