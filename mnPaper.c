@@ -3897,7 +3897,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_s.mode != MODE_EINK) {
                 if (MessageBoxW(hwnd,
                     L"E-ink mode turns the whole screen black-and-white with high contrast.\n\n"
-                    L"You can return to paper texture anytime from the tray or with Ctrl+Alt+P.\n\n"
+                    L"You can return to paper texture anytime from the tray or with Ctrl+Alt+E.\n\n"
                     L"Switch to e-ink mode?",
                     L"mnPaper - E-ink mode", MB_YESNO | MB_ICONQUESTION) != IDYES)
                     break;
