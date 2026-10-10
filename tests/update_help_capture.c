@@ -360,7 +360,10 @@ int main(void) {
 
 #ifdef MN_VAL_NETWORK
     /* The real button, the real WinHTTP worker, the real feed. Off by default:
-     * it performs a live network request and its result raises a real box. */
+     * it performs a live network request and its result raises a real box.
+     * The busy-guard test above seeded the 5-second manual click debounce,
+     * so age it out before clicking so the live check actually starts. */
+    Pump(5500);
     SendMessageW(GetDlgItem(g_dlg, 117), BM_CLICK, 0, 0);
     Pump(20000);
     Check(g_update_busy == 0, "a live check releases the busy guard when it finishes");
