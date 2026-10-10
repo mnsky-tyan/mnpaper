@@ -298,20 +298,24 @@ int main(void) {
                 Check(plain != NULL, "a plain non-taskbar window could be created");
                 g_ntb = TB_MAX;   /* table full: the case the old order got wrong */
                 Check(pf != NULL, "plain-window log file could be opened");
-                if (plain && pf) {
-                    g_log = pf;
-                    pr = TbEnumProc(plain, 0);
-                    g_log = NULL;
-                    fflush(pf); fclose(pf);
-                    pf = fopen("hole_cycle_tbcap.log", "r");
-                    memset(pbuf, 0, sizeof pbuf);
-                    if (pf) { fread(pbuf, 1, sizeof pbuf - 1, pf); fclose(pf); }
-                    Check(pr == TRUE,
-                          "a non-taskbar window on a full table is passed through, not refused");
-                    Check(pbuf[0] == '\0',
-                          "no cap line is logged for a window that is not a taskbar");
+                if (pf) {
+                    if (plain) {
+                        g_log = pf;
+                        pr = TbEnumProc(plain, 0);
+                        g_log = NULL;
+                        fflush(pf); fclose(pf);
+                        pf = fopen("hole_cycle_tbcap.log", "r");
+                        memset(pbuf, 0, sizeof pbuf);
+                        if (pf) { fread(pbuf, 1, sizeof pbuf - 1, pf); fclose(pf); }
+                        Check(pr == TRUE,
+                              "a non-taskbar window on a full table is passed through, not refused");
+                        Check(pbuf[0] == '\0',
+                              "no cap line is logged for a window that is not a taskbar");
+                    } else {
+                        fclose(pf);
+                    }
+                    DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
                 }
-                DeleteFileA("hole_cycle_tbcap.log");   /* no residue */
                 if (plain) DestroyWindow(plain);
                 g_ntb = 0;
             }

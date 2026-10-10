@@ -582,13 +582,18 @@ int main(void) {
             Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, NULL, &sz) != ERROR_SUCCESS,
                   "a quoted entry naming this exe is removed when autostart is off");
             /* Expandable environment-variable entries naming this exe are also matched */
-            RegSetValueExW(key, L"mnPaper", 0, REG_EXPAND_SZ, (BYTE *)qmine,
-                           (DWORD)((lstrlenW(qmine) + 1) * sizeof(WCHAR)));
+            WCHAR expentry[MAX_PATH + 16];
+            WCHAR drv[4] = { mine[0], mine[1], 0, 0 };
+            SetEnvironmentVariableW(L"MNVAL_RUNDRV", drv);
+            _snwprintf(expentry, MAX_PATH + 16, L"\"%%MNVAL_RUNDRV%%%s\"", mine + 2);
+            RegSetValueExW(key, L"mnPaper", 0, REG_EXPAND_SZ, (BYTE *)expentry,
+                           (DWORD)((lstrlenW(expentry) + 1) * sizeof(WCHAR)));
             g_s.autostart = 0;
             SaveSettings();
             sz = sizeof seen;
             Check(RegQueryValueExW(key, L"mnPaper", NULL, &t, NULL, &sz) != ERROR_SUCCESS,
-                  "an expandable entry naming this exe is removed when autostart is off");
+                  "an expandable entry with environment variables naming this exe is removed when autostart is off");
+            SetEnvironmentVariableW(L"MNVAL_RUNDRV", NULL);
             RegCloseKey(key);
         } else Check(0, "scratch Run key writable for the ownership check");
         g_s.master = saved_master; g_s.autostart = saved_auto;
