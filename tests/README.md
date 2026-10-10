@@ -44,8 +44,9 @@ Covered:
   entries naming this exe are expanded and matched) - the real HKCU Run key is
   never touched.
 - The ? button (id 116) opens one shared help window; in headless mode it is
-  created but never shown, re-click reuses and restores it if minimized,
-  closing clears it.
+  created but never shown, re-click reuses it, and closing clears it (the
+  restore-when-minimized branch is suppressed in headless runs and is not
+  suite-covered).
 - Version parsing/comparison for the update check as pure functions, plus
   button 117 existence. The live WinHTTP check is deliberately NOT exercised
   in standard test builds (real network + a real MessageBox would disturb the
@@ -99,7 +100,9 @@ Re-run before treating it as a regression.
 ## Build recipe (Windows host)
 
 Above is the debug recipe for the leak-checked suite. The practical build for
-all suites on a Windows box with VS2022 (any edition) is:
+all suites on a Windows box with VS2022 (any edition) is (save as a `.bat` file
+such as `build_tests.bat`, or replace `%%f` with `%f` if typing interactively
+at a cmd prompt):
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Auxiliary\Build\vcvars64.bat"

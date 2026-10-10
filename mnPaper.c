@@ -1576,6 +1576,7 @@ static int g_out_cap_logged;/* likewise for the output enumeration cap */
 static int g_dupfail_logged;/* likewise: an output duplication that failed */
 static int g_devfail_logged; /* likewise: the D3D11 device could not be created */
 static int g_noout_logged;   /* likewise: no output could be duplicated */
+static int g_acqloss_logged; /* likewise: DXGI capture access lost */
 static int g_acqfail_logged;/* likewise: a per-frame acquire keeps failing */
 static int g_badfmt_logged; /* likewise: an unsupported desktop format */
 static int g_fallback_logged;/* likewise: the GDI fallback's reason line */
@@ -1940,7 +1941,10 @@ static int DxgiPoll(unsigned char *dst) {
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
         if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED ||
             hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_DEVICE_REMOVED) {
-            L("dxgi: access lost, re-init later");
+            if (!g_acqloss_logged) {
+                g_acqloss_logged = 1;
+                L("dxgi: access lost, re-init later");
+            }
             if (res) res->lpVtbl->Release(res);
             EinkShutdownCapture();
             return 0;
@@ -3889,7 +3893,17 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetMaster(!g_s.master);
             break;
         case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
-        case IDM_EINK:      ActivateMode(MODE_EINK); break;
+        case IDM_EINK:
+            if (g_s.mode != MODE_EINK) {
+                if (MessageBoxW(hwnd,
+                    L"E-ink mode turns the whole screen black-and-white with high contrast.\n\n"
+                    L"You can return to paper texture anytime from the tray or with Ctrl+Alt+P.\n\n"
+                    L"Switch to e-ink mode?",
+                    L"mnPaper - E-ink mode", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                    break;
+            }
+            ActivateMode(MODE_EINK);
+            break;
         case IDM_SETTINGS:  OpenSettings(); break;
         case IDM_STRENGTH + 0: case IDM_STRENGTH + 1:
         case IDM_STRENGTH + 2: case IDM_STRENGTH + 3:
@@ -4036,7 +4050,7 @@ static int SendToRunning(void) {
              * let the exit-2 path report it, not hang the second copy */
             ok = 0;
     }
-    if (g_cmd)
+    if (g_cmd && !(g_has_set && !ok))
         if (!PostMessageW(h, WM_APP_CMD, (WPARAM)g_cmd, 0))
             ok = 0;
     return ok;
