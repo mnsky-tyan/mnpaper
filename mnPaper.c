@@ -1938,7 +1938,8 @@ static int DxgiPoll(unsigned char *dst) {
 
         hr = g_out[i].dup->lpVtbl->AcquireNextFrame(g_out[i].dup, 0, &fi, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED || hr == DXGI_ERROR_INVALID_CALL) {
+        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED ||
+            hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_DEVICE_REMOVED) {
             L("dxgi: access lost, re-init later");
             if (res) res->lpVtbl->Release(res);
             EinkShutdownCapture();
@@ -2071,12 +2072,16 @@ static unsigned char *g_gdi_bits;   /* the DIB's pixels, written by BitBlt */
 static unsigned char *g_gdi_prev;  /* previous grab, owned by this module */
 static int g_gdi_w, g_gdi_h;       /* size the grab set was created for */
 
+static DWORD g_gdi_retry_at;
+static int g_gdifail_logged;
+
 static void GdiResetGrabs(void) {
     if (g_gdi_bmp) DeleteObject(g_gdi_bmp);
     if (g_gdi_dc)  DeleteDC(g_gdi_dc);
     free(g_gdi_prev);
     g_gdi_bmp = NULL; g_gdi_dc = NULL; g_gdi_bits = NULL; g_gdi_prev = NULL;
     g_gdi_w = 0; g_gdi_h = 0;
+    g_gdi_retry_at = 0;
 }
 
 static int GdiPoll(unsigned char *dst) {
@@ -2086,6 +2091,7 @@ static int GdiPoll(unsigned char *dst) {
     int w = g_vsw, h = g_vsh;
 
     if (w <= 0 || h <= 0 || !dst) return 0;
+    if (GetTickCount() < g_gdi_retry_at) return 0;
     n = (size_t)w * h * 4;
     if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits || g_gdi_w != w || g_gdi_h != h) {
         GdiResetGrabs();
@@ -2100,9 +2106,19 @@ static int GdiPoll(unsigned char *dst) {
         g_gdi_dc = CreateCompatibleDC(screen);
         g_gdi_bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&g_gdi_bits, NULL, 0);
         ReleaseDC(NULL, screen);
-        if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) { GdiResetGrabs(); return 0; }
+        if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) {
+            GdiResetGrabs();
+            g_gdi_retry_at = GetTickCount() + 1000;
+            if (!g_gdifail_logged) { g_gdifail_logged = 1; L("eink: gdi capture DIB allocation failed"); }
+            return 0;
+        }
         g_gdi_prev = (unsigned char *)malloc(n);
-        if (!g_gdi_prev) { GdiResetGrabs(); return 0; }
+        if (!g_gdi_prev) {
+            GdiResetGrabs();
+            g_gdi_retry_at = GetTickCount() + 1000;
+            if (!g_gdifail_logged) { g_gdifail_logged = 1; L("eink: gdi capture buffer allocation failed"); }
+            return 0;
+        }
         SelectObject(g_gdi_dc, g_gdi_bmp);
         g_gdi_w = w; g_gdi_h = h;
         memset(g_gdi_prev, 0, n);   /* force the first comparison to differ */
@@ -2617,7 +2633,7 @@ static LRESULT CALLBACK HelpProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
  * a headless run must never show a window or touch the foreground. */
 static void HelpPresent(HWND h) {
     if (g_test_headless) return;
-    ShowWindow(h, SW_SHOW);
+    ShowWindow(h, SW_RESTORE);
     SetForegroundWindow(h);
 }
 
@@ -3075,10 +3091,11 @@ static DWORD WINAPI SelfUpdateThread(LPVOID param) {
 static int BatchSafePath(const WCHAR *p) {
     char a[2 * MAX_PATH + 2];
     WCHAR back[MAX_PATH + 2];
-    int n = WideCharToMultiByte(CP_ACP, 0, p, -1, a, sizeof a, NULL, NULL);
+    UINT cp = GetOEMCP();
+    int n = WideCharToMultiByte(cp, 0, p, -1, a, sizeof a, NULL, NULL);
     int m;
     if (n <= 1) return 0;
-    m = MultiByteToWideChar(CP_ACP, 0, a, n - 1, back, MAX_PATH + 1);
+    m = MultiByteToWideChar(cp, 0, a, n - 1, back, MAX_PATH + 1);
     if (m <= 0) return 0;
     back[m] = 0;   /* an explicit-length conversion is not required to terminate */
     return wcscmp(p, back) == 0;
@@ -3115,7 +3132,7 @@ static int RelaunchAfterSwap(const WCHAR *exe) {
         if (exe8[i] == L'%') line[j++] = L'%';   /* % is special in a .cmd */
     }
     line[j++] = L'"'; line[j++] = L'\r'; line[j++] = L'\n'; line[j] = 0;
-    n = WideCharToMultiByte(CP_ACP, 0, line, -1, ansi, sizeof ansi, NULL, NULL);
+    n = WideCharToMultiByte(GetOEMCP(), 0, line, -1, ansi, sizeof ansi, NULL, NULL);
     if (n <= 0) return 0;
     sf = CreateFileW(cmdf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                      FILE_ATTRIBUTE_NORMAL, NULL);
@@ -3856,8 +3873,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (dlg) DialogPushSettings(dlg);
             }
             L("cli sync: master=%d mode=%d", g_s.master, g_s.mode);
+            return TRUE;
         }
-        return TRUE;
+        return FALSE;
     }
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP)
