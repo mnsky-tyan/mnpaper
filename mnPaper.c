@@ -256,21 +256,22 @@ static void ApplyAutostart(void) {
               (unsigned long)n);
         /* a transient path-read failure here must not silently disable autostart */
     } else {
-        /* Remove the entry only when it is absent or names this exe. A copy at
+        /* Remove the entry only when it names this exe. A copy at
          * another path derives autostart=0 from the installed copy's entry
          * (LoadSettings), so an unconditional delete would remove an entry
          * that belongs to a different exe. */
-        WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
+        WCHAR path[MAX_PATH + 4] = L"", mine[MAX_PATH] = L"";
         DWORD sz = sizeof(path), t = 0, n;
         n = GetModuleFileNameW(NULL, mine, MAX_PATH);
         /* a truncated path does not name this exe, so ownership cannot be
          * proven: leave the entry alone (same rule as the write half and
          * InstallResult) instead of matching a 259-char prefix written by an
          * older build */
-        if (n > 0 && n < MAX_PATH &&
-            (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) != ERROR_SUCCESS ||
-             t != REG_SZ || RunEntryMatchesExe(path, mine)))
-            RegDeleteValueW(k, L"mnPaper");
+        if (n > 0 && n < MAX_PATH) {
+            if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS &&
+                (t == REG_SZ || t == REG_EXPAND_SZ) && RunEntryMatchesExe(path, mine))
+                RegDeleteValueW(k, L"mnPaper");
+        }
     }
     RegCloseKey(k);
 }
@@ -332,9 +333,10 @@ static void LoadSettings(void) {
     }
     /* autostart mirrors the Run key so an external edit stays honest */
     if (RegOpenKeyExW(HKEY_CURRENT_USER, g_run_key, 0, KEY_READ, &k) == ERROR_SUCCESS) {
-        WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
+        WCHAR path[MAX_PATH + 4] = L"", mine[MAX_PATH] = L"";
         DWORD sz = sizeof(path), t = 0;
-        if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS && t == REG_SZ) {
+        if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) == ERROR_SUCCESS &&
+            (t == REG_SZ || t == REG_EXPAND_SZ)) {
             DWORD n = GetModuleFileNameW(NULL, mine, MAX_PATH);
             if (n > 0 && n < MAX_PATH && RunEntryMatchesExe(path, mine)) g_s.autostart = 1;
             else g_s.autostart = 0;
@@ -841,7 +843,10 @@ static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
             L"MnPaperOverlay", L"mnPaper", WS_POPUP,
             rc->left, rc->top + sy, ov->w, sh, NULL, NULL, hi, NULL);
         if (!ov->shwnd[ov->n_strips]) {
+            DWORD err = GetLastError();
             int k;
+            L("overlay: monitor at %ld,%ld %dx%d: strip %d creation failed err %lu - monitor left untextured",
+              ov->rc.left, ov->rc.top, ov->w, ov->h, ov->n_strips, err);
             for (k = 0; k < ov->n_strips; k++) { DestroyWindow(ov->shwnd[k]); ov->shwnd[k] = NULL; }
             ov->n_strips = 0;
             return 0;
