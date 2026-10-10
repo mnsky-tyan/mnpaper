@@ -3057,9 +3057,10 @@ static int BatchSafePath(const WCHAR *p) {
 
 /* Writes the temporary .cmd that starts the new exe once we are gone, and
  * launches it after a short delay. The install path enters the batch file
- * through its short (8.3) name, which is ASCII, so the path is data inside
- * a file instead of a command line to parse. Returns 0 when the chain
- * cannot be built safely. */
+ * preferably through its short (8.3) name (which is ASCII, so the path is data
+ * inside a file instead of a command line to parse) or falls back to a batch-safe
+ * plain path when 8.3 alias creation is disabled on the volume. Returns 0 when
+ * the chain cannot be built safely. */
 static int RelaunchAfterSwap(const WCHAR *exe) {
     WCHAR exe8[MAX_PATH], tdir[MAX_PATH], cmdf[MAX_PATH + 32], cmd8[MAX_PATH + 32];
     WCHAR line[2 * MAX_PATH + 8], cmd[2 * MAX_PATH + 64];
