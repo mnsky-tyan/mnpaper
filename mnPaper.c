@@ -242,10 +242,15 @@ static void ApplyAutostart(void) {
          * (LoadSettings), so an unconditional delete would remove an entry
          * that belongs to a different exe. */
         WCHAR path[MAX_PATH] = L"", mine[MAX_PATH] = L"";
-        DWORD sz = sizeof(path), t = 0;
-        GetModuleFileNameW(NULL, mine, MAX_PATH);
-        if (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) != ERROR_SUCCESS ||
-            t != REG_SZ || _wcsicmp(path, mine) == 0)
+        DWORD sz = sizeof(path), t = 0, n;
+        n = GetModuleFileNameW(NULL, mine, MAX_PATH);
+        /* a truncated path does not name this exe, so ownership cannot be
+         * proven: leave the entry alone (same rule as the write half and
+         * InstallResult) instead of matching a 259-char prefix written by an
+         * older build */
+        if (n > 0 && n < MAX_PATH &&
+            (RegQueryValueExW(k, L"mnPaper", NULL, &t, (BYTE *)path, &sz) != ERROR_SUCCESS ||
+             t != REG_SZ || _wcsicmp(path, mine) == 0))
             RegDeleteValueW(k, L"mnPaper");
     }
     RegCloseKey(k);
@@ -1478,6 +1483,7 @@ static void RepaintAll(void) {
                                * probe index and the log on this one constant */
 
 typedef struct {
+    IDXGIOutput1 *out;      /* retained for the staleness re-check; released in DxgiShutdown */
     IDXGIOutputDuplication *dup;
     RECT r;                 /* rect inside the virtual-screen capture buffer */
     ID3D11Texture2D *stage;
@@ -1545,6 +1551,7 @@ static int g_acqfail_logged;/* likewise: a per-frame acquire keeps failing */
 static int g_badfmt_logged; /* likewise: an unsupported desktop format */
 static int g_fallback_logged;/* likewise: the GDI fallback's reason line */
 static int g_recover_logged;/* likewise: duplication recovered after GDI */
+static int g_init_logged;   /* likewise: the first successful duplication init */
 static void GdiResetGrabs(void);   /* defined with the GDI fallback poller */
 static const int BAYER4[4][4] = {
     { 0,  8,  2, 10 },
@@ -1685,6 +1692,7 @@ static int PresentEinkRect(OVL *ov) {
 static void DxgiShutdown(void) {
     int i;
     for (i = 0; i < g_nout; i++) {
+        if (g_out[i].out)   { g_out[i].out->lpVtbl->Release(g_out[i].out);   g_out[i].out = NULL; }
         if (g_out[i].stage) { g_out[i].stage->lpVtbl->Release(g_out[i].stage); g_out[i].stage = NULL; }
         if (g_out[i].dup)   { g_out[i].dup->lpVtbl->Release(g_out[i].dup);     g_out[i].dup = NULL; }
     }
@@ -1750,6 +1758,7 @@ static int DxgiInit(void) {
         while (g_nout < MAX_OUT) {
             HRESULT ehr;
             IDXGIOutput1 *out1 = NULL;
+            int stored = 0;
             ehr = adapters[a]->lpVtbl->EnumOutputs(adapters[a], o++, &out);
             if (ehr == DXGI_ERROR_NOT_FOUND) break;
             if (FAILED(ehr) || !out) break;   /* transient failure: skip the
@@ -1783,7 +1792,9 @@ static int DxgiInit(void) {
                     g_out[g_nout].r.bottom = r.bottom - g_vsy;
                     HRESULT dhr = out1->lpVtbl->DuplicateOutput(out1, (IUnknown *)g_dev, &g_out[g_nout].dup);
                     if (SUCCEEDED(dhr) && g_out[g_nout].dup) {
+                        g_out[g_nout].out = out1;   /* the interface reference moves into the slot */
                         g_nout++;
+                        stored = 1;
                     } else if (!g_dupfail_logged) {
                         /* The device lives on the default adapter, so every
                          * output of a second adapter fails here; those monitors
@@ -1796,7 +1807,8 @@ static int DxgiInit(void) {
                           (unsigned long)dhr);
                     }
                 }
-                out1->lpVtbl->Release(out1);
+                if (!stored)
+                    out1->lpVtbl->Release(out1);   /* not retained: dup failed or desc failed */
             }
             out->lpVtbl->Release(out);
             out = NULL;
@@ -1831,7 +1843,10 @@ static int DxgiInit(void) {
         if (!g_noout_logged) { g_noout_logged = 1; L("dxgi: no duplication outputs"); }
         DxgiShutdown();
     } else {
-        L("dxgi: %d duplication output(s)", g_nout);
+        if (!g_init_logged) {
+            g_init_logged = 1;
+            L("dxgi: %d duplication output(s)", g_nout);
+        }
     }
     return g_nout > 0;
 }
@@ -2089,14 +2104,20 @@ static int EinkBuffersReady(void) {
         && g_vsh == GetSystemMetrics(SM_CYVIRTUALSCREEN);
 }
 
+static DWORD g_ering_retry_at;  /* next allowed e-ink ring allocation attempt */
+
+static int EinkRingBackoff(void) {
+    /* plain DWORD compare fails open at wrap (one early retry) - harmless */
+    return g_ecap[0] == NULL && GetTickCount() < g_ering_retry_at;
+}
+
 static void EinkBuffersRestart(void) {
-    static DWORD retry_at;      /* a failed allocate is retried at 1 Hz, not 20 Hz */
     static int last_want = -1;
     int had_ring = (g_ecap[0] != NULL);
     int was_ready = EinkBuffersReady();
     int want;
     DWORD now = GetTickCount();
-    if (!had_ring && now < retry_at) return;   /* nothing changed since the last failure */
+    if (EinkRingBackoff()) return;   /* nothing changed since the last failure */
     EinkWorkerSet(0);
     EinkEnsureBuffers();
     if (g_dxgi && !was_ready)
@@ -2107,9 +2128,10 @@ static void EinkBuffersRestart(void) {
          * re-derives its own origin). Keyed on the rebuild, not on the ring's
          * prior presence: a ring absent while capture is live still leaves
          * stale rects behind when it is finally built. EinkTick re-inits
-         * within a tick. */
+         * within a tick - but never inside the backoff window, which would
+         * pair with this teardown into a 1 Hz create/destroy cycle. */
         EinkShutdownCapture();
-    if (!g_ecap[0]) retry_at = now + 1000;
+    if (!g_ecap[0]) g_ering_retry_at = now + 1000;
     want = (g_ecap[0] && g_eproc_show && g_s.master && g_s.mode == MODE_EINK);
     EinkWorkerSet(want);
     if (want != last_want) {   /* a persistent not-ready state ticks at 20 Hz: say it once */
@@ -2261,6 +2283,21 @@ static void EinkFallBackToGdi(unsigned char *dst, int retry, const char *why) {
     }
 }
 
+static int DxgiRectsStale(void) {
+    int i;
+    for (i = 0; i < g_nout; i++) {
+        DXGI_OUTPUT_DESC d;
+        if (!g_out[i].out || FAILED(g_out[i].out->lpVtbl->GetDesc(g_out[i].out, &d)))
+            return 1;   /* the output is gone from the desktop: re-anchor */
+        if (d.DesktopCoordinates.left   - g_vsx != g_out[i].r.left
+            || d.DesktopCoordinates.top    - g_vsy != g_out[i].r.top
+            || d.DesktopCoordinates.right  - g_vsx != g_out[i].r.right
+            || d.DesktopCoordinates.bottom - g_vsy != g_out[i].r.bottom)
+            return 1;
+    }
+    return 0;
+}
+
 static void EinkTick(void) {
     unsigned char *dst;
     int got = 0;
@@ -2283,10 +2320,18 @@ static void EinkTick(void) {
                     g_dxgi_fail_at = GetTickCount();
                 }
             }
+        } else if (EinkRingBackoff()) {
+            /* the ring failed to allocate and is backing off: standing up
+             * duplication now would pair with the re-anchor shutdown in
+             * EinkBuffersRestart into a 1 Hz full create/destroy cycle with
+             * its own log flood - wait for the window to expire */
         } else if (DxgiInit()) {
             g_dxgi = 1;
             g_dxgi_retry = 1;
-            L("eink: dxgi duplication live");
+            if (!g_init_logged) {
+                g_init_logged = 1;
+                L("eink: dxgi duplication live");
+            }
         } else {
             g_gdi_only = 1;
             g_dxgi_retry = 1;
@@ -2295,6 +2340,21 @@ static void EinkTick(void) {
         }
     }
     if (!EinkBuffersReady()) { EinkBuffersRestart(); return; }
+    {
+        static int rect_tick;
+        if (++rect_tick >= 64) {   /* ~3 s: g_out[].r is mapped once at init, so a
+            * pure monitor rearrangement that WM_DISPLAYCHANGE never reports and
+            * the virtual-screen metrics cannot see (identical resolutions
+            * swapped left/right) would put each output's frames in the other
+            * monitor's slot half forever - re-check the anchor cheaply */
+            rect_tick = 0;
+            if (DxgiRectsStale()) {
+                L("eink: desktop arrangement changed, capture re-anchoring");
+                EinkShutdownCapture();
+                return;   /* next tick re-inits against the new coordinates */
+            }
+        }
+    }
     if (!g_ework) EinkWorkerSet(1);          /* mode/master flipped: arm it */
 
     dst = EinkCapBegin();
@@ -3908,8 +3968,12 @@ static int SendToRunning(void) {
         cd.dwData = CMD_SYNC;
         cd.cbData = sizeof(SETTINGS);
         cd.lpData = &g_cli_settings;
-        if (!SendMessageW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd))
-            ok = 0;   /* the handler returns TRUE only when it processed us */
+        if (!SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd,
+                                 SMTO_ABORTIFHUNG, 10000, NULL))
+            /* the handler returns TRUE only when it processed us; a wedged
+             * host thread (stuck in a driver call) must drop the command and
+             * let the exit-2 path report it, not hang the second copy */
+            ok = 0;
     }
     if (g_cmd)
         if (!PostMessageW(h, WM_APP_CMD, (WPARAM)g_cmd, 0))
@@ -3998,9 +4062,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* a completed self-update leaves the previous exe as .old - sweep it */
     {
         WCHAR exe[MAX_PATH], oldp[MAX_PATH + 8];
-        GetModuleFileNameW(NULL, exe, MAX_PATH);
-        lstrcpyW(oldp, exe); lstrcpyW(oldp + lstrlenW(oldp), L".old");
-        DeleteFileW(oldp);   /* best effort; may still be locked right after the swap */
+        DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+        /* a truncated path does not name this exe: deleting "<truncation>.old"
+         * could remove a file the truncation happens to name (same rule as
+         * InstallResult) - sweep only when the path is provably ours, and let
+         * startup continue either way */
+        if (n > 0 && n < MAX_PATH) {
+            lstrcpyW(oldp, exe); lstrcpyW(oldp + lstrlenW(oldp), L".old");
+            DeleteFileW(oldp);   /* best effort; may still be locked right after the swap */
+        }
         {   /* the updater's throwaway .cmd also outlives its run */
             WCHAR tdir[MAX_PATH], cmdp[MAX_PATH + 24];
             if (GetTempPathW(MAX_PATH, tdir)) {

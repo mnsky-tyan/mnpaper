@@ -89,7 +89,7 @@ int main(void) {
         ov.bits = malloc((size_t)w * h * 4);
         ov.mem = NULL;                                  /* no real upload target */
         px = (unsigned char *)ov.bits;
-        if (!px) { Check(0, "scratch texture allocated"); return 1; }
+        if (!px) { Check(0, "scratch texture allocated"); goto done; }
         memset(px, 0, (size_t)w * h * 4);               /* known background */
         armed = PixelHash8(px, (size_t)w * h * 4);
 
@@ -140,6 +140,7 @@ int main(void) {
         ov.w = w; ov.h = h; ov.idx = 0;
         px = malloc((size_t)w * h * 4);
         ov.bits = px;
+        if (!px) { Check(0, "FIX 3 scratch allocated"); goto done; }
         for (x = 0; x < w * h; x++) { px[4*x] = 10; px[4*x+1] = 20; px[4*x+2] = 30; px[4*x+3] = 255; }
         ULONGLONG before;
         unsigned char *saved = NULL;
@@ -170,8 +171,10 @@ int main(void) {
         g_dlg = NULL;
         Check(LiveDlg() == NULL, "LiveDlg() is NULL with no dialog");
     }
+done:
     /* leave no scratch behind: the 2026-10-03 review caught this suite
-     * leaking its key into the captain's real hive on every run */
+     * leaking its key into the captain's real hive on every run, and the
+     * allocation-failure bail-outs above must not either */
     RegDeleteTreeW(HKEY_CURRENT_USER, scratch);
     RegDeleteTreeW(HKEY_CURRENT_USER, runkey);
 
