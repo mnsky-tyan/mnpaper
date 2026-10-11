@@ -171,6 +171,56 @@ int main(void) {
         g_dlg = NULL;
         Check(LiveDlg() == NULL, "LiveDlg() is NULL with no dialog");
     }
+    printf("\nFIX (2026-10-11): the --set parser accepts, clamps and refuses\n");
+    /* SetKeyValue is the one door every `mnPaper --set key=value` walks
+     * through; until now it was exercised only live. Its real contract:
+     * keys case-insensitive, values DIGITS ONLY (anything else is refused
+     * so a typo cannot become a silent 0), booleans folded v?1:0, and NO
+     * clamping - ApplySets runs ClampSettingsOf after the parse, so the
+     * same two steps are driven here on a scratch SETTINGS. */
+    {
+        SETTINGS p = g_s;
+        int saw;   /* SetKeyValue returns nonzero for a recognised key */
+
+        saw = SetKeyValue(&p, L"tapebar=1");
+        Check(saw && p.tapebar == 1, "tapebar=1 is accepted and stored");
+        saw = SetKeyValue(&p, L"tapebar=0");
+        Check(saw && p.tapebar == 0, "tapebar=0 clears it again");
+
+        p.intensity = 1;
+        saw = SetKeyValue(&p, L"intensity=999");
+        Check(saw && p.intensity == 999, "intensity=999 parses unclamped");
+        ClampSettingsOf(&p);
+        Check(p.intensity == 40, "ApplySets' clamp pass then caps it at 40");
+
+        p.shades = 4;
+        SetKeyValue(&p, L"shades=99");
+        ClampSettingsOf(&p);
+        Check(p.shades == 16, "shades=99 clamps to the 16-level cap");
+
+        p.intensity = 1;
+        Check(!SetKeyValue(&p, L"intensity=-5") && p.intensity == 1,
+              "a negative value is refused, not parsed or stored");
+        Check(!SetKeyValue(&p, L"intensity=abc") && p.intensity == 1,
+              "a non-numeric value is refused, not stored as 0");
+
+        p.master = 1;
+        saw = SetKeyValue(&p, L"master=0");
+        Check(saw && p.master == 0, "master=0 toggles the master switch");
+
+        p.mode = MODE_PAPER;
+        saw = SetKeyValue(&p, L"mode=1");
+        Check(saw && p.mode == MODE_EINK, "mode=1 switches to e-ink");
+        saw = SetKeyValue(&p, L"MODE=0");
+        Check(saw && p.mode == MODE_PAPER, "MODE=0 (any case) switches to paper");
+
+        Check(!SetKeyValue(&p, L"nonsense=7"),
+              "an unknown key is refused, not silently stored");
+        Check(!SetKeyValue(&p, L"novalue"),
+              "a key with no = is refused");
+        Check(!SetKeyValue(&p, L"master="),
+              "a key with an empty value is refused");
+    }
 done:
     /* leave no scratch behind: the 2026-10-03 review caught this suite
      * leaking its key into the captain's real hive on every run, and the

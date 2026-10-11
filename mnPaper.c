@@ -213,7 +213,9 @@ static void ClampSettingsOf(SETTINGS *s) {
     int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0 };
     int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1, 1, 1 };
     int i;
-    for (i = 0; i < 14; i++) {
+    /* the bound follows the vals array, so a field added there is clamped
+     * even when nobody remembers to bump a hand-written count */
+    for (i = 0; i < (int)(sizeof(vals) / sizeof(vals[0])); i++) {
         if (*vals[i] < mins[i]) *vals[i] = mins[i];
         if (*vals[i] > maxs[i]) *vals[i] = maxs[i];
     }
@@ -830,8 +832,22 @@ static void DestroyOverlay(OVL *ov) {
     ov->dib = NULL; ov->mem = NULL; ov->bits = NULL;
 }
 
-static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
+/* One factory for the top-down 32bpp DIBs the present path and the GDI grab
+ * both need: they must agree on row order and stride, so they share the
+ * setup instead of two hand-written headers drifting apart. */
+static HBITMAP CreateTopDownDIB32(HDC screen, int w, int h, void **bits) {
     BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;   /* negative: top-down, row 0 on top */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(screen, &bi, DIB_RGB_COLORS, bits, NULL, 0);
+}
+
+static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
     HDC screen;
     HINSTANCE hi = GetModuleHandleW(NULL);
 
@@ -873,14 +889,7 @@ static int MakeOverlay(OVL *ov, HMONITOR mon, const RECT *rc) {
     ApplyCaptureState(ov);
 
     screen = GetDC(NULL);
-    memset(&bi, 0, sizeof bi);
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = ov->w;
-    bi.bmiHeader.biHeight = -ov->h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    ov->dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &ov->bits, NULL, 0);
+    ov->dib = CreateTopDownDIB32(screen, ov->w, ov->h, &ov->bits);
     ov->mem = CreateCompatibleDC(screen);
     SelectObject(ov->mem, ov->dib);
     ReleaseDC(NULL, screen);
@@ -1220,17 +1229,27 @@ static void RequestPaper(void);
  * (a checkbox click or a tray command) while Housekeeping owns the taskbar
  * enumeration on its own timer, and re-walking it from two threads would race
  * the g_tb table. The next Housekeeping pass re-walks and confirms. */
+/* The shared hole-dirty apply: RecomputeHoles and Housekeeping both land
+ * here, so the gating and the mode dispatch live in exactly one place. */
+static void ApplyHoleRefresh(void) {
+    int i;
+    if (!g_hole_dirty) return;
+    g_hole_dirty = 0;
+    if (g_s.master && g_s.mode == MODE_PAPER)
+        for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
+    else if (g_s.master && g_s.mode == MODE_EINK)
+        /* the punch lives in ov->bits and a static screen publishes no
+         * frames, so without this the parked taskbar leaves the last
+         * published frame's transparent band on screen indefinitely
+         * (2026-10-05 review) */
+        EinkPresent();
+}
+
 static void RecomputeHoles(void) {
     int i;
     for (i = 0; i < MAX_MON; i++) g_hole_on[i] = 0;
     ComputeHoles();   /* sets g_hole_dirty: every slot was cleared above */
-    if (g_hole_dirty) {
-        g_hole_dirty = 0;
-        if (g_s.master && g_s.mode == MODE_PAPER)
-            for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
-        else if (g_s.master && g_s.mode == MODE_EINK)
-            EinkPresent();
-    }
+    ApplyHoleRefresh();
 }
 
 static void Housekeeping(void) {
@@ -1300,17 +1319,7 @@ static void Housekeeping(void) {
        skips taskbars entirely. */
     CollectTaskbars();
     ComputeHoles();
-    if (g_hole_dirty) {
-        g_hole_dirty = 0;
-        if (g_s.master && g_s.mode == MODE_PAPER)
-            for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
-        else if (g_s.master && g_s.mode == MODE_EINK)
-            /* the punch lives in ov->bits and a static screen publishes no
-             * frames, so without this the parked taskbar leaves the last
-             * published frame's transparent band on screen indefinitely
-             * (2026-10-05 review) */
-            EinkPresent();
-    }
+    ApplyHoleRefresh();
     /* the settings window floats above the veil (the veil used to swallow
        it, which is what made the sliders feel laggy and unreadable). */
     {
@@ -2112,7 +2121,6 @@ static void GdiResetGrabs(void) {
 
 static int GdiPoll(unsigned char *dst) {
     HDC screen;
-    BITMAPINFO bi;
     size_t n;
     int w = g_vsw, h = g_vsh;
 
@@ -2121,16 +2129,9 @@ static int GdiPoll(unsigned char *dst) {
     n = (size_t)w * h * 4;
     if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits || g_gdi_w != w || g_gdi_h != h) {
         GdiResetGrabs();
-        memset(&bi, 0, sizeof bi);
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
         screen = GetDC(NULL);
         g_gdi_dc = CreateCompatibleDC(screen);
-        g_gdi_bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&g_gdi_bits, NULL, 0);
+        g_gdi_bmp = CreateTopDownDIB32(screen, w, h, (void **)&g_gdi_bits);
         ReleaseDC(NULL, screen);
         if (!g_gdi_bmp || !g_gdi_dc || !g_gdi_bits) {
             GdiResetGrabs();
@@ -2583,6 +2584,47 @@ static const WCHAR *SET_CLASS = L"MnPaperSettings";
 
 static HWND g_helpwnd;          /* single "?" help window              */
 static void SetMaster(int on);  /* defined in the commands section below */
+
+/* One confirmation for the dramatic switch, shared by the dialog radio and
+ * the tray item: same words, same warning icon, and default-No so a stray
+ * Enter cannot flip the whole screen. */
+static int ConfirmEink(HWND owner) {
+    return MessageBoxW(owner,
+        L"E-ink turns your ENTIRE screen into a black-and-white, Kindle-style reader view. "
+        L"On a normal laptop screen it looks harsh and can shimmer while content moves. "
+        L"It is for occasional reading, not everyday work.\n\n"
+        L"You can always click Paper here (or press Ctrl+Alt+E) to come back instantly.\n\n"
+        L"Switch to E-ink now?",
+        L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
+/* One place for the four boolean settings: the dialog checkboxes set them,
+ * the tray menu toggles them, and both paths save, run the side effect,
+ * mirror the open settings window and log through here. */
+enum { BB_SHARE, BB_AUTOSTART, BB_AUTOUPD, BB_TAPEBAR, BB_COUNT };
+static const struct {
+    int *field;
+    int  chk;                 /* the settings-window checkbox id */
+    void (*effect)(void);     /* extra apply step beyond SaveSettings */
+    const char *name;         /* log prefix, matches the --set key */
+} g_bprops[BB_COUNT] = {
+    { &g_s.share,     113, ApplyCaptureAll, "share"     },
+    { &g_s.autostart, 119, NULL,            "autostart" },
+    { &g_s.autoupd,   120, NULL,            "autoupd"   },
+    { &g_s.tapebar,   121, RecomputeHoles,  "tapebar"   },
+};
+
+static void ApplyBool(int which, int value) {
+    if (which < 0 || which >= BB_COUNT) return;
+    *g_bprops[which].field = value ? 1 : 0;
+    SaveSettings();
+    if (g_bprops[which].effect) g_bprops[which].effect();
+    {
+        HWND dlg = LiveDlg();
+        if (dlg) SetChk(GetDlgItem(dlg, g_bprops[which].chk), *g_bprops[which].field);
+    }
+    L("%s=%d", g_bprops[which].name, *g_bprops[which].field);
+}
 
 static const WCHAR HELP_TEXT[] =
     L"mnPaper - how every control works\r\n"
@@ -3542,7 +3584,6 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 240, 352, 20, hwnd, (HMENU)118,
             GetModuleHandleW(NULL), NULL);
-        SetChk(GetDlgItem(hwnd, 118), g_s.master);
         /* Autostart: mirrors the tray's Start-with-Windows item. */
         CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 260, 352, 20, hwnd, (HMENU)119,
@@ -3606,8 +3647,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RequestPaperPreview();
         else if (g_s.mode == MODE_EINK && g_s.master)
             RequestEinkRender();   /* re-render only; never re-present here */
-        else
-            RepaintAll();
+        else if (g_s.master)
+            RepaintAll();          /* e-ink switch state; hidden needs nothing */
         SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, NULL);
         return 0;
     }
@@ -3620,8 +3661,8 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RequestPaper();          /* refine the already-visible preview */
             else if (g_s.mode == MODE_EINK && g_s.master)
                 RequestEinkRender();
-            else
-                RepaintAll();
+            else if (g_s.master)
+                RepaintAll();    /* e-ink switch state; hidden needs nothing */
         }
         return 0;
     case WM_COMMAND:
@@ -3630,10 +3671,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextW(g_btn_adv, g_advanced ? L"<< Advanced" : L"Advanced >>");
             DlgLayout();
         } else if (LOWORD(wp) == 113) {
-            g_s.share = IsDlgButtonChecked(hwnd, 113) == BST_CHECKED;
-            SaveSettings();
-            ApplyCaptureAll();   /* re-applies the capture exclusion live */
-            L("share=%d", g_s.share);
+            ApplyBool(BB_SHARE, IsDlgButtonChecked(hwnd, 113) == BST_CHECKED);
         } else if (LOWORD(wp) == 114 || LOWORD(wp) == 115) {
             int mode = (LOWORD(wp) == 114) ? MODE_PAPER : MODE_EINK;
             if (g_s.mode != mode) {
@@ -3641,13 +3679,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     /* E-ink is dramatic and easy to stumble into. Confirm in
                      * plain words first; Paper always switches instantly so
                      * this dialog doubles as the escape hatch. */
-                    if (MessageBoxW(hwnd,
-                        L"E-ink turns your ENTIRE screen into a black-and-white, Kindle-style reader view. "
-                        L"On a normal laptop screen it looks harsh and can shimmer while content moves. "
-                        L"It is for occasional reading, not everyday work.\n\n"
-                        L"You can always click Paper here (or press Ctrl+Alt+E) to come back instantly.\n\n"
-                        L"Switch to E-ink now?",
-                        L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                    if (!ConfirmEink(hwnd)) {
                         SyncModeRadios(hwnd, 114);   /* snap back */
                         return 0;
                     }
@@ -3658,18 +3690,11 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (LOWORD(wp) == 118) {
             SetMaster(IsDlgButtonChecked(hwnd, 118) == BST_CHECKED);
         } else if (LOWORD(wp) == 119) {
-            g_s.autostart = IsDlgButtonChecked(hwnd, 119) == BST_CHECKED;
-            SaveSettings();   /* SaveSettings applies the Run key */
-            L("autostart=%d", g_s.autostart);
+            ApplyBool(BB_AUTOSTART, IsDlgButtonChecked(hwnd, 119) == BST_CHECKED);
         } else if (LOWORD(wp) == 120) {
-            g_s.autoupd = IsDlgButtonChecked(hwnd, 120) == BST_CHECKED;
-            SaveSettings();
-            L("autoupd=%d", g_s.autoupd);
+            ApplyBool(BB_AUTOUPD, IsDlgButtonChecked(hwnd, 120) == BST_CHECKED);
         } else if (LOWORD(wp) == 121) {
-            g_s.tapebar = IsDlgButtonChecked(hwnd, 121) == BST_CHECKED;
-            SaveSettings();
-            RecomputeHoles();   /* band flips between papered and bare at once */
-            L("tapebar=%d", g_s.tapebar);
+            ApplyBool(BB_TAPEBAR, IsDlgButtonChecked(hwnd, 121) == BST_CHECKED);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
@@ -3736,8 +3761,7 @@ static void OpenSettings(void) {
         NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (g_dlg) {
         FitClient(g_dlg, 402, 402);   /* the client the controls are laid out in */
-        DlgSyncBars();
-        ShowWindow(g_dlg, SW_SHOW);
+        ShowWindow(g_dlg, SW_SHOW);   /* WM_CREATE's push already synced everything */
         UpdateWindow(g_dlg);
     }
 }
@@ -3939,11 +3963,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_PAPER:     ActivateMode(MODE_PAPER); break;
         case IDM_EINK:
             if (g_s.mode != MODE_EINK) {
-                if (MessageBoxW(hwnd,
-                    L"E-ink mode turns the whole screen black-and-white with high contrast.\n\n"
-                    L"You can return to paper texture anytime from the tray or with Ctrl+Alt+E.\n\n"
-                    L"Switch to e-ink mode?",
-                    L"mnPaper - E-ink mode", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                if (!ConfirmEink(hwnd))
                     break;
             }
             ActivateMode(MODE_EINK);
@@ -3959,47 +3979,21 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SaveSettings();
             if (g_s.master && g_s.mode == MODE_PAPER)
                 RequestPaper();
-            else
-                RepaintAll();
+            else if (g_s.master)
+                RepaintAll();   /* e-ink switch state; hidden needs nothing */
             L("strength=%d", g_s.intensity);
             break;
         case IDM_SHARE:
-            g_s.share = g_s.share ? 0 : 1;
-            SaveSettings();
-            ApplyCaptureAll();   /* re-applies the capture exclusion state */
-            {
-                HWND dlg = LiveDlg();
-                if (dlg) SetChk(GetDlgItem(dlg, 113), g_s.share);
-            }
-            L("share=%d", g_s.share);
+            ApplyBool(BB_SHARE, !*g_bprops[BB_SHARE].field);
             break;
         case IDM_AUTOSTART:
-            g_s.autostart = g_s.autostart ? 0 : 1;
-            SaveSettings();
-            {
-                HWND dlg = LiveDlg();
-                if (dlg) SetChk(GetDlgItem(dlg, 119), g_s.autostart);
-            }
-            L("autostart=%d", g_s.autostart);
+            ApplyBool(BB_AUTOSTART, !*g_bprops[BB_AUTOSTART].field);
             break;
         case IDM_AUTOUPD:
-            g_s.autoupd = g_s.autoupd ? 0 : 1;
-            SaveSettings();
-            {
-                HWND dlg = LiveDlg();
-                if (dlg) SetChk(GetDlgItem(dlg, 120), g_s.autoupd);
-            }
-            L("autoupd=%d", g_s.autoupd);
+            ApplyBool(BB_AUTOUPD, !*g_bprops[BB_AUTOUPD].field);
             break;
         case IDM_TAPEBAR:
-            g_s.tapebar = g_s.tapebar ? 0 : 1;
-            SaveSettings();
-            RecomputeHoles();   /* repaint the band according to the new choice */
-            {
-                HWND dlg = LiveDlg();
-                if (dlg) SetChk(GetDlgItem(dlg, 121), g_s.tapebar);
-            }
-            L("tapebar=%d", g_s.tapebar);
+            ApplyBool(BB_TAPEBAR, !*g_bprops[BB_TAPEBAR].field);
             break;
         case IDM_EXIT:
             SaveSettings();
