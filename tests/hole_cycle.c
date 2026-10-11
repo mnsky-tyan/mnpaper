@@ -41,7 +41,7 @@ int main(void) {
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 80, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
-                      .autostart = 0, .share = 0, .autoupd = 1 };
+                      .autostart = 0, .share = 0, .tapebar = 0, .autoupd = 1 };
     BuildPaper(&ov);
     clean = H(px, (size_t)w * h * 4);
     Check(px[(size_t)band_y * w * 4 + 1400 * 4 + 3] != 0,
@@ -115,6 +115,51 @@ int main(void) {
 
         g_ntb = 0;                /* leave no synthesized taskbar behind */
         g_hole_on[0] = 0;
+    }
+
+    /* --------------- the tapebar opt-in (paper the taskbar too) ----------
+     * The default keeps the hole punched over a revealed taskbar so the
+     * shell's own buttons stay untextured. The opt-in widens the hole to
+     * nothing so the paper covers the band as well. Drive the real decision
+     * on the same revealed bottom band: g_s.tapebar=0 must open the hole
+     * exactly as before, g_s.tapebar=1 must leave it closed, and switching
+     * back must re-open it (RecomputeHoles clears the latched hole first,
+     * because ComputeHoles only flags dirty when the rect CHANGES). */
+    {
+        g_n = 1;
+        g_ov[0].rc = mon;
+        g_tbw[0] = NULL;          /* no taskbar window: the raise is skipped */
+        SetRect(&g_tb[0], mon.left, 1752, mon.right, mon.bottom);
+        g_ntb = 1;
+
+        g_s.tapebar = 0;          /* default: the taskbar stays bare */
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        ComputeHoles();
+        Check(g_tb_state[0] == 2 && g_hole_on[0] == 1 &&
+              g_hole[0].top == 1752 && g_hole[0].bottom == 1800,
+              "tapebar off: a revealed taskbar still gets the hole punched");
+
+        g_s.tapebar = 1;          /* opted in: no hole, paper covers the band */
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        ComputeHoles();
+        Check(g_tb_state[0] == 2 && g_hole_on[0] == 0,
+              "tapebar on: a revealed taskbar gets no hole, the band is papered");
+
+        g_s.tapebar = 0;          /* and back again: the hole must return */
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        RecomputeHoles();
+        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752,
+              "turning tapebar back off re-opens the hole over the band");
+
+        g_s.tapebar = 1;          /* ...and off again through the same entry */
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        RecomputeHoles();
+        Check(g_hole_on[0] == 0,
+              "turning tapebar on closes the hole again (cleared state, not a cached rect)");
+
+        g_ntb = 0;                /* leave no synthesized taskbar behind */
+        g_hole_on[0] = 0;
+        g_s.tapebar = 0;
     }
 
     /* --------------- clipping at the hole/hole's-bounds boundary -----------

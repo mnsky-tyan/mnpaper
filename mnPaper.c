@@ -71,6 +71,7 @@
 #define IDM_SETTINGS    9004
 #define IDM_STRENGTH    9007      /* + index: 10/20/30/40 */
 #define IDM_SHARE       9020
+#define IDM_TAPEBAR     9022
 #define IDM_AUTOSTART   9005
 #define IDM_AUTOUPD     9021
 #define IDM_EXIT        9006
@@ -135,6 +136,8 @@ typedef struct {
     int dither;
     int autostart;
     int share;     /* 1 = the texture is visible in screenshots / screen shares */
+    int tapebar;   /* 1 = paper the taskbar too, 0 = keep the hole punched
+                    * (default) so the shell's own bar stays untextured */
     int autoupd;   /* 1 = look for a new version about once a day (never auto-install) */
 } SETTINGS;
 
@@ -167,7 +170,8 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
 static SETTINGS g_s = { .master = 1, .mode = MODE_PAPER, .intensity = 30,
                         .warmth = 45, .grain = 4, .fibre = 40, .blotch = 30,
                         .shades = 4, .contrast = 50, .dither = 75,
-                        .autostart = 0, .share = 0, .autoupd = 1 };
+                        .autostart = 0, .share = 0, .tapebar = 0,
+                        .autoupd = 1 };
 /* Test mode: the hidden regression suites set this before anything runs. It
  * gates every side effect a test must not perform (windows on the working
  * desktop, network, the Run key); declared here because ShowOverlay, the
@@ -205,11 +209,11 @@ static void ClampSettingsOf(SETTINGS *s) {
     int *vals[] = { &s->master, &s->mode, &s->intensity, &s->warmth,
                     &s->grain, &s->fibre, &s->blotch, &s->shades,
                     &s->contrast, &s->dither, &s->autostart, &s->share,
-                    &s->autoupd };
-    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0 };
-    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1, 1 };
+                    &s->tapebar, &s->autoupd };
+    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0 };
+    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1, 1, 1 };
     int i;
-    for (i = 0; i < 13; i++) {
+    for (i = 0; i < 14; i++) {
         if (*vals[i] < mins[i]) *vals[i] = mins[i];
         if (*vals[i] > maxs[i]) *vals[i] = maxs[i];
     }
@@ -298,6 +302,7 @@ static void SaveSettings(void) {
     /* no "autostart" value here: LoadSettings derives it from the Run key,
      * so a stored copy could only diverge from the truth (2026-10-04 review) */
     RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
+    RegSetValueExW(k, L"tapebar",   0, REG_DWORD, (BYTE *)&g_s.tapebar,  sizeof(int));
     RegSetValueExW(k, L"autoupd",   0, REG_DWORD, (BYTE *)&g_s.autoupd,   sizeof(int));
     RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,    sizeof(g_lastupd));
     RegSetValueExW(k, L"updfails",  0, REG_DWORD, (BYTE *)&g_upd_fails,  sizeof(g_upd_fails));
@@ -326,6 +331,7 @@ static void LoadSettings(void) {
         g_s.contrast  = GetDword(k, L"contrast",  g_s.contrast);
         g_s.dither    = GetDword(k, L"dither",    g_s.dither);
         g_s.share     = GetDword(k, L"share",     g_s.share);
+        g_s.tapebar   = GetDword(k, L"tapebar",   0);   /* default: taskbar stays bare */
         g_s.autoupd   = GetDword(k, L"autoupd",   1);   /* default: daily check on */
         {
             DWORD sz = sizeof(ULONGLONG), t = 0;
@@ -1167,29 +1173,23 @@ static void ComputeHoles(void) {
             continue;
         }
         g_tb_state[j] = 2;
-        /* The shell's auto-hide manager is supposed to set WS_EX_TOPMOST on
-         * the taskbar when it reveals, but with a topmost full-screen veil
-         * present it never does (verified: app stopped -> task reveals at
-         * rank 8 topmost=1; app running -> topmost never set, rank 230+,
-         * the taskbar sinks behind every window). Re-assert the bit for it,
-         * ADD-ONLY: never demote. Demoting is what the first guard attempt
-         * did, and a SetWindowPos with a non-topmost insert-after clears
-         * WS_EX_TOPMOST, which ping-ponged with the shell and made the
-         * sinking intermittent.
-         *
-         * Raise UNCONDITIONALLY while revealed, not only when the bit is
-         * missing: the shell never clears WS_EX_TOPMOST on park, so after
-         * the first cycle the bit is permanently set and a bit-gated raise
-         * never fires again - the taskbar then re-reveals at its parked
-         * rank, BEHIND our topmost strips (sank a few
-         * minutes after launch). SetWindowPos(HWND_TOPMOST) is idempotent
-         * and lifts the window to the top of the topmost band; repeated
-         * raises while revealed are harmless and we still never demote. */
+        /* The veil steps aside from the taskbar by default: painting paper
+         * over it makes Windows drop the taskbar's topmost state and sink it
+         * behind every window (see the hole note above g_hole). The user can
+         * opt into papering the taskbar anyway (g_s.tapebar), and that choice
+         * is only safe while we keep re-asserting the taskbar's topmost bit
+         * here: the shell strips it whenever a topmost full-screen veil is
+         * up, so without the raise the bar would sink exactly as it did
+         * before the hole existed - which is the whole reason the hole
+         * exists. Raising stays ADD-ONLY and applies to the one taskbar
+         * window, never to our own strips. */
         if (g_tbw[j])
             SetWindowPos(g_tbw[j], HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        if (newon[mon]) UnionRect(&newh[mon], &newh[mon], &on);
-        else { newh[mon] = on; newon[mon] = 1; }
+        if (!g_s.tapebar) {              /* default: step aside, punch the hole */
+            if (newon[mon]) UnionRect(&newh[mon], &newh[mon], &on);
+            else { newh[mon] = on; newon[mon] = 1; }
+        }
     }
     for (i = 0; i < g_n; i++) {
         int changed = newon[i] != g_hole_on[i];
@@ -1210,6 +1210,28 @@ static void ComputeHoles(void) {
 }
 
 static void RequestPaper(void);
+
+/* Force a hole re-decision and apply it. ComputeHoles only flags dirty when
+ * the rect CHANGES, so flipping g_s.tapebar off a zero hole (paper the
+ * taskbar -> keep the hole bare) leaves the band textured on screen until the
+ * taskbar moves. This clears the latched hole state first so the next pass
+ * always sees a change, then runs the same apply path Housekeeping uses.
+ * CollectTaskbars is deliberately NOT called here: this runs on the UI thread
+ * (a checkbox click or a tray command) while Housekeeping owns the taskbar
+ * enumeration on its own timer, and re-walking it from two threads would race
+ * the g_tb table. The next Housekeeping pass re-walks and confirms. */
+static void RecomputeHoles(void) {
+    int i;
+    for (i = 0; i < MAX_MON; i++) g_hole_on[i] = 0;
+    ComputeHoles();   /* sets g_hole_dirty: every slot was cleared above */
+    if (g_hole_dirty) {
+        g_hole_dirty = 0;
+        if (g_s.master && g_s.mode == MODE_PAPER)
+            for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
+        else if (g_s.master && g_s.mode == MODE_EINK)
+            EinkPresent();
+    }
+}
 
 static void Housekeeping(void) {
     int i, j, walked;
@@ -2551,6 +2573,7 @@ static void DumpEink(const char *path, int w, int h) {
 static HWND g_tb_intensity, g_tb_warmth, g_tb_grain, g_tb_fibre, g_tb_blotch;
 static HWND g_tb_shades, g_tb_contrast, g_tb_dither, g_btn_adv;
 static HWND g_chk_share;   /* settings-window mirror of the tray share toggle */
+static HWND g_chk_tapebar; /* settings-window mirror of the tray taskbar toggle */
 static void ActivateMode(int mode);   /* defined in the commands section below */
 static HWND g_lb_strength, g_lb_warmth, g_lb_grain, g_lb_fibre, g_lb_blotch;
 static HWND g_lb_shades, g_lb_contrast, g_lb_dither;
@@ -2602,6 +2625,14 @@ static const WCHAR HELP_TEXT[] =
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
     L"the texture. E-ink is always hidden from captures.\r\n"
+    L"  Paper the taskbar too\r\n"
+    L"    Unchecked (default): the taskbar keeps its own colours; only the "
+    L"empty gaps beside its buttons carry the texture. Checked: the texture "
+    L"covers the taskbar as well, so the whole screen reads as one surface. "
+    L"This is the one setting that fights the shell: Windows sometimes tries "
+    L"to hide the taskbar behind the texture, so mnPaper keeps re-asserting "
+    L"it on top while this is on. If you ever see the taskbar disappear, "
+    L"turn this back off - the taskbar returns immediately.\r\n"
     L"  ?        - this window.\r\n"
     L"  Check for updates - compares your version with the published one. "
     L"If a new version exists it offers to download and install it: the "
@@ -3468,6 +3499,7 @@ static void DialogPushSettings(HWND dlg) {
     SetChk(GetDlgItem(dlg, 118), g_s.master);
     SetChk(GetDlgItem(dlg, 119), g_s.autostart);
     SetChk(GetDlgItem(dlg, 120), g_s.autoupd);
+    SetChk(GetDlgItem(dlg, 121), g_s.tapebar);
 }
 
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3500,40 +3532,45 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Mode radios switch Paper <-> E-ink live; the dialog stays open and
          * morphs (SetMode refreshes rows in place). */
         CreateWindowExW(0, L"BUTTON", L"Paper",
-            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 14, 226, 80, 20, hwnd, (HMENU)114,
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 14, 214, 80, 20, hwnd, (HMENU)114,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"E-ink",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 226, 80, 20, hwnd, (HMENU)115,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 100, 214, 80, 20, hwnd, (HMENU)115,
             GetModuleHandleW(NULL), NULL);
         /* Texture on/off: hide the veil without quitting the app (same as the
          * tray's master toggle and Ctrl+Alt+P). */
         CreateWindowExW(0, L"BUTTON", L"&Texture on",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 250, 352, 20, hwnd, (HMENU)118,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 240, 352, 20, hwnd, (HMENU)118,
             GetModuleHandleW(NULL), NULL);
         SetChk(GetDlgItem(hwnd, 118), g_s.master);
         /* Autostart: mirrors the tray's Start-with-Windows item. */
         CreateWindowExW(0, L"BUTTON", L"Start with &Windows",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 272, 352, 20, hwnd, (HMENU)119,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 260, 352, 20, hwnd, (HMENU)119,
             GetModuleHandleW(NULL), NULL);
         /* Same setting as the tray's share toggle. Grayed in e-ink mode:
          * that mode is always capture-excluded (feedback white-out). */
         g_chk_share = CreateWindowExW(0, L"BUTTON", L"Texture in shares/screenshots",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 294, 352, 20, hwnd, (HMENU)113,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 280, 352, 20, hwnd, (HMENU)113,
             GetModuleHandleW(NULL), NULL);
         /* daily self-check opt-out; the download itself is always manual */
         CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 316, 352, 20, hwnd, (HMENU)120,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 300, 352, 20, hwnd, (HMENU)120,
+            GetModuleHandleW(NULL), NULL);
+        /* Paper the taskbar too: the risky half of the taskbar story, so it
+         * is opt-in and off by default (see ComputeHoles). */
+        g_chk_tapebar = CreateWindowExW(0, L"BUTTON", L"Paper the taskbar too",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 320, 352, 20, hwnd, (HMENU)121,
             GetModuleHandleW(NULL), NULL);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
         CreateWindowExW(0, L"BUTTON", L"?",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 338, 26, 24, hwnd, (HMENU)116,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14, 348, 26, 24, hwnd, (HMENU)116,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"&Close",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 338, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 135, 348, 110, 24, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
         /* update check + hash-pinned self-update */
         CreateWindowExW(0, L"BUTTON", L"Check for updates",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 364, 240, 24, hwnd, (HMENU)117,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 81, 376, 240, 24, hwnd, (HMENU)117,
             GetModuleHandleW(NULL), NULL);
         DialogPushSettings(hwnd);   /* every control reflects g_s: one push, one place */
 
@@ -3628,6 +3665,11 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_s.autoupd = IsDlgButtonChecked(hwnd, 120) == BST_CHECKED;
             SaveSettings();
             L("autoupd=%d", g_s.autoupd);
+        } else if (LOWORD(wp) == 121) {
+            g_s.tapebar = IsDlgButtonChecked(hwnd, 121) == BST_CHECKED;
+            SaveSettings();
+            RecomputeHoles();   /* band flips between papered and bare at once */
+            L("tapebar=%d", g_s.tapebar);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
@@ -3785,6 +3827,8 @@ static void TrayMenu(void) {
     AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_STRING | (g_s.autoupd ? MF_CHECKED : 0), IDM_AUTOUPD,
                 L"Check for updates automatically");
+    AppendMenuW(m, MF_STRING | (g_s.tapebar ? MF_CHECKED : 0), IDM_TAPEBAR,
+                L"Paper the taskbar too");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
     GetCursorPos(&pt);
@@ -3947,6 +3991,16 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             L("autoupd=%d", g_s.autoupd);
             break;
+        case IDM_TAPEBAR:
+            g_s.tapebar = g_s.tapebar ? 0 : 1;
+            SaveSettings();
+            RecomputeHoles();   /* repaint the band according to the new choice */
+            {
+                HWND dlg = LiveDlg();
+                if (dlg) SetChk(GetDlgItem(dlg, 121), g_s.tapebar);
+            }
+            L("tapebar=%d", g_s.tapebar);
+            break;
         case IDM_EXIT:
             SaveSettings();
             DestroyWindow(hwnd);
@@ -4003,6 +4057,7 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
     else if (!_wcsicmp(key, L"mode")) s->mode = v ? MODE_EINK : MODE_PAPER;
     else if (!_wcsicmp(key, L"autostart")) { s->autostart = v ? 1 : 0; g_autostart_set = 1; }
     else if (!_wcsicmp(key, L"share")) s->share = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"tapebar")) s->tapebar = v ? 1 : 0;
     else if (!_wcsicmp(key, L"autoupd")) s->autoupd = v ? 1 : 0;
     else if (!_wcsicmp(key, L"master")) s->master = v ? 1 : 0;
     else return 0;

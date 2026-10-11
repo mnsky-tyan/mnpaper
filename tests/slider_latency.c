@@ -492,6 +492,26 @@ int main(void) {
         Check(IsDlgButtonChecked(g_dlg, 114) == BST_CHECKED,
               "paper radio reflects the mode");
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
+        /* The taskbar-texture box: the one setting that decides whether the
+         * veil keeps its hole punched, so it must persist and actually reach
+         * the hole state, not just its own checkbox. */
+        {
+            int saved_tb = -1;
+            Check(g_chk_tapebar && IsWindow(g_chk_tapebar),
+                  "taskbar-texture checkbox is a live control in the settings window");
+            SendMessageW(g_chk_tapebar, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)g_chk_tapebar);
+            Pump(50);
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                saved_tb = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+            }
+            Check(saved_tb == 1, "checking the taskbar box persists tapebar=1");
+            Check(g_s.tapebar == 1, "checking the taskbar box sets the live setting");
+            SendMessageW(g_chk_tapebar, BM_SETCHECK, BST_UNCHECKED, 0);
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)g_chk_tapebar);
+            Pump(50);
+            Check(g_s.tapebar == 0, "unchecking the taskbar box clears the live setting");
+        }
         g_s.master = saved_master;
         SyncMasterCheckbox();   /* the product's own mirror, same as SetMaster uses */
 

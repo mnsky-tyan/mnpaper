@@ -139,7 +139,7 @@ static void CheckLayout(HWND dlg, const char *mode) {
         MapWindowPoints(NULL, dlg, (POINT *)&r, 2);
         printf("  checkbox 120 at %d,%d %dx%d\n",
                (int)r.left, (int)r.top, (int)(r.right - r.left), (int)(r.bottom - r.top));
-        Check(r.left == 14 && r.top == 316 && r.right == 366 && r.bottom == 336,
+        Check(r.left == 14 && r.top == 300 && r.right == 366 && r.bottom == 320,
               "checkbox 120 sits at its design position");
         GetWindowRect(GetDlgItem(dlg, 117), &r);
         MapWindowPoints(NULL, dlg, (POINT *)&r, 2);
