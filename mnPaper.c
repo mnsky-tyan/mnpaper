@@ -205,19 +205,25 @@ static void L(const char *fmt, ...) {
     }
 }
 
+/* One row per clamped field, bounds next to the field they bound: three
+ * parallel arrays make a field added to one of them and forgotten in the
+ * others an out-of-bounds read on every clamp, while a row cannot be half
+ * written. The bound follows the table, so there is no hand-written count to
+ * bump. Same shape as the g_bprops table below. */
 static void ClampSettingsOf(SETTINGS *s) {
-    int *vals[] = { &s->master, &s->mode, &s->intensity, &s->warmth,
-                    &s->grain, &s->fibre, &s->blotch, &s->shades,
-                    &s->contrast, &s->dither, &s->autostart, &s->share,
-                    &s->tapebar, &s->autoupd };
-    int mins[]  = { 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0 };
-    int maxs[]  = { 1, 1, 40, 100, 12, 100, 100, 16, 100, 100, 1, 1, 1, 1 };
+    struct { int *v; int lo, hi; } f[] = {
+        { &s->master,    0,   1 }, { &s->mode,      0,   1 },
+        { &s->intensity, 0,  40 }, { &s->warmth,    0, 100 },
+        { &s->grain,     2,  12 }, { &s->fibre,     0, 100 },
+        { &s->blotch,    0, 100 }, { &s->shades,    2,  16 },
+        { &s->contrast,  0, 100 }, { &s->dither,    0, 100 },
+        { &s->autostart, 0,   1 }, { &s->share,     0,   1 },
+        { &s->tapebar,   0,   1 }, { &s->autoupd,   0,   1 },
+    };
     int i;
-    /* the bound follows the vals array, so a field added there is clamped
-     * even when nobody remembers to bump a hand-written count */
-    for (i = 0; i < (int)(sizeof(vals) / sizeof(vals[0])); i++) {
-        if (*vals[i] < mins[i]) *vals[i] = mins[i];
-        if (*vals[i] > maxs[i]) *vals[i] = maxs[i];
+    for (i = 0; i < (int)(sizeof(f) / sizeof(f[0])); i++) {
+        if (*f[i].v < f[i].lo) *f[i].v = f[i].lo;
+        if (*f[i].v > f[i].hi) *f[i].v = f[i].hi;
     }
 }
 
@@ -1220,15 +1226,6 @@ static void ComputeHoles(void) {
 
 static void RequestPaper(void);
 
-/* Force a hole re-decision and apply it. ComputeHoles only flags dirty when
- * the rect CHANGES, so flipping g_s.tapebar off a zero hole (paper the
- * taskbar -> keep the hole bare) leaves the band textured on screen until the
- * taskbar moves. This clears the latched hole state first so the next pass
- * always sees a change, then runs the same apply path Housekeeping uses.
- * CollectTaskbars is deliberately NOT called here: this runs on the UI thread
- * (a checkbox click or a tray command) while Housekeeping owns the taskbar
- * enumeration on its own timer, and re-walking it from two threads would race
- * the g_tb table. The next Housekeeping pass re-walks and confirms. */
 /* The shared hole-dirty apply: RecomputeHoles and Housekeeping both land
  * here, so the gating and the mode dispatch live in exactly one place. */
 static void ApplyHoleRefresh(void) {
@@ -1245,10 +1242,22 @@ static void ApplyHoleRefresh(void) {
         EinkPresent();
 }
 
+/* Re-decide the holes and apply the result at once, so the taskbar checkbox
+ * and the tray item take effect on the click instead of on the next timer
+ * tick. Nothing is forced here: ComputeHoles compares newon[i] against the
+ * latched g_hole_on[i] as well as the rect, so a hole OPENING and a hole
+ * CLOSING are both changes and both arm the re-upload - which is the whole
+ * reason both directions of g_s.tapebar reach the screen. Pre-clearing the
+ * latched state to "make sure" a change is seen does the opposite: a hole
+ * that is now closed compares equal to the cleared zero, no re-upload runs,
+ * and the band keeps the transparency of the previous upload, so the taskbar
+ * stays untextured for good on a static screen (2026-10-11 review).
+ * CollectTaskbars is deliberately NOT called here: this runs on the UI thread
+ * (a checkbox click or a tray command) while Housekeeping owns the taskbar
+ * enumeration on its own timer, and re-walking it from two threads would race
+ * the g_tb table. The next Housekeeping pass re-walks and confirms. */
 static void RecomputeHoles(void) {
-    int i;
-    for (i = 0; i < MAX_MON; i++) g_hole_on[i] = 0;
-    ComputeHoles();   /* sets g_hole_dirty: every slot was cleared above */
+    ComputeHoles();
     ApplyHoleRefresh();
 }
 

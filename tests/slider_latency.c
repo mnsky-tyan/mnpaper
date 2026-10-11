@@ -106,10 +106,17 @@ int main(void) {
     /* Warm-up: a cold process's first paint pays DLL paging, DIB allocation
      * and worker start-up, which is not the drag latency this suite measures
      * (and on a busy desktop it alone crosses the 250ms budget). One
-     * throwaway move settles that, then the state is re-baselined so the
-     * timed stream below measures steady state - what a user mid-drag
-     * actually experiences. */
+     * throwaway move settles that, and it is DRAINED to completion before the
+     * state is re-baselined: an in-flight warm-up frame landing after the
+     * re-baseline would satisfy "pixels changed within 250ms" on the warm-up's
+     * own work rather than the drag's, which is the case this re-baseline
+     * exists to exclude. The trailing debounce is cancelled first so nothing
+     * else from the warm-up is still queued behind the baseline. */
     Slider(12); Pump(300);
+    KillTimer(g_dlg, TIMER_DEBOUNCE);
+    final_gen = g_pgen;
+    stop = GetTickCount() + 10000;
+    while (last_applied_gen < final_gen && (LONG)(GetTickCount() - stop) < 0) Pump(20);
     started = GetTickCount(); first_pixel_ms = 0;
     previous_hash = PixelHash(g_ov[0].bits, (size_t)rc.right * rc.bottom * 4);
     /* A slow enough step stream to mimic dragging without ever moving the cursor. */
@@ -500,9 +507,13 @@ int main(void) {
         Check(IsDlgButtonChecked(g_dlg, 114) == BST_CHECKED,
               "paper radio reflects the mode");
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
-        /* The taskbar-texture box: the one setting that decides whether the
-         * veil keeps its hole punched, so it must persist and actually reach
-         * the hole state, not just its own checkbox. */
+        /* The taskbar-texture box: what this suite can prove about it is the
+         * click path - the live control exists, the real WM_COMMAND handler
+         * persists tapebar to the scratch hive and moves the live setting in
+         * both directions. The hole state the setting decides is asserted by
+         * hole_cycle.c, which drives the same click entry (RecomputeHoles)
+         * with a taskbar synthesized; here master is off and no taskbar is
+         * enumerated, so ApplyHoleRefresh has nothing to re-upload. */
         {
             int saved_tb = -1;
             Check(g_chk_tapebar && IsWindow(g_chk_tapebar),

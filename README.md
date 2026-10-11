@@ -96,7 +96,7 @@ The build produces `mnPaper.exe` in the repo root.
   always-on-top paper over the taskbar instead makes Windows drop the
   taskbar's own topmost state, which is why it steps aside rather than
   covering it. Taskbars shown on secondary displays get the same treatment.
-  If you want the texture over the taskbar too, turn on "Paper the taskbar"
+  If you want the texture over the taskbar too, turn on "Paper the taskbar too"
   in Settings or the tray menu: mnPaper then keeps re-asserting the taskbar
   on top, and turning it off restores the behaviour above immediately.
 - The settings window keeps a compact fixed-size layout rather than scaling

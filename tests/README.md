@@ -31,6 +31,8 @@ Covered:
 - Two-monitor rendering after a 200-request burst.
 - The settings-window share checkbox (id 113) persists `share` and flips the
   real `WDA_EXCLUDEFROMCAPTURE` affinity on the hidden overlay strip.
+- The settings-window taskbar checkbox (id 121) persists `tapebar` in the
+  scratch hive and moves the live `g_s.tapebar` in both directions.
 - Mode radios (id 114/115): SetMode morphs the open dialog in place (rows
   swap, radios reflect, share checkbox greys in e-ink) and persists `mode`.
 - The Texture-on checkbox (id 118) reflects the current master state on open;
@@ -141,8 +143,8 @@ rebuild and run in one go, or exclude the temp directory.
   byte-identical - every byte), odd preview sizes, warmth/grain/fibre/blotch
   structure, help window, update-feed parsing (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
-  63/65-char runs refused), and the share/mode/texture-on/
-  autostart controls against a PID-suffixed scratch hive.
+  63/65-char runs refused), the share/mode/texture-on/autostart controls and
+  the taskbar-texture checkbox (id 121) against a PID-suffixed scratch hive.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker
   render, pointer swap, newest-wins, settings re-render on a static screen,
@@ -174,7 +176,13 @@ rebuild and run in one go, or exclude the temp directory.
   hitting the cap is proven to log what was dropped, and `MonRectCb` is driven
   headlessly past `MAX_MON` to prove the monitor cap stores a monitor with one
   slot free and logs what is lost; the fakes are destroyed before the suite
-  returns and never intersect the virtual screen.
+  returns and never intersect the virtual screen. The `tapebar` opt-in is
+  driven through the real click entry `RecomputeHoles` from the LATCHED state
+  in both directions (open hole -> tapebar on, closed hole -> tapebar off), and
+  the change is observed as the `taskbar hole N ON/off` line that arms the
+  re-upload, plus the latched rect itself - so a pass that fails to notice the
+  change fails the suite, and an unchanged pass must log nothing (no re-upload
+  on every tick).
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
   the settings struct (sliders, checkboxes, the mode radio pair), each numeric
   readout is asserted to show its own bar's value (the label-to-bar pairing no
@@ -191,7 +199,12 @@ rebuild and run in one go, or exclude the temp directory.
   are deleted before the suite returns).
 - `verify_fixes.c` - the extracted feed-size cap (`FeedFits`) boundary, the
   show path never falling back to a full synchronous build, the hole
-  save/restore being byte-identical, and the `LiveDlg` owner rule.
+  save/restore being byte-identical, the `LiveDlg` owner rule, and the
+  `--set key=value` contract driven through the real parser: recognised keys
+  case-insensitively (`tapebar`, `master`, `mode`), values digits only, so a
+  negative, non-numeric, empty or unknown entry is refused rather than stored
+  as a silent 0, and out-of-range values parse unclamped and are then bounded
+  by the `ClampSettingsOf` pass `ApplySets` runs after them.
 - `tall_coverage.c` - the strip stack over tall monitors: it drives the real
   `MakeOverlay` on 4K-portrait, 5K-portrait, 8K and very-tall rects and walks
   each created strip window's own `GetWindowRect` to prove the union covers the
