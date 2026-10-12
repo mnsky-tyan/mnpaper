@@ -31,8 +31,10 @@ Covered:
 - Two-monitor rendering after a 200-request burst.
 - The settings-window share checkbox (id 113) persists `share` and flips the
   real `WDA_EXCLUDEFROMCAPTURE` affinity on the hidden overlay strip.
-- The settings-window taskbar checkbox (id 121) persists `tapebar` in the
-  scratch hive and moves the live `g_s.tapebar` in both directions.
+- The settings-window taskbar radio group (ids 121/122/123, `tbmode` 0/1/2)
+  persists the mode to the scratch hive, moves the live `g_s.tbmode`, keeps
+  the group mutually exclusive, and deletes a seeded legacy `tapebar` key.
+  Clicking 123 means paper over; 121 means bare.
 - Mode radios (id 114/115): SetMode morphs the open dialog in place (rows
   swap, radios reflect, share checkbox greys in e-ink) and persists `mode`.
 - The Texture-on checkbox (id 118) reflects the current master state on open;
@@ -144,7 +146,8 @@ rebuild and run in one go, or exclude the temp directory.
   structure, help window, update-feed parsing (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
   63/65-char runs refused), the share/mode/texture-on/autostart controls and
-  the taskbar-texture checkbox (id 121) against a PID-suffixed scratch hive.
+  the taskbar mode radio group (ids 121/122/123) against a PID-suffixed
+  scratch hive.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker
   render, pointer swap, newest-wins, settings re-render on a static screen,
@@ -176,17 +179,26 @@ rebuild and run in one go, or exclude the temp directory.
   hitting the cap is proven to log what was dropped, and `MonRectCb` is driven
   headlessly past `MAX_MON` to prove the monitor cap stores a monitor with one
   slot free and logs what is lost; the fakes are destroyed before the suite
-  returns and never intersect the virtual screen. The `tapebar` opt-in is
-  driven through the real click entry `RecomputeHoles` from the LATCHED state
-  in both directions (open hole -> tapebar on, closed hole -> tapebar off), and
-  the change is observed as the `taskbar hole N ON/off` line that arms the
-  re-upload, plus the latched rect itself - so a pass that fails to notice the
-  change fails the suite, and an unchanged pass must log nothing (no re-upload
-  on every tick).
+  returns and never intersect the virtual screen. All three taskbar modes are
+  driven through the real click entry `RecomputeHoles` from the LATCHED state:
+  hole (default) opens the hole over a revealed band, cover closes it, and
+  paper over keeps the rect but changes its KIND - the case where the geometry
+  compares equal and only `g_tb_mode` can make the pass dirty. The change is
+  observed as the `taskbar hole N ON/off mode=N` line that arms the re-upload,
+  plus the latched rect, so a pass that fails to notice the change fails the
+  suite, and an unchanged pass must log nothing (no re-upload on every tick).
+  The band transform itself is asserted on pixels: `ClearHoleAlpha` and
+  `RestoreHoleAlpha` are driven directly so what actually goes to the screen is
+  measured - bare means zero alpha, paper over lands inside the alpha window
+  under the cap with its spread intact, and the master comes back
+  byte-identical - and the same transform is checked against the e-ink regime
+  (straight grey at alpha 255), where the RGB must move with the alpha.
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
-  the settings struct (sliders, checkboxes, the mode radio pair), each numeric
-  readout is asserted to show its own bar's value (the label-to-bar pairing no
-  other suite checks), and a destroyed dialog is refused rather than pushed to.
+  the settings struct (sliders, checkboxes, the mode radio pair and the
+  taskbar radio group 121/122/123, whose push must clear the other two radios),
+  each numeric readout is asserted to show its own bar's value (the
+  label-to-bar pairing no other suite checks), and a destroyed dialog is
+  refused rather than pushed to.
   It also pins the tray's explorer-restart branch end to end: it stores the
   real `TaskbarCreated` message value, posts it to the host window and asserts
   the branch reports itself (headless runs suppress the real
@@ -201,10 +213,12 @@ rebuild and run in one go, or exclude the temp directory.
   show path never falling back to a full synchronous build, the hole
   save/restore being byte-identical, the `LiveDlg` owner rule, and the
   `--set key=value` contract driven through the real parser: recognised keys
-  case-insensitively (`tapebar`, `master`, `mode`), values digits only, so a
-  negative, non-numeric, empty or unknown entry is refused rather than stored
-  as a silent 0, and out-of-range values parse unclamped and are then bounded
-  by the `ClampSettingsOf` pass `ApplySets` runs after them.
+  case-insensitively (`tbmode`, `master`, `mode`, and the legacy `tapebar`
+  alias), values digits only, so a negative, non-numeric, empty or unknown
+  entry is refused rather than stored as a silent 0. Out-of-range values parse
+  unclamped and are then bounded by the `ClampSettingsOf` pass `ApplySets`
+  runs after them - except `tbmode`, which clamps inside the parser too, so
+  its bound is asserted directly.
 - `tall_coverage.c` - the strip stack over tall monitors: it drives the real
   `MakeOverlay` on 4K-portrait, 5K-portrait, 8K and very-tall rects and walks
   each created strip window's own `GetWindowRect` to prove the union covers the

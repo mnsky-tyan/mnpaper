@@ -507,29 +507,65 @@ int main(void) {
         Check(IsDlgButtonChecked(g_dlg, 114) == BST_CHECKED,
               "paper radio reflects the mode");
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
-        /* The taskbar-texture box: what this suite can prove about it is the
-         * click path - the live control exists, the real WM_COMMAND handler
-         * persists tapebar to the scratch hive and moves the live setting in
-         * both directions. The hole state the setting decides is asserted by
-         * hole_cycle.c, which drives the same click entry (RecomputeHoles)
-         * with a taskbar synthesized; here master is off and no taskbar is
-         * enumerated, so ApplyHoleRefresh has nothing to re-upload. */
+        /* The taskbar mode radios: what this suite can prove about them is the
+         * click path - the real WM_COMMAND handler persists tbmode to the
+         * scratch hive and moves the live setting. The band state the setting
+         * decides is asserted by hole_cycle.c, which drives the same click
+         * entry (RecomputeHoles) with a synthesized taskbar; here master is off
+         * and no taskbar is enumerated, so ApplyHoleRefresh has nothing to
+         * re-upload. */
         {
             int saved_tb = -1;
-            Check(g_chk_tapebar && IsWindow(g_chk_tapebar),
-                  "taskbar-texture checkbox is a live control in the settings window");
-            SendMessageW(g_chk_tapebar, BM_SETCHECK, BST_CHECKED, 0);
-            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)g_chk_tapebar);
+            HWND r1 = GetDlgItem(g_dlg, 121), r3 = GetDlgItem(g_dlg, 123);
+            Check(r1 && IsWindow(r1) && r3 && IsWindow(r3),
+                  "the taskbar radio group is live controls in the settings window");
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(123, BN_CLICKED), (LPARAM)r3);
             Pump(50);
             if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
-                saved_tb = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+                saved_tb = GetDword(key, L"tbmode", -1); RegCloseKey(key);
             }
-            Check(saved_tb == 1, "checking the taskbar box persists tapebar=1");
-            Check(g_s.tapebar == 1, "checking the taskbar box sets the live setting");
-            SendMessageW(g_chk_tapebar, BM_SETCHECK, BST_UNCHECKED, 0);
-            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)g_chk_tapebar);
+            Check(saved_tb == TB_PAPER, "clicking 'Paper over' persists tbmode=2");
+            Check(g_s.tbmode == TB_PAPER, "clicking 'Paper over' sets the live setting");
+            Check(IsDlgButtonChecked(g_dlg, 123) == BST_CHECKED &&
+                  IsDlgButtonChecked(g_dlg, 121) != BST_CHECKED,
+                  "the radio group followed the click (one group, one value)");
+            /* the alias an old command line still uses, through the same door */
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
             Pump(50);
-            Check(g_s.tapebar == 0, "unchecking the taskbar box clears the live setting");
+            Check(g_s.tbmode == TB_HOLE, "clicking 'Bare' clears the live setting to hole");
+            /* The legacy key must not survive, and it has to be SEEDED first:
+             * the scratch hive is fresh for this run and nothing ever wrote
+             * tapebar into it, so reading it without seeding pins nothing (it
+             * would still pass with the deletion removed). Seed the state an
+             * install last touched by an older build is actually in, then take
+             * one more click so SaveSettings runs, and only then assert it is
+             * gone. The click leaves tbmode at hole, the default. */
+            {
+                HKEY seed;
+                int one = 1, seeded = -1;
+                HWND r2 = GetDlgItem(g_dlg, 122);
+                if (RegCreateKeyExW(HKEY_CURRENT_USER, scratch, 0, NULL, 0,
+                                    KEY_SET_VALUE, NULL, &seed, NULL) == ERROR_SUCCESS) {
+                    RegSetValueExW(seed, L"tapebar", 0, REG_DWORD, (BYTE *)&one, sizeof one);
+                    RegCloseKey(seed);
+                }
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                    seeded = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+                }
+                Check(seeded == 1, "the seeded legacy tapebar key is present before the save");
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(122, BN_CLICKED), (LPARAM)r2);
+                Pump(50);
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
+                Pump(50);
+                saved_tb = -1;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                    saved_tb = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+                }
+                Check(saved_tb == -1,
+                      "the legacy tapebar key is deleted on save (tbmode is the only truth)");
+                Check(g_s.tbmode == TB_HOLE,
+                      "the seeded-legacy sequence leaves the live mode back at the default");
+            }
         }
         g_s.master = saved_master;
         SyncMasterCheckbox();   /* the product's own mirror, same as SetMaster uses */

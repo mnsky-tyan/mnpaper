@@ -71,7 +71,7 @@
 #define IDM_SETTINGS    9004
 #define IDM_STRENGTH    9007      /* + index: 10/20/30/40 */
 #define IDM_SHARE       9020
-#define IDM_TAPEBAR     9022
+#define IDM_TBMODE      9023      /* + mode index: hole / cover / paper over */
 #define IDM_AUTOSTART   9005
 #define IDM_AUTOUPD     9021
 #define IDM_EXIT        9006
@@ -136,10 +136,37 @@ typedef struct {
     int dither;
     int autostart;
     int share;     /* 1 = the texture is visible in screenshots / screen shares */
-    int tapebar;   /* 1 = paper the taskbar too, 0 = keep the hole punched
-                    * (default) so the shell's own bar stays untextured */
+    int tbmode;    /* how the veil meets a revealed taskbar:
+                    *   0 = hole  - punch it transparent so the bare shell bar
+                    *              shows through (default; the untextured box
+                    *              that follows the bar)
+                    *   1 = cover - no hole; the opaque veil hides the bar
+                    *   2 = paper - keep a scaled alpha over the bar so the
+                    *              texture reads on it and the bar shows
+                    *              through underneath */
     int autoupd;   /* 1 = look for a new version about once a day (never auto-install) */
 } SETTINGS;
+
+#define TB_HOLE   0     /* punch the bar transparent: bare shell bar shows through */
+#define TB_COVER  1     /* no hole: the veil hides the bar */
+#define TB_PAPER  2     /* scaled alpha over the bar: texture reads, bar shows through */
+/* How strong the paper is over the bar in paper-over mode. Measured (not
+ * guessed) with the shipped build's own PaperPixel over a 1440x52 band: at the
+ * live settings the veil's alpha averages only 18/255 (7%, max 42), because
+ * alpha IS the paper's grain, not a wash of colour. So the veil as it stands
+ * is about a 2% lift on the bar - essentially nothing - and "keep 55% of the
+ * veil's alpha" would have been invisible. The band's alpha is therefore
+ * scaled UP by TB_PAPER_BOOST and capped at TB_PAPER_CAP:
+ *   x3, cap 128 -> mean 55/255 (21%): the bar keeps 79% of its own tone, the
+ *                    spread (sd 13 of 55) is preserved so the grain still
+ *                    reads, and nothing saturates at Strength 40.
+ *   x4 saturates 12% of the band at Strength 40 and flattens the texture.
+ *   x2 (14%) is too faint to notice.
+ * The cap is a CEILING, not a floor: at Subtle (10) the band scales to ~3%
+ * instead of 21%, so paper-over follows Strength and a deliberate papered bar
+ * stays a deliberate choice. */
+#define TB_PAPER_BOOST 3
+#define TB_PAPER_CAP   128
 
 static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
 
@@ -170,7 +197,7 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
 static SETTINGS g_s = { .master = 1, .mode = MODE_PAPER, .intensity = 30,
                         .warmth = 45, .grain = 4, .fibre = 40, .blotch = 30,
                         .shades = 4, .contrast = 50, .dither = 75,
-                        .autostart = 0, .share = 0, .tapebar = 0,
+                        .autostart = 0, .share = 0, .tbmode = TB_HOLE,
                         .autoupd = 1 };
 /* Test mode: the hidden regression suites set this before anything runs. It
  * gates every side effect a test must not perform (windows on the working
@@ -218,7 +245,7 @@ static void ClampSettingsOf(SETTINGS *s) {
         { &s->blotch,    0, 100 }, { &s->shades,    2,  16 },
         { &s->contrast,  0, 100 }, { &s->dither,    0, 100 },
         { &s->autostart, 0,   1 }, { &s->share,     0,   1 },
-        { &s->tapebar,   0,   1 }, { &s->autoupd,   0,   1 },
+        { &s->tbmode,    0,   TB_PAPER }, { &s->autoupd,   0,   1 },
     };
     int i;
     for (i = 0; i < (int)(sizeof(f) / sizeof(f[0])); i++) {
@@ -310,7 +337,10 @@ static void SaveSettings(void) {
     /* no "autostart" value here: LoadSettings derives it from the Run key,
      * so a stored copy could only diverge from the truth (2026-10-04 review) */
     RegSetValueExW(k, L"share",     0, REG_DWORD, (BYTE *)&g_s.share,     sizeof(int));
-    RegSetValueExW(k, L"tapebar",   0, REG_DWORD, (BYTE *)&g_s.tapebar,  sizeof(int));
+    RegSetValueExW(k, L"tbmode",    0, REG_DWORD, (BYTE *)&g_s.tbmode,   sizeof(int));
+    /* tbmode is the only taskbar key from here on; a stale tapebar left from
+     * an older install would otherwise sit in the hive forever, ignored. */
+    RegDeleteValueW(k, L"tapebar");
     RegSetValueExW(k, L"autoupd",   0, REG_DWORD, (BYTE *)&g_s.autoupd,   sizeof(int));
     RegSetValueExW(k, L"lastupd",   0, REG_QWORD, (BYTE *)&g_lastupd,    sizeof(g_lastupd));
     RegSetValueExW(k, L"updfails",  0, REG_DWORD, (BYTE *)&g_upd_fails,  sizeof(g_upd_fails));
@@ -339,7 +369,18 @@ static void LoadSettings(void) {
         g_s.contrast  = GetDword(k, L"contrast",  g_s.contrast);
         g_s.dither    = GetDword(k, L"dither",    g_s.dither);
         g_s.share     = GetDword(k, L"share",     g_s.share);
-        g_s.tapebar   = GetDword(k, L"tapebar",   0);   /* default: taskbar stays bare */
+        /* tbmode replaced the tapebar switch. An install that never chose
+         * tbmode still has tapebar on disk, and dropping it would silently
+         * revert that machine to the default: 0 -> hole, 1 -> cover. A tbmode
+         * value, once written, wins outright and the old key is ignored. */
+        {
+            DWORD v = 0, sz = sizeof(v), t = 0;
+            if (RegQueryValueExW(k, L"tbmode", NULL, &t, (BYTE *)&v, &sz) == ERROR_SUCCESS
+                && t == REG_DWORD)
+                g_s.tbmode = (int)v;
+            else
+                g_s.tbmode = GetDword(k, L"tapebar", TB_HOLE) ? TB_COVER : TB_HOLE;
+        }
         g_s.autoupd   = GetDword(k, L"autoupd",   1);   /* default: daily check on */
         {
             DWORD sz = sizeof(ULONGLONG), t = 0;
@@ -456,6 +497,13 @@ static int  g_n;
  * which side of the overlay it sits on. */
 static RECT g_hole[MAX_MON];
 static int  g_hole_on[MAX_MON];
+/* What kind of band this monitor's rect is: TB_HOLE (bare) or TB_PAPER
+ * (papered). The presentation layer cannot re-derive it in time: the mode can
+ * change between the upload that read it and the click that has to undo it, so
+ * a papered band restored as a hole would leave the tinted pixels in the master
+ * texture. TB_COVER sets no rect at all and needs no state. Indexed exactly
+ * like g_hole / g_hole_on and written by the same code that writes them. */
+static int  g_tb_mode[MAX_MON];
 static int  g_hole_dirty;
 static HWND g_host;
 static int  g_force_capture_show;   /* --no-exclude validation flag, session only */
@@ -715,8 +763,43 @@ static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
                (size_t)(x1 - x0) * 4);
 }
 
-/* Save the hole rect's pixels, zero their alpha, and hand the saved block back
- * so the caller can restore it after the upload.
+/* The paper-over variant: instead of zeroing the rect's alpha, RAISE it toward
+ * the paper's normal strength so the texture reads ON the bar while the shell's
+ * own glyphs still show through underneath. The veil's own alpha is far too
+ * faint for this (measured: ~7% at Strength 40), which is why the band is
+ * scaled up rather than left alone or scaled down. ULW blends by premultiplied
+ * alpha, so the RGB has to be moved WITH the alpha: PaperPixel stores
+ * RGB = colour * alpha / 255, and raising the alpha alone would leave that
+ * RGB too high for the new alpha and brighten the paper. Multiplying the RGB
+ * by the same factor a_new/a_old keeps the pixel's own tone (highlight or
+ * shadow) and only moves how much of it lands on the bar.
+ *
+ * Like PunchHoleAlpha this writes ov->bits in place. That is safe for the same
+ * reason in both callers: the paper path saves the rect first (ClearHoleAlpha)
+ * and puts it back after the upload (RestoreHoleAlpha), and the e-ink path
+ * re-copies the whole buffer from the published frame on every present. */
+static void TintHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
+    int x, y;
+    if (!ov->bits || !on) return;
+    for (y = y0; y < y1; y++) {
+        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4;
+        for (x = 0; x < x1 - x0; x++) {
+            unsigned char *p = row + (size_t)x * 4;
+            int a = p[3] * TB_PAPER_BOOST;
+            if (a > TB_PAPER_CAP) a = TB_PAPER_CAP;
+            if (p[3]) {                       /* a zero-alpha pixel has no tone to keep */
+                int r = p[0] * a / p[3], g = p[1] * a / p[3], b = p[2] * a / p[3];
+                p[0] = (unsigned char)(r > 255 ? 255 : r);
+                p[1] = (unsigned char)(g > 255 ? 255 : g);
+                p[2] = (unsigned char)(b > 255 ? 255 : b);
+            }
+            p[3] = (unsigned char)a;
+        }
+    }
+}
+
+/* Save the band rect's pixels, apply this monitor's band transform, and hand
+ * the saved block back so the caller can restore it after the upload.
  *
  * The ALPHA is per-pixel noise (PaperPixel derives it from grain, fibre and
  * blotch), so it cannot be guessed back - it has to be saved. That is what
@@ -725,7 +808,11 @@ static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
  * punched would keep a transparent band after the taskbar parked. Forcing a
  * constant alpha back would instead flatten the paper's own transparency. The
  * save is only ever the hole rect (a taskbar strip), and RestoreHoleAlpha
- * frees it. */
+ * frees it.
+ *
+ * The transform is chosen by the band's KIND (g_tb_mode), not by the current
+ * g_s.tbmode: the mode may have moved on since this rect was decided, and the
+ * pixels saved here must be exactly what the upload undoes. */
 static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
     int on, x0, y0, x1, y1, y;
     size_t rowbytes;
@@ -744,10 +831,13 @@ static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, in
         memcpy(*saved + rowbytes * (size_t)(y - y0),
                (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4,
                rowbytes);
-    /* Punch the same rect that was just saved, never a re-read of the live
-     * hole: a punch wider than the save would zero alpha on pixels nothing
-     * restores, leaving a permanent transparent band. */
-    PunchHoleAlpha(ov, on, x0, y0, x1, y1);
+    /* Transform the same rect that was just saved, never by re-reading the live
+     * hole: a band wider than the save would tint pixels nothing restores,
+     * leaving a permanent altered band in the master texture. */
+    if (ov->idx >= 0 && ov->idx < MAX_MON && g_tb_mode[ov->idx] == TB_PAPER)
+        TintHoleAlpha(ov, on, x0, y0, x1, y1);
+    else
+        PunchHoleAlpha(ov, on, x0, y0, x1, y1);
 }
 
 /* Put the saved pixels back where they came from. Called after the upload, on
@@ -1169,9 +1259,10 @@ static void ComputeHoles(void) {
     int i, j;
     RECT newh[MAX_MON];
     int  newon[MAX_MON];
+    int  newmode[MAX_MON];
 
     memset(newh, 0, sizeof(newh));
-    for (i = 0; i < g_n; i++) newon[i] = 0;
+    for (i = 0; i < g_n; i++) { newon[i] = 0; newmode[i] = TB_HOLE; }
     for (j = 0; j < g_ntb; j++) {
         int mon = -1;
         RECT on;
@@ -1191,7 +1282,7 @@ static void ComputeHoles(void) {
         /* The veil steps aside from the taskbar by default: painting paper
          * over it makes Windows drop the taskbar's topmost state and sink it
          * behind every window (see the hole note above g_hole). The user can
-         * opt into papering the taskbar anyway (g_s.tapebar), and that choice
+         * opt into papering the taskbar anyway (g_s.tbmode), and that choice
          * is only safe while we keep re-asserting the taskbar's topmost bit
          * here: the shell strips it whenever a topmost full-screen veil is
          * up, so without the raise the bar would sink exactly as it did
@@ -1201,13 +1292,17 @@ static void ComputeHoles(void) {
         if (g_tbw[j])
             SetWindowPos(g_tbw[j], HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        if (!g_s.tapebar) {              /* default: step aside, punch the hole */
-            if (newon[mon]) UnionRect(&newh[mon], &newh[mon], &on);
-            else { newh[mon] = on; newon[mon] = 1; }
+        if (g_s.tbmode != TB_COVER) {    /* hole (default) or a papered band */
+            if (newon[mon]) { UnionRect(&newh[mon], &newh[mon], &on); newmode[mon] = g_s.tbmode; }
+            else { newh[mon] = on; newon[mon] = 1; newmode[mon] = g_s.tbmode; }
         }
     }
     for (i = 0; i < g_n; i++) {
-        int changed = newon[i] != g_hole_on[i];
+        /* A band is dirty when it opens, closes, MOVES, or when the same rect
+         * changes KIND (hole -> papered or back). The kind matters because the
+         * upload applies a different transform to the same pixels. */
+        int changed = newon[i] != g_hole_on[i] ||
+                      (newon[i] && newmode[i] != g_tb_mode[i]);
         if (!changed && newon[i] &&
             (newh[i].left != g_hole[i].left || newh[i].top != g_hole[i].top ||
              newh[i].right != g_hole[i].right || newh[i].bottom != g_hole[i].bottom))
@@ -1215,9 +1310,10 @@ static void ComputeHoles(void) {
         if (changed) {
             g_hole[i] = newh[i];
             g_hole_on[i] = newon[i];
+            g_tb_mode[i] = newon[i] ? newmode[i] : TB_HOLE;
             g_hole_dirty = 1;
-            L("taskbar hole %d %s rect=(%ld,%ld)-(%ld,%ld) on-screen=%ld",
-              i, newon[i] ? "ON" : "off",
+            L("taskbar hole %d %s mode=%d rect=(%ld,%ld)-(%ld,%ld) on-screen=%ld",
+              i, newon[i] ? "ON" : "off", newon[i] ? newmode[i] : TB_HOLE,
               newh[i].left, newh[i].top, newh[i].right, newh[i].bottom,
               newon[i] ? newh[i].bottom - newh[i].top : 0);
         }
@@ -1247,7 +1343,7 @@ static void ApplyHoleRefresh(void) {
  * tick. Nothing is forced here: ComputeHoles compares newon[i] against the
  * latched g_hole_on[i] as well as the rect, so a hole OPENING and a hole
  * CLOSING are both changes and both arm the re-upload - which is the whole
- * reason both directions of g_s.tapebar reach the screen. Pre-clearing the
+ * reason every direction of g_s.tbmode reaches the screen. Pre-clearing the
  * latched state to "make sure" a change is seen does the opposite: a hole
  * that is now closed compares equal to the cleared zero, no re-upload runs,
  * and the band keeps the transparency of the previous upload, so the taskbar
@@ -1751,13 +1847,20 @@ static int PresentEinkRect(OVL *ov) {
     }
     LeaveCriticalSection(&g_ecs);
     if (!got) return 0;
-    /* Same hole rule as the paper path, punched in place: this buffer is
+    /* Same band rule as the paper path, applied in place: this buffer is
      * re-copied from g_eproc_show at the top of every present, so the pixels
-     * under the hole are disposable. Housekeeping re-presents on every hole
-     * change, so a parked taskbar cannot leave a stale band in the upload. */
+     * under the band are disposable. Housekeeping re-presents on every hole
+     * change, so a parked taskbar cannot leave a stale band in the upload.
+     *
+     * In e-ink the pixels are an UNpremultiplied grey at alpha 255, and
+     * TintHoleAlpha preserves the RGB/alpha ratio, so the same transform lands
+     * on the bar as a correct grey wash rather than a wrong one. */
     { int hon, hx0, hy0, hx1, hy1;
       LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
-      PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1); }
+      if (hon && ov->idx >= 0 && ov->idx < MAX_MON && g_tb_mode[ov->idx] == TB_PAPER)
+          TintHoleAlpha(ov, hon, hx0, hy0, hx1, hy1);
+      else
+          PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1); }
     return 1;
 }
 
@@ -2583,7 +2686,6 @@ static void DumpEink(const char *path, int w, int h) {
 static HWND g_tb_intensity, g_tb_warmth, g_tb_grain, g_tb_fibre, g_tb_blotch;
 static HWND g_tb_shades, g_tb_contrast, g_tb_dither, g_btn_adv;
 static HWND g_chk_share;   /* settings-window mirror of the tray share toggle */
-static HWND g_chk_tapebar; /* settings-window mirror of the tray taskbar toggle */
 static void ActivateMode(int mode);   /* defined in the commands section below */
 static HWND g_lb_strength, g_lb_warmth, g_lb_grain, g_lb_fibre, g_lb_blotch;
 static HWND g_lb_shades, g_lb_contrast, g_lb_dither;
@@ -2607,10 +2709,13 @@ static int ConfirmEink(HWND owner) {
         L"mnPaper - about E-ink mode", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
 }
 
-/* One place for the four boolean settings: the dialog checkboxes set them,
- * the tray menu toggles them, and both paths save, run the side effect,
- * mirror the open settings window and log through here. */
-enum { BB_SHARE, BB_AUTOSTART, BB_AUTOUPD, BB_TAPEBAR, BB_COUNT };
+/* One place for the boolean settings that behave identically: the dialog
+ * checkboxes set them, the tray menu toggles them, and both paths save, run
+ * the side effect, mirror the open settings window and log through here.
+ * The taskbar choice is NOT in this table: it has three values, so toggling
+ * it (value ? 1 : 0) would silently fold "paper over" back to "cover";
+ * ApplyTbMode owns that one. */
+enum { BB_SHARE, BB_AUTOSTART, BB_AUTOUPD, BB_COUNT };
 static const struct {
     int *field;
     int  chk;                 /* the settings-window checkbox id */
@@ -2620,7 +2725,6 @@ static const struct {
     { &g_s.share,     113, ApplyCaptureAll, "share"     },
     { &g_s.autostart, 119, NULL,            "autostart" },
     { &g_s.autoupd,   120, NULL,            "autoupd"   },
-    { &g_s.tapebar,   121, RecomputeHoles,  "tapebar"   },
 };
 
 static void ApplyBool(int which, int value) {
@@ -2633,6 +2737,25 @@ static void ApplyBool(int which, int value) {
         if (dlg) SetChk(GetDlgItem(dlg, g_bprops[which].chk), *g_bprops[which].field);
     }
     L("%s=%d", g_bprops[which].name, *g_bprops[which].field);
+}
+
+static const WCHAR *TB_MODE_NAMES[3] = { L"Leave the taskbar bare", L"Cover the taskbar", L"Paper over the taskbar" };
+static void SyncTbRadios(HWND dlg, int id);   /* defined with the other radio mirrors */
+
+/* The one path that changes the taskbar mode: dialog radio or tray item.
+ * Saves, re-decides the bands so the click takes effect immediately, mirrors
+ * the open settings window and logs - same shape as ApplyBool, but with a
+ * three-valued field and the radio group instead of a checkbox. */
+static void ApplyTbMode(int mode) {
+    HWND dlg;
+    if (mode < TB_HOLE) mode = TB_HOLE;
+    if (mode > TB_PAPER) mode = TB_PAPER;
+    g_s.tbmode = mode;
+    SaveSettings();
+    RecomputeHoles();
+    dlg = LiveDlg();
+    if (dlg) SyncTbRadios(dlg, 121 + mode);
+    L("tbmode=%d", mode);
 }
 
 static const WCHAR HELP_TEXT[] =
@@ -2676,14 +2799,27 @@ static const WCHAR HELP_TEXT[] =
     L"    Unchecked (default): screenshots and screen shares see the clean "
     L"desktop while you still see the texture. Checked: captures include "
     L"the texture. E-ink is always hidden from captures.\r\n"
-    L"  Paper the taskbar too\r\n"
-    L"    Unchecked (default): the taskbar keeps its own colours; only the "
-    L"empty gaps beside its buttons carry the texture. Checked: the texture "
-    L"covers the taskbar as well, so the whole screen reads as one surface. "
-    L"This is the one setting that fights the shell: Windows sometimes tries "
-    L"to hide the taskbar behind the texture, so mnPaper keeps re-asserting "
-    L"it on top while this is on. If you ever see the taskbar disappear, "
-    L"turn this back off - the taskbar returns immediately.\r\n"
+    L"  Taskbar (the three buttons on one row)\r\n"
+    L"    How the paper meets your taskbar while it is showing. The choice\r\n"
+    L"    never applies to the thin sliver a hidden taskbar leaves behind;\r\n"
+    L"    that always keeps the texture.\r\n"
+    L"      Leave the taskbar bare (default) - the paper steps aside over the\r\n"
+    L"        taskbar's own buttons, so they keep their exact colours and the\r\n"
+    L"        texture stays in the gaps around them. You get an untextured box\r\n"
+    L"        that follows the taskbar.\r\n"
+    L"      Cover the taskbar - the veil does not step aside, so the band gets\r\n"
+    L"        the same light texture as the rest of the screen and the bottom\r\n"
+    L"        reads as one surface. The taskbar is still underneath, not crisp,\r\n"
+    L"        and on a dark bar the paper's grain sits over it. Pick Paper over\r\n"
+    L"        instead if you want the bar to read clearly.\r\n"
+    L"      Paper over the taskbar - the texture lies ON the bar at a raised\r\n"
+    L"        strength, so you can still see and read the taskbar underneath.\r\n"
+    L"        This is the option that renders the bar with the paper on it.\r\n"
+    L"    Cover and Paper over both fight the shell: Windows likes to drop the\r\n"
+    L"    taskbar's always-on-top state when a full-screen texture sits over\r\n"
+    L"    it, so mnPaper keeps re-asserting the taskbar on top while either is\r\n"
+    L"    chosen. If the taskbar ever disappears, pick Leave the taskbar bare -\r\n"
+    L"    it comes back immediately.\r\n"
     L"  ?        - this window.\r\n"
     L"  Check for updates - compares your version with the published one. "
     L"If a new version exists it offers to download and install it: the "
@@ -3531,6 +3667,21 @@ static void SyncModeRadios(HWND dlg, int id) {
     if (b) SetWindowLongW(b, GWL_STYLE, GetWindowLongW(b, GWL_STYLE) | WS_TABSTOP);
 }
 
+/* Same tab-stop re-assertion as SyncModeRadios, for the three taskbar buttons.
+ * Group 121..123 (hole / cover / paper over); the id is 121 + mode, which is
+ * why TB_HOLE is 0 and TB_PAPER is 2 - the value indexes the group directly. */
+static void SyncTbRadios(HWND dlg, int id) {
+    int k;
+    if (!dlg || !IsWindow(dlg)) return;
+    if (id < 121) id = 121;
+    if (id > 123) id = 123;
+    CheckRadioButton(dlg, 121, 123, id);
+    for (k = 121; k <= 123; k++) {
+        HWND b = GetDlgItem(dlg, k);
+        if (b) SetWindowLongW(b, GWL_STYLE, GetWindowLongW(b, GWL_STYLE) | WS_TABSTOP);
+    }
+}
+
 /* The ONE place that pushes g_s into the dialog controls. Every "refresh the
  * window because settings changed" site calls this - WM_CREATE, a mode
  * switch, a tray-menu change and a CLI sync used to each push a different
@@ -3550,7 +3701,7 @@ static void DialogPushSettings(HWND dlg) {
     SetChk(GetDlgItem(dlg, 118), g_s.master);
     SetChk(GetDlgItem(dlg, 119), g_s.autostart);
     SetChk(GetDlgItem(dlg, 120), g_s.autoupd);
-    SetChk(GetDlgItem(dlg, 121), g_s.tapebar);
+    SyncTbRadios(dlg, 121 + g_s.tbmode);
 }
 
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3606,10 +3757,22 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"BUTTON", L"Check for updates automatically",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 300, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
-        /* Paper the taskbar too: the risky half of the taskbar story, so it
-         * is opt-in and off by default (see ComputeHoles). */
-        g_chk_tapebar = CreateWindowExW(0, L"BUTTON", L"Paper the taskbar too",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 320, 352, 20, hwnd, (HMENU)121,
+        /* Taskbar band: three mutually exclusive ways the veil meets a revealed
+         * taskbar (see ComputeHoles). The row is a group of radios rather than
+         * checkboxes, and the captions are short because at 200% scaling the
+         * full names do not fit one row - layout_fit audits the captions for
+         * clipping and the ? window plus the tray submenu carry the wording. */
+        CreateWindowExW(0, L"STATIC", L"Taskbar:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 14, 324, 72, 16, hwnd, (HMENU)130,
+            GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"Bare",
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 92, 320, 88, 20, hwnd, (HMENU)121,
+            GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"Cover",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 186, 320, 96, 20, hwnd, (HMENU)122,
+            GetModuleHandleW(NULL), NULL);
+        CreateWindowExW(0, L"BUTTON", L"Paper",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 288, 320, 100, 20, hwnd, (HMENU)123,
             GetModuleHandleW(NULL), NULL);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
@@ -3702,8 +3865,9 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ApplyBool(BB_AUTOSTART, IsDlgButtonChecked(hwnd, 119) == BST_CHECKED);
         } else if (LOWORD(wp) == 120) {
             ApplyBool(BB_AUTOUPD, IsDlgButtonChecked(hwnd, 120) == BST_CHECKED);
-        } else if (LOWORD(wp) == 121) {
-            ApplyBool(BB_TAPEBAR, IsDlgButtonChecked(hwnd, 121) == BST_CHECKED);
+        } else if (LOWORD(wp) >= 121 && LOWORD(wp) <= 123) {
+            /* the three taskbar radios share one setting; id - 121 is the mode */
+            ApplyTbMode((int)LOWORD(wp) - 121);
         } else if (LOWORD(wp) == 116) {
             OpenHelp(hwnd);   /* explanations on demand, never on hover */
         } else if (LOWORD(wp) == 117) {
@@ -3842,6 +4006,7 @@ static const WCHAR *STRENGTH_NAMES[4] = { L"Subtle (10)", L"Soft (20)", L"Medium
 static void TrayMenu(void) {
     HMENU m = CreatePopupMenu();
     HMENU sub = CreatePopupMenu();
+    HMENU tbs = CreatePopupMenu();
     POINT pt;
     int i;
     for (i = 0; i < 4; i++)
@@ -3860,8 +4025,10 @@ static void TrayMenu(void) {
     AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_STRING | (g_s.autoupd ? MF_CHECKED : 0), IDM_AUTOUPD,
                 L"Check for updates automatically");
-    AppendMenuW(m, MF_STRING | (g_s.tapebar ? MF_CHECKED : 0), IDM_TAPEBAR,
-                L"Paper the taskbar too");
+    for (i = 0; i < 3; i++)
+        AppendMenuW(tbs, MF_STRING | (g_s.tbmode == i ? MF_CHECKED : 0),
+                    IDM_TBMODE + i, TB_MODE_NAMES[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)tbs, L"Taskbar");   /* hole / cover / paper over */
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
     GetCursorPos(&pt);
@@ -3870,6 +4037,7 @@ static void TrayMenu(void) {
     PostMessageW(g_host, WM_NULL, 0, 0);   /* KB135788: dismiss cleanly if the
                                             * foreground window changed */
     DestroyMenu(sub);
+    DestroyMenu(tbs);
     DestroyMenu(m);
 }
 
@@ -4001,8 +4169,10 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_AUTOUPD:
             ApplyBool(BB_AUTOUPD, !*g_bprops[BB_AUTOUPD].field);
             break;
-        case IDM_TAPEBAR:
-            ApplyBool(BB_TAPEBAR, !*g_bprops[BB_TAPEBAR].field);
+        case IDM_TBMODE:
+        case IDM_TBMODE + 1:
+        case IDM_TBMODE + 2:
+            ApplyTbMode((int)wp - IDM_TBMODE);
             break;
         case IDM_EXIT:
             SaveSettings();
@@ -4060,7 +4230,11 @@ static int SetKeyValue(SETTINGS *s, const WCHAR *arg) {
     else if (!_wcsicmp(key, L"mode")) s->mode = v ? MODE_EINK : MODE_PAPER;
     else if (!_wcsicmp(key, L"autostart")) { s->autostart = v ? 1 : 0; g_autostart_set = 1; }
     else if (!_wcsicmp(key, L"share")) s->share = v ? 1 : 0;
-    else if (!_wcsicmp(key, L"tapebar")) s->tapebar = v ? 1 : 0;
+    else if (!_wcsicmp(key, L"tbmode")) { if (v < TB_HOLE) v = TB_HOLE; if (v > TB_PAPER) v = TB_PAPER; s->tbmode = v; }
+    /* `tapebar` was the old boolean switch and is still a sensible thing to
+     * name on a command line written before tbmode: 0 -> leave it bare, 1 ->
+     * cover. It is an alias for tbmode only, never a second stored truth. */
+    else if (!_wcsicmp(key, L"tapebar")) s->tbmode = v ? TB_COVER : TB_HOLE;
     else if (!_wcsicmp(key, L"autoupd")) s->autoupd = v ? 1 : 0;
     else if (!_wcsicmp(key, L"master")) s->master = v ? 1 : 0;
     else return 0;

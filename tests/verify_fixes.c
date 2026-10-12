@@ -175,17 +175,23 @@ int main(void) {
     /* SetKeyValue is the one door every `mnPaper --set key=value` walks
      * through; until now it was exercised only live. Its real contract:
      * keys case-insensitive, values DIGITS ONLY (anything else is refused
-     * so a typo cannot become a silent 0), booleans folded v?1:0, and NO
-     * clamping - ApplySets runs ClampSettingsOf after the parse, so the
-     * same two steps are driven here on a scratch SETTINGS. */
+     * so a typo cannot become a silent 0), booleans folded v?1:0. Range
+     * clamping is mostly ApplySets' job - it runs ClampSettingsOf after the
+     * parse, and both steps are driven here on a scratch SETTINGS - but
+     * tbmode clamps inside the parser as well, so its bound is asserted
+     * below rather than assumed. */
     {
         SETTINGS p = g_s;
         int saw;   /* SetKeyValue returns nonzero for a recognised key */
 
+        saw = SetKeyValue(&p, L"tbmode=2");
+        Check(saw && p.tbmode == TB_PAPER, "tbmode=2 is accepted and stored");
+        saw = SetKeyValue(&p, L"tbmode=9");
+        Check(saw && p.tbmode == TB_PAPER, "tbmode above the top mode clamps to paper over");
         saw = SetKeyValue(&p, L"tapebar=1");
-        Check(saw && p.tapebar == 1, "tapebar=1 is accepted and stored");
+        Check(saw && p.tbmode == TB_COVER, "legacy tapebar=1 means cover");
         saw = SetKeyValue(&p, L"tapebar=0");
-        Check(saw && p.tapebar == 0, "tapebar=0 clears it again");
+        Check(saw && p.tbmode == TB_HOLE, "legacy tapebar=0 means leave it bare");
 
         p.intensity = 1;
         saw = SetKeyValue(&p, L"intensity=999");
