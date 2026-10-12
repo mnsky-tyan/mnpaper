@@ -22,6 +22,28 @@ static void Check(int c, const char *what) {
 #include "fnv64.h"
 #define H PixelHashAll
 
+/* Run the click entry (RecomputeHoles) with its change log captured into buf.
+ * ApplyHoleRefresh consumes g_hole_dirty before the caller can read it, so the
+ * line ComputeHoles writes when a hole changes is the only observable that a
+ * pass saw the change and re-uploaded - which is exactly what the pre-clear
+ * used to suppress. Returns 0 when the scratch log could not be captured. */
+static int RecomputeLogged(char *buf, size_t cap) {
+    FILE *f;
+    size_t n = 0;
+    buf[0] = 0;
+    f = fopen("hole_cycle_tape.log", "w");
+    if (!f) return 0;
+    g_log = f;
+    RecomputeHoles();
+    g_log = NULL;
+    fflush(f); fclose(f);
+    f = fopen("hole_cycle_tape.log", "r");
+    if (f) { n = fread(buf, 1, cap - 1, f); fclose(f); }
+    buf[n] = 0;
+    DeleteFileA("hole_cycle_tape.log");   /* no residue */
+    return 1;
+}
+
 int main(void) {
     RECT mon = { 0, 0, 2880, 1800 };          /* fixed reference geometry */
     int w = mon.right - mon.left, h = mon.bottom - mon.top;
@@ -41,7 +63,7 @@ int main(void) {
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 80, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
-                      .autostart = 0, .share = 0, .autoupd = 1 };
+                      .autostart = 0, .share = 0, .tapebar = 0, .autoupd = 1 };
     BuildPaper(&ov);
     clean = H(px, (size_t)w * h * 4);
     Check(px[(size_t)band_y * w * 4 + 1400 * 4 + 3] != 0,
@@ -115,6 +137,71 @@ int main(void) {
 
         g_ntb = 0;                /* leave no synthesized taskbar behind */
         g_hole_on[0] = 0;
+    }
+
+    /* --------------- the tapebar opt-in (paper the taskbar too) ----------
+     * The default keeps the hole punched over a revealed taskbar so the
+     * shell's own buttons stay untextured. The opt-in closes the hole so the
+     * paper covers the band as well. Both directions are decided from the
+     * LATCHED state, exactly as the click reaches them: the checkbox/tray item
+     * call RecomputeHoles, they never reset the hole first. ComputeHoles
+     * compares the new hole against the latched g_hole_on/g_hole, so a hole
+     * that opens AND a hole that closes are both changes that arm the
+     * re-upload - the only reason either direction of g_s.tapebar reaches the
+     * screen. Nothing here pre-clears g_hole_on: a test that clears it first
+     * asserts against a state RecomputeHoles would have cleared anyway and
+     * cannot see the change detection at all (2026-10-11 review). */
+    {
+        char lbuf[512];
+        int logged;
+        g_n = 1;
+        g_ov[0].rc = mon;
+        g_tbw[0] = NULL;          /* no taskbar window: the raise is skipped */
+        SetRect(&g_tb[0], mon.left, 1752, mon.right, mon.bottom);
+        g_ntb = 1;
+
+        /* the state a revealed taskbar leaves behind on a static screen:
+         * hole latched OPEN over the band, tapebar off (the default). */
+        g_s.tapebar = 0;
+        g_hole_on[0] = 0; g_hole_dirty = 0;
+        RecomputeHoles();
+        Check(g_tb_state[0] == 2 && g_hole_on[0] == 1 &&
+              g_hole[0].top == 1752 && g_hole[0].bottom == 1800,
+              "tapebar off: a revealed taskbar gets the hole punched through the click entry");
+
+        /* the reported case: check the box with the hole already latched open.
+         * Closing the hole is a change, so it must be reported (that line is
+         * what arms the re-upload) and the band rect replaced. */
+        g_s.tapebar = 1;
+        logged = RecomputeLogged(lbuf, sizeof lbuf);
+        Check(logged, "the hole change from the tapebar click could be captured");
+        Check(g_hole_on[0] == 0 && g_hole[0].top == 0 && g_hole[0].bottom == 0 &&
+              g_tb_state[0] == 2,
+              "checking tapebar closes the latched hole over the band, bar still revealed");
+        Check(logged && strstr(lbuf, "hole 0 off") != NULL,
+              "the hole close is reported as a change, so the band is re-uploaded papered");
+
+        /* and back again from the latched-closed state: the hole must re-open,
+         * again detected as a change (the bare-taskbar direction). */
+        g_s.tapebar = 0;
+        logged = RecomputeLogged(lbuf, sizeof lbuf);
+        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752,
+              "unchecking tapebar re-opens the hole over the band");
+        Check(logged && strstr(lbuf, "hole 0 ON") != NULL,
+              "the hole re-opening is reported as a change, so the band goes bare again");
+
+        /* the other half of the same invariant: with nothing changed, a further
+         * pass flags no change at all, or every timer tick re-uploads. */
+        logged = RecomputeLogged(lbuf, sizeof lbuf);
+        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752,
+              "an unchanged pass keeps the latched hole");
+        Check(logged && lbuf[0] == 0,
+              "an unchanged hole flags no change (no re-upload on every tick)");
+
+        g_ntb = 0;                /* leave no synthesized taskbar behind */
+        g_hole_on[0] = 0;
+        g_hole_dirty = 0;
+        g_s.tapebar = 0;
     }
 
     /* --------------- clipping at the hole/hole's-bounds boundary -----------
