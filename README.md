@@ -87,18 +87,34 @@ The build produces `mnPaper.exe` in the repo root.
   the login screen): Windows forbids drawing there by design.
 - The Start menu, search and notification center run in shell z-order bands
   ordinary apps cannot enter, so they stay untextured.
-- The taskbar: while it is revealed - thicker than the roughly 16-pixel
-  sliver a parked auto-hidden taskbar keeps on screen, on any edge, which
-  stays covered like the rest of the desktop - the paper steps out of the way
-  of the taskbar's own buttons (the Start button, the icon pill and the tray
-  pill) so they stay crisp with no texturing on top of them; the gaps between
-  them keep the paper, as shown in the screenshot above. Forcing the
-  always-on-top paper over the taskbar instead makes Windows drop the
-  taskbar's own topmost state, which is why it steps aside rather than
-  covering it. Taskbars shown on secondary displays get the same treatment.
-  If you want the texture over the taskbar too, turn on "Paper the taskbar too"
-  in Settings or the tray menu: mnPaper then keeps re-asserting the taskbar
-  on top, and turning it off restores the behaviour above immediately.
+- The taskbar: how the paper meets a revealed taskbar is your choice, on the
+  `Taskbar:` row in Settings or in the tray's `Taskbar` submenu. It never
+  applies to the thin sliver a parked auto-hidden taskbar keeps on screen
+  (roughly 16 pixels, on any edge): that always carries the texture like the
+  rest of the desktop.
+    - **Bare** (default): the paper steps out of the way of the taskbar's own
+      buttons (the Start button, the icon pill and the tray pill) so they stay
+      crisp with nothing textured on top of them; the gaps between them keep
+      the paper, as shown in the screenshot above. Forcing always-on-top paper
+      over the taskbar makes Windows drop the taskbar's own topmost state,
+      which is why the default steps aside.
+    - **Cover**: the veil does not step aside, so the band gets the same light
+      texture as the rest of the screen and the bottom reads as one surface.
+      The taskbar itself is still there underneath rather than having the
+      texture laid on it - it reads as part of the paper, and the bar's own
+      surface is no longer crisp. `Paper over` is the mode that puts the
+      texture ON the bar.
+    - **Paper**: the texture lies ON the bar at a raised strength, so the bar
+      still shows through underneath and you can read it. This is the option
+      that actually renders the taskbar with the paper on it. The strength is
+      raised from the paper's own: the veil is only ~7% opaque off the bat
+      (measured: mean alpha 18/255 at Strength 40), which is far too faint
+      over a taskbar, so the band's alpha is scaled up 3x and capped at 128.
+      It follows the `Strength` slider, so on a subtle setting it is subtle.
+  `Cover` and `Paper` both fight the shell, so mnPaper keeps re-asserting the
+  taskbar on top while either is chosen. If the taskbar ever disappears, pick
+  `Bare`: the bar comes straight back. Taskbars shown on secondary displays get
+  the same treatment either way.
 - The settings window keeps a compact fixed-size layout rather than scaling
   with your display DPI, so it looks small on a high-DPI screen; every
   control still fits and works.
