@@ -3763,10 +3763,10 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * full names do not fit one row - layout_fit audits the captions for
          * clipping and the ? window plus the tray submenu carry the wording. */
         CreateWindowExW(0, L"STATIC", L"Taskbar:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | WS_GROUP, 14, 324, 72, 16, hwnd, (HMENU)130,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 14, 324, 72, 16, hwnd, (HMENU)130,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"Bare",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 92, 320, 88, 20, hwnd, (HMENU)121,
+            WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 92, 320, 88, 20, hwnd, (HMENU)121,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"Cover",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 186, 320, 96, 20, hwnd, (HMENU)122,

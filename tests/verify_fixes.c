@@ -175,9 +175,11 @@ int main(void) {
     /* SetKeyValue is the one door every `mnPaper --set key=value` walks
      * through; until now it was exercised only live. Its real contract:
      * keys case-insensitive, values DIGITS ONLY (anything else is refused
-     * so a typo cannot become a silent 0), booleans folded v?1:0, and NO
-     * clamping - ApplySets runs ClampSettingsOf after the parse, so the
-     * same two steps are driven here on a scratch SETTINGS. */
+     * so a typo cannot become a silent 0), booleans folded v?1:0. Range
+     * clamping is mostly ApplySets' job - it runs ClampSettingsOf after the
+     * parse, and both steps are driven here on a scratch SETTINGS - but
+     * tbmode clamps inside the parser as well, so its bound is asserted
+     * below rather than assumed. */
     {
         SETTINGS p = g_s;
         int saw;   /* SetKeyValue returns nonzero for a recognised key */

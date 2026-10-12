@@ -533,11 +533,39 @@ int main(void) {
             SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
             Pump(50);
             Check(g_s.tbmode == TB_HOLE, "clicking 'Bare' clears the live setting to hole");
-            /* the legacy key must not survive: tbmode is the only truth now */
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
-                saved_tb = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+            /* The legacy key must not survive, and it has to be SEEDED first:
+             * the scratch hive is fresh for this run and nothing ever wrote
+             * tapebar into it, so reading it without seeding pins nothing (it
+             * would still pass with the deletion removed). Seed the state an
+             * install last touched by an older build is actually in, then take
+             * one more click so SaveSettings runs, and only then assert it is
+             * gone. The click leaves tbmode at hole, the default. */
+            {
+                HKEY seed;
+                int one = 1, seeded = -1;
+                HWND r2 = GetDlgItem(g_dlg, 122);
+                if (RegCreateKeyExW(HKEY_CURRENT_USER, scratch, 0, NULL, 0,
+                                    KEY_SET_VALUE, NULL, &seed, NULL) == ERROR_SUCCESS) {
+                    RegSetValueExW(seed, L"tapebar", 0, REG_DWORD, (BYTE *)&one, sizeof one);
+                    RegCloseKey(seed);
+                }
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                    seeded = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+                }
+                Check(seeded == 1, "the seeded legacy tapebar key is present before the save");
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(122, BN_CLICKED), (LPARAM)r2);
+                Pump(50);
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
+                Pump(50);
+                saved_tb = -1;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                    saved_tb = GetDword(key, L"tapebar", -1); RegCloseKey(key);
+                }
+                Check(saved_tb == -1,
+                      "the legacy tapebar key is deleted on save (tbmode is the only truth)");
+                Check(g_s.tbmode == TB_HOLE,
+                      "the seeded-legacy sequence leaves the live mode back at the default");
             }
-            Check(saved_tb == -1, "the old tapebar key is gone from the registry");
         }
         g_s.master = saved_master;
         SyncMasterCheckbox();   /* the product's own mirror, same as SetMaster uses */

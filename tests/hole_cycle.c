@@ -297,6 +297,27 @@ int main(void) {
                       if (p[3] > 0 && (p[0] > p[3] || p[1] > p[3] || p[2] > p[3])) bad++;
                   }
               Check(bad == 0, "the tinted band stays premultiplied (no channel exceeds alpha)"); }
+            /* The e-ink regime, which no other suite drives: EinkRender writes
+             * every pixel as an UNpremultiplied grey at alpha 255, the one
+             * input where the tint's move is not a ratio-preserving no-op.
+             * Prove the band lands at the cap with the grey scaled WITH it, so
+             * the same transform is a correct ~50% wash over the bar. */
+            { int bad2 = 0, y3, x3;
+              for (y3 = 0; y3 < 8; y3++)
+                  for (x3 = 0; x3 < 64; x3++) {
+                      unsigned char *p = sb + (size_t)y3 * 64 * 4 + x3 * 4;
+                      p[0] = p[1] = p[2] = 200;   /* a mid e-ink grey */
+                      p[3] = 255;                  /* straight alpha */
+                  }
+              TintHoleAlpha(&band_ov, 1, 0, 0, 64, 8);
+              for (y3 = 0; y3 < 8; y3++)
+                  for (x3 = 0; x3 < 64; x3++) {
+                      unsigned char *p = sb + (size_t)y3 * 64 * 4 + x3 * 4;
+                      if (p[3] != TB_PAPER_CAP) bad2++;       /* boost really applied */
+                      if (p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) bad2++;
+                  }
+              Check(bad2 == 0,
+                    "the e-ink regime (straight grey at 255) tints to the cap and stays premultiplied"); }
             free(sb);
             band_ov.bits = NULL;
             g_hole_on[0] = 0; g_tb_mode[0] = TB_HOLE;
