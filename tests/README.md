@@ -146,7 +146,8 @@ rebuild and run in one go, or exclude the temp directory.
   structure, help window, update-feed parsing (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
   63/65-char runs refused), the share/mode/texture-on/autostart controls and
-  the taskbar-texture radio group (ids 121/122/123) against a PID-suffixed scratch hive.
+  the taskbar mode radio group (ids 121/122/123) against a PID-suffixed
+  scratch hive.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker
   render, pointer swap, newest-wins, settings re-render on a static screen,
@@ -193,9 +194,11 @@ rebuild and run in one go, or exclude the temp directory.
   byte-identical - and the same transform is checked against the e-ink regime
   (straight grey at alpha 255), where the RGB must move with the alpha.
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
-  the settings struct (sliders, checkboxes, the mode radio pair), each numeric
-  readout is asserted to show its own bar's value (the label-to-bar pairing no
-  other suite checks), and a destroyed dialog is refused rather than pushed to.
+  the settings struct (sliders, checkboxes, the mode radio pair and the
+  taskbar radio group 121/122/123, whose push must clear the other two radios),
+  each numeric readout is asserted to show its own bar's value (the
+  label-to-bar pairing no other suite checks), and a destroyed dialog is
+  refused rather than pushed to.
   It also pins the tray's explorer-restart branch end to end: it stores the
   real `TaskbarCreated` message value, posts it to the host window and asserts
   the branch reports itself (headless runs suppress the real
