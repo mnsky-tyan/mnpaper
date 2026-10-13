@@ -63,7 +63,7 @@ int main(void) {
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 80, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
-                      .autostart = 0, .share = 0, .tbmode = TB_HOLE, .autoupd = 1 };
+                      .autostart = 0, .share = 0, .tbmode = TB_NOT_COVER, .autoupd = 1 };
     BuildPaper(&ov);
     clean = H(px, (size_t)w * h * 4);
     Check(px[(size_t)band_y * w * 4 + 1400 * 4 + 3] != 0,
@@ -139,19 +139,16 @@ int main(void) {
         g_hole_on[0] = 0;
     }
 
-    /* --------------- the three taskbar modes ---------------------------
-     * TB_HOLE punches the band transparent, TB_COVER leaves the veil as
-     * drawn, TB_PAPER tints the band. All three are decided from the
-     * LATCHED state, exactly as the click reaches them: the dialog radios
-     * and the tray submenu call RecomputeHoles, they never reset the hole
-     * first. ComputeHoles compares the new hole against the latched
-     * g_hole_on/g_hole AND the latched kind in g_tb_mode, so a hole that
-     * opens, one that closes, and a band that only changes KIND (same rect,
-     * hole -> paper) are all changes that arm the re-upload - the only
-     * reason any direction reaches the screen. Nothing here pre-clears
+    /* --------------- the two taskbar modes ---------------------------
+     * TB_NOT_COVER punches the band transparent, TB_COVER leaves the veil as
+     * drawn. Both are decided from the LATCHED state, exactly as the click
+     * reaches them: the dialog radios and the tray submenu call RecomputeHoles,
+     * they never reset the hole first. ComputeHoles compares the new hole
+     * against the latched g_hole_on/g_hole, so a hole that opens and one that
+     * closes are both changes that arm the re-upload. Nothing here pre-clears
      * g_hole_on: a test that clears it first asserts against a state
      * RecomputeHoles would have cleared anyway and cannot see the change
-     * detection at all (2026-10-11 review). */
+     * detection at all. */
     {
         char lbuf[512];
         int logged;
@@ -162,14 +159,13 @@ int main(void) {
         g_ntb = 1;
 
         /* the state a revealed taskbar leaves behind on a static screen:
-         * hole latched OPEN over the band, mode hole (the default). */
-        g_s.tbmode = TB_HOLE;
-        g_hole_on[0] = 0; g_tb_mode[0] = TB_HOLE; g_hole_dirty = 0;
+         * hole latched OPEN over the band, mode not-cover (the default). */
+        g_s.tbmode = TB_NOT_COVER;
+        g_hole_on[0] = 0; g_hole_dirty = 0;
         RecomputeHoles();
         Check(g_tb_state[0] == 2 && g_hole_on[0] == 1 &&
-              g_hole[0].top == 1752 && g_hole[0].bottom == 1800 &&
-              g_tb_mode[0] == TB_HOLE,
-              "mode hole: a revealed taskbar gets the hole punched through the click entry");
+              g_hole[0].top == 1752 && g_hole[0].bottom == 1800,
+              "mode not-cover: a revealed taskbar gets the hole punched through the click entry");
 
         /* cover: check the band closes with the hole. Closing is a change, so
          * it must be reported (that line is what arms the re-upload). */
@@ -182,152 +178,52 @@ int main(void) {
         Check(logged && strstr(lbuf, "hole 0 off") != NULL,
               "the hole close is reported as a change, so the band is re-uploaded papered");
 
-        /* back to hole from the latched-closed state: the hole re-opens, again
+        /* back to not-cover from the latched-closed state: the hole re-opens, again
          * detected as a change (the bare-taskbar direction). */
-        g_s.tbmode = TB_HOLE;
+        g_s.tbmode = TB_NOT_COVER;
         logged = RecomputeLogged(lbuf, sizeof lbuf);
-        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752 && g_tb_mode[0] == TB_HOLE,
-              "mode hole re-opens the hole over the band");
+        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752,
+              "mode not-cover re-opens the hole over the band");
         Check(logged && strstr(lbuf, "hole 0 ON") != NULL,
               "the hole re-opening is reported as a change, so the band goes bare again");
 
-        /* the new case: same rect, hole -> paper over. The geometry compares
-         * equal, so only g_tb_mode can make this a change. Without it the tint
-         * would never reach the screen until the taskbar happened to move. */
-        g_s.tbmode = TB_PAPER;
-        logged = RecomputeLogged(lbuf, sizeof lbuf);
-        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752 && g_tb_mode[0] == TB_PAPER,
-              "paper over keeps the band rect open and records the kind");
-        Check(logged && strstr(lbuf, "hole 0 ON") != NULL &&
-              strstr(lbuf, "mode=2") != NULL,
-              "a band that only changes KIND is reported as a change (same rect, hole -> paper)");
-
-        /* and back to hole from paper: the same kind-only transition in reverse */
-        g_s.tbmode = TB_HOLE;
-        logged = RecomputeLogged(lbuf, sizeof lbuf);
-        Check(g_tb_mode[0] == TB_HOLE &&
-              logged && strstr(lbuf, "mode=0") != NULL,
-              "paper over -> bare is reported too (the reverse kind change)");
-
-        /* the other half of the same invariant: with nothing changed, a further
-         * pass flags no change at all, or every timer tick re-uploads. */
-        g_s.tbmode = TB_PAPER;
-        logged = RecomputeLogged(lbuf, sizeof lbuf);
-        Check(g_hole_on[0] == 1 && g_hole[0].top == 1752 && g_tb_mode[0] == TB_PAPER,
-              "an unchanged pass keeps the latched band");
+        /* with nothing changed, a further pass flags no change at all */
         logged = RecomputeLogged(lbuf, sizeof lbuf);
         Check(logged && lbuf[0] == 0,
               "an unchanged band flags no change (no re-upload on every tick)");
 
-        /* the paper-over upload itself. ApplyLayered cannot be observed here
+        /* the upload itself. ApplyLayered cannot be observed here
          * (this scratch OVL has no strips to upload into), so the two halves
          * it performs are driven directly: ClearHoleAlpha saves the band and
-         * leaves the transformed pixels in the buffer that
-         * UpdateLayeredWindow would read, RestoreHoleAlpha puts the master
-         * back. That is the real contract, and it is assertable. */
+         * leaves the punched pixels in the buffer that UpdateLayeredWindow
+         * would read, RestoreHoleAlpha puts the master back. */
         {
             unsigned long long before = H(px, (size_t)w * h * 4);
             unsigned char *saved = NULL;
             size_t saved_len = 0;
             int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0, x;
-            long tint_tot = 0, bare_tot = 0;
-            int tint_mx = 0, bare_mx = 0;
+            long bare_tot = 0;
 
-            g_hole_on[0] = 1; g_tb_mode[0] = TB_PAPER;
+            g_hole_on[0] = 1;
             SetRect(&g_hole[0], mon.left, 1752, mon.right, mon.bottom);
             ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
             Check(saved && saved_len > 0 && rx1 > rx0 && ry1 > ry0,
-                  "the paper-over band saved its pixels before transforming");
+                  "ClearHoleAlpha saved its pixels before punching");
             for (x = rx0; x < rx1; x++) {
                 int a = ((unsigned char *)ov.bits)[(size_t)ry0 * w * 4 + x * 4 + 3];
-                tint_tot += a; if (a > tint_mx) tint_mx = a;
+                bare_tot += a;
             }
-            RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
-            Check(H(px, (size_t)w * h * 4) == before,
-                  "a paper-over band leaves the master texture byte-identical (restore works)");
-
-            g_tb_mode[0] = TB_HOLE;
-            ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
-            for (x = rx0; x < rx1; x++) {
-                int a = ((unsigned char *)ov.bits)[(size_t)ry0 * w * 4 + x * 4 + 3];
-                bare_tot += a; if (a > bare_mx) bare_mx = a;
-            }
-            RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
             Check(bare_tot == 0,
                   "the bare band really is zero alpha on the way up (the hole still works)");
+            RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
             Check(H(px, (size_t)w * h * 4) == before,
-                  "the bare band restores the master exactly too");
-            Check(tint_mx > bare_mx && tint_tot / (rx1 - rx0) > 20,
-                  "paper over puts real alpha on the band where the hole put none");
-            g_tb_mode[0] = TB_HOLE;
-        }
-
-        /* the transform on its own terms, measured on pixels: paper-over must
-         * raise the band's alpha well above the veil's own (~7% off the bat,
-         * invisible over a taskbar), stay under the cap so the grain is not
-         * flattened, and keep a spread so the texture still reads. */
-        {
-            OVL band_ov;
-            unsigned char *sb = (unsigned char *)malloc((size_t)64 * 8 * 4);
-            int y2, x2, mn = 255, mx = 0, tot = 0, nz = 0;
-            memset(&band_ov, 0, sizeof band_ov);
-            band_ov.idx = 0; band_ov.w = 64; band_ov.h = 8; SetRect(&band_ov.rc, 0, 0, 64, 8);
-            band_ov.bits = sb;
-            BuildPaper(&band_ov);
-            TintHoleAlpha(&band_ov, 1, 0, 0, 64, 8);
-            for (y2 = 0; y2 < 8; y2++)
-                for (x2 = 0; x2 < 64; x2++) {
-                    int a = sb[(size_t)y2 * 64 * 4 + x2 * 4 + 3];
-                    if (a < mn) mn = a;
-                    if (a > mx) mx = a;
-                    tot += a; nz++;
-                }
-            Check(mx <= TB_PAPER_CAP,
-                  "the paper-over band never exceeds the cap (a saturated band is a flat band)");
-            Check(tot / nz > 20,
-                  "the paper-over band sits well above the veil's own alpha, so it reads on the bar");
-            Check(mx > mn, "the band keeps a spread of alpha values: grain, not a flat wash");
-            Check(mn >= 2, "no band pixel becomes invisible at the low end");
-            /* premultiplied sanity: scaling RGB by the same factor as alpha
-             * would fade the paper toward black instead of showing it. */
-            { int bad = 0;
-              for (y2 = 0; y2 < 8; y2++)
-                  for (x2 = 0; x2 < 64; x2++) {
-                      unsigned char *p = sb + (size_t)y2 * 64 * 4 + x2 * 4;
-                      if (p[3] > 0 && (p[0] > p[3] || p[1] > p[3] || p[2] > p[3])) bad++;
-                  }
-              Check(bad == 0, "the tinted band stays premultiplied (no channel exceeds alpha)"); }
-            /* The e-ink regime, which no other suite drives: EinkRender writes
-             * every pixel as an UNpremultiplied grey at alpha 255, the one
-             * input where the tint's move is not a ratio-preserving no-op.
-             * Prove the band lands at the cap with the grey scaled WITH it, so
-             * the same transform is a correct ~50% wash over the bar. */
-            { int bad2 = 0, y3, x3;
-              for (y3 = 0; y3 < 8; y3++)
-                  for (x3 = 0; x3 < 64; x3++) {
-                      unsigned char *p = sb + (size_t)y3 * 64 * 4 + x3 * 4;
-                      p[0] = p[1] = p[2] = 200;   /* a mid e-ink grey */
-                      p[3] = 255;                  /* straight alpha */
-                  }
-              TintHoleAlpha(&band_ov, 1, 0, 0, 64, 8);
-              for (y3 = 0; y3 < 8; y3++)
-                  for (x3 = 0; x3 < 64; x3++) {
-                      unsigned char *p = sb + (size_t)y3 * 64 * 4 + x3 * 4;
-                      if (p[3] != TB_PAPER_CAP) bad2++;       /* boost really applied */
-                      if (p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) bad2++;
-                  }
-              Check(bad2 == 0,
-                    "the e-ink regime (straight grey at 255) tints to the cap and stays premultiplied"); }
-            free(sb);
-            band_ov.bits = NULL;
-            g_hole_on[0] = 0; g_tb_mode[0] = TB_HOLE;
+                  "the bare band restores the master exactly too (restore works)");
         }
 
         g_ntb = 0;                /* leave no synthesized taskbar behind */
         g_hole_on[0] = 0;
-        g_tb_mode[0] = TB_HOLE;
         g_hole_dirty = 0;
-        g_s.tbmode = TB_HOLE;
+        g_s.tbmode = TB_NOT_COVER;
     }
 
     /* --------------- clipping at the hole/hole's-bounds boundary -----------
