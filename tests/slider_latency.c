@@ -17,7 +17,7 @@ static int preview_count;
 /* every byte: for equality claims (PixelHash strides 97 and is for change
  * detection only - the 2026-10-03 review flagged one equality claim resting
  * on the sampled hash). PixelHashAll is the shared full-byte hash in
- * tests/fnv64.h, also used by hole_cycle and verify_fixes. */
+ * tests/fnv64.h, also used by tbzorder and verify_fixes. */
 #include "fnv64.h"   /* full-byte hash: tests/slider_latency.c and fnv64.h sit in tests/ */
 
 static ULONGLONG PixelHash(const unsigned char *p, size_t bytes) {
@@ -167,59 +167,32 @@ int main(void) {
         }
         Check(saved == 19, "closing immediately autosaves into isolated test registry");
     }
-    /* Taskbar-mask changes must never invoke noise rendering or destroy the
-     * backing image. Upload still uses the real hidden layered targets. */
+    /* Taskbar z-order changes must never touch the texture bytes: the two
+     * modes differ only in window order (2.7.19 deleted the hole mask that
+     * used to punch the band transparent here). Upload still uses the real
+     * hidden layered targets. */
     {
         unsigned gen = g_pgen;
         unsigned char *px = (unsigned char *)g_ov[0].bits;
-        int hx = 40, hy = 1700, hw = 80;
+        int band_y = (int)rc.bottom - 48;   /* inside the taskbar band */
         size_t stride = (size_t)rc.right * 4;
-        g_hole_on[0] = 1;
-        SetRect(&g_hole[0], 0, 1700, 2880, 1800);
-        unsigned char *saved = NULL;
-        size_t saved_len = 0;
-        int rx0=0, ry0=0, rx1=0, ry1=0;
-        ULONGLONG armed, armed_all;
-        px[(size_t)hy * stride + hx * 4 + 3] = 255;   /* armed before the hole */
-        armed = PixelHash(px, (size_t)rc.right * (size_t)rc.bottom * 4);
-        armed_all = PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4);
-        /* The hole is a MASK on one upload, not a change to the texture. The
-         * upload sees the hole; the master texture must come back untouched,
-         * because Housekeeping re-uploads with no rebuild behind it. */
-        ClearHoleAlpha(&g_ov[0], &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
-        Check(px[(size_t)hy * stride + hx * 4 + 3] == 0, "taskbar hole zeroes alpha inside the rect");
-        Check(px[(size_t)(hy + 40) * stride + (hx + 40) * 4 + 3] == 0, "taskbar hole covers the whole rect");
-        RestoreHoleAlpha(&g_ov[0], saved, saved_len, rx0, ry0, rx1, ry1);
-        Check(PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4) == armed_all,
-              "the upload leaves the master texture byte-identical (every byte)");
-        Check(ApplyLayered(&g_ov[0]), "moving taskbar hole uploads without a texture rebuild");
-        Check(g_pgen == gen, "taskbar hole moves without a render generation bump");
-        Check(px[(size_t)hy * stride + hx * 4 + 3] != 0, "the texture is not left punched after an upload");
-        /* THE REGRESSION (2.7.7): Housekeeping re-uploads when the hole closes
-         * or moves with NO rebuild behind it. If the upload leaves the hole
-         * punched into the master texture, the transparent band stays after the
-         * taskbar parks - a permanent stripe of unrendered screen along the
-         * bottom. So: open the hole, upload, close the hole, upload again, and
-         * the texture must be exactly as it was before the hole ever opened. */
-        {
-            ULONGLONG before = PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4);
-            g_hole_on[0] = 1;
-            SetRect(&g_hole[0], 0, 1700, 2880, 1800);
-            ApplyLayered(&g_ov[0]);
-            /* ApplyLayered restores the master texture, so the punch is visible
-             * only during the upload - which is what keeps the next no-rebuild
-             * re-upload correct. What is observable here is that the texture is
-             * unchanged by the upload, which the check below pins down. */
-            Check(PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
-                  "an upload with the hole leaves the master texture untouched (every byte)");
-            g_hole_on[0] = 0;                       /* taskbar parked: hole closes */
-            Check(ApplyLayered(&g_ov[0]), "closing the hole uploads with no rebuild");
-            Check(PixelHashAll((const unsigned char *)px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
-                  "closing the hole restores the texture exactly, every byte (no permanent band)");
-            Check(px[(size_t)1750 * stride + 200 * 4 + 3] != 0,
-                  "the band under a parked taskbar renders paper again");
-        }
-        g_hole_on[0] = 0;
+        ULONGLONG before = PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4);
+        /* the state Housekeeping latches while a taskbar is revealed */
+        g_ntb = 1;
+        g_tbw[0] = NULL;          /* no window: the raise side is covered by tbzorder */
+        g_tb_state[0] = 2;
+        g_s.tbmode = TB_NOT_COVER;
+        Check(ApplyLayered(&g_ov[0]), "an upload around a revealed taskbar succeeds (Not cover)");
+        Check(g_pgen == gen, "taskbar state changes upload without a render generation bump");
+        Check(PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
+              "Not cover: the upload leaves the master texture byte-identical (every byte)");
+        Check(px[(size_t)band_y * stride + 200 * 4 + 3] != 0,
+              "the taskbar band still carries paper alpha (no hole is punched)");
+        g_s.tbmode = TB_COVER;
+        Check(ApplyLayered(&g_ov[0]), "an upload in Cover succeeds");
+        Check(PixelHashAll(px, (size_t)rc.right * (size_t)rc.bottom * 4) == before,
+              "Cover: the upload leaves the same untouched texture (no hole is punched)");
+        g_ntb = 0;   /* leave no synthesized taskbar behind */
     }
     /* Small odd sizes cover the grid edge and SIMD scalar tail; all preview
      * bytes remain valid premultiplied alpha. */    {

@@ -27,7 +27,6 @@ static void Check(int c, const char *what) {
 }
 
 int main(void) {
-    RECT rc;
     WCHAR scratch[128], runkey[160];
     printf("VERIFIER STARTED\n"); fflush(stdout);
     ULONGLONG t0, t1;
@@ -131,38 +130,12 @@ int main(void) {
                (unsigned long long)(t1 - t0));
         free(ov.bits);
     }
-    printf("\nFIX 3 (X1/X2/X5): one hole rule, one owner rule\n");
-    {
-        OVL ov;
-        int w = 200, h = 200, x, y;
-        unsigned char *px;
-        memset(&ov, 0, sizeof ov);
-        ov.w = w; ov.h = h; ov.idx = 0;
-        px = malloc((size_t)w * h * 4);
-        ov.bits = px;
-        if (!px) { Check(0, "FIX 3 scratch allocated"); goto done; }
-        for (x = 0; x < w * h; x++) { px[4*x] = 10; px[4*x+1] = 20; px[4*x+2] = 30; px[4*x+3] = 255; }
-        ULONGLONG before;
-        unsigned char *saved = NULL;
-        size_t saved_len = 0;
-        int rx0=0, ry0=0, rx1=0, ry1=0;
-        g_hole_on[0] = 1;
-        SetRect(&g_hole[0], 0, 100, 200, 200);
-        before = PixelHash8(px, (size_t)w * h * 4);
-        ClearHoleAlpha(&ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
-        Check(px[(size_t)150 * w * 4 + 50 * 4 + 3] == 0, "ClearHoleAlpha zeroes alpha inside the hole");
-        Check(px[(size_t)50 * w * 4 + 50 * 4 + 3] == 255, "ClearHoleAlpha leaves alpha outside the hole untouched");
-        Check(saved != NULL && saved_len > 0, "ClearHoleAlpha saves the pixels it overwrote");
-        RestoreHoleAlpha(&ov, saved, saved_len, rx0, ry0, rx1, ry1);
-        Check(PixelHash8(px, (size_t)w * h * 4) == before,
-              "RestoreHoleAlpha puts the texture back byte-for-byte (no permanent band)");
-        /* the restore put the punched pixel's own alpha back (the hash check
-         * above already proves it for every byte; this names the property in
-         * the bug report's own terms) */
-        Check(px[(size_t)150 * w * 4 + 50 * 4 + 3] == 255,
-              "RestoreHoleAlpha leaves the punched pixel back at its own alpha");
-        free(px);
-    }
+    printf("\nFIX 3 (X5): the owner rule\n");
+    /* The hole-rule half of FIX 3 (X1/X2) died with the hole machinery in
+     * 2.7.19: the taskbar modes punch no transparency any more, so there is
+     * no save/restore pair left to pin. Its invariant - taskbar state can
+     * never alter texture bytes - lives in tests/tbzorder.c now. The owner
+     * rule below is unchanged and still load-bearing. */
     {
         /* the owner rule: a dead handle must come back as NULL, not be used */
         HWND dead = (HWND)(INT_PTR)0x1234;   /* never a live window here */

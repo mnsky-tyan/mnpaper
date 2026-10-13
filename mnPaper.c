@@ -137,14 +137,14 @@ typedef struct {
     int autostart;
     int share;     /* 1 = the texture is visible in screenshots / screen shares */
     int tbmode;    /* how the veil meets a revealed taskbar:
-                    *   0 = not cover - punch it transparent so the bare shell
-                    *                   bar shows through (default)
-                    *   1 = cover     - no hole; the paper texture covers the bar */
+                    *   0 = not cover - the bar is raised above the veil, so
+                    *                   the shell bar shows crisp (default)
+                    *   1 = cover     - the paper texture covers the bar */
     int autoupd;   /* 1 = look for a new version about once a day (never auto-install) */
 } SETTINGS;
 
-#define TB_NOT_COVER 0  /* punch the bar transparent: do not cover the taskbar */
-#define TB_COVER     1  /* no hole: the paper texture covers the taskbar */
+#define TB_NOT_COVER 0  /* raise the bar above the veil: do not cover the taskbar */
+#define TB_COVER     1  /* leave the bar under the veil: the paper covers the taskbar */
 
 static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
 
@@ -467,15 +467,12 @@ typedef struct {
 
 static OVL  g_ov[MAX_MON];
 static int  g_n;
-/* Hole-in-the-veil state. Fighting the shell over the taskbar's z-order
- * turned out to be intermittent (the shell re-orders it whenever it feels
- * like it), so in the default Not cover mode the veil instead stops painting
- * over the taskbar entirely: while the taskbar is revealed, the veil pixels
- * there are fully transparent alpha and the real taskbar shows through
- * pristine, no matter which side of the overlay it sits on. */
-static RECT g_hole[MAX_MON];
-static int  g_hole_on[MAX_MON];
-static int  g_hole_dirty;
+/* The taskbar modes never touch the texture. Cover and Not cover keep the
+ * veil's pixels opaque everywhere; they differ only in window z-order -
+ * which side of the veil the taskbar sits on (TaskbarZorder below). The
+ * old hole state (a transparent band punched into the veil) is gone as of
+ * 2.7.19: it let the desktop's white frame show around the bar's rounded
+ * corners, which is exactly what Not cover must never do. */
 static HWND g_host;
 static int  g_force_capture_show;   /* --no-exclude validation flag, session only */
 
@@ -509,7 +506,7 @@ static void ApplyCaptureAll(void) {
 
 /* Lift one overlay's strips to the top of the topmost band. Add-only: never
  * demote (a non-topmost insert-after clears WS_EX_TOPMOST and ping-pongs with
- * the shell - see the unconditional-raise comment in Housekeeping). */
+ * the shell - see the raise note on TaskbarZorder). */
 static void RaiseOverlay(OVL *ov) {
     int s;
     for (s = 0; s < ov->n_strips; s++)
@@ -691,26 +688,6 @@ static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp) 
 }
 
 
-/* ClipRect is defined with GrowRect in the housekeeping section, below
- * LocalHole - forward-declared here rather than splitting the pair. */
-static void ClipRect(RECT *r, const RECT *to);
-
-/* hole rect in overlay-local coordinates, 0 if none */
-static void LocalHole(const OVL *ov, int *on, int *x0, int *y0, int *x1, int *y1) {
-    RECT full, local;
-    *on = 0; *x0 = *y0 = *x1 = *y1 = 0;
-    if (ov->idx >= 0 && ov->idx < MAX_MON && g_hole_on[ov->idx]) {
-        SetRect(&full, 0, 0, ov->w, ov->h);          /* the overlay's own extent */
-        local = g_hole[ov->idx];
-        OffsetRect(&local, -ov->rc.left, -ov->rc.top);   /* into overlay-local space */
-        ClipRect(&local, &full);
-        if (local.right > local.left && local.bottom > local.top) {
-            *on = 1;
-            *x0 = local.left; *y0 = local.top; *x1 = local.right; *y1 = local.bottom;
-        }
-    }
-}
-
 static void BuildPaper(OVL *ov) {
     BuildPaperInto((unsigned char *)ov->bits, ov->w, ov->h, &g_s);
 }
@@ -718,71 +695,6 @@ static void BuildPaper(OVL *ov) {
 /* mirror one setting into one checkbox; no-op when there is no live control */
 static void SetChk(HWND ctl, int on) {
     if (ctl) SendMessageW(ctl, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
-}
-
-/* Zero a rect's alpha in place, RGB left alone: one implementation for every
- * path that presents a monitor's texture, so paper and e-ink cannot drift
- * apart on the row/stride geometry. ULW blends by alpha, so the RGB under a
- * hole is never seen and needs no work. Callers that must not leave the master
- * texture mutated use ClearHoleAlpha/RestoreHoleAlpha below, which save the
- * rect first and punch through this. */
-static void PunchHoleAlpha(OVL *ov, int on, int x0, int y0, int x1, int y1) {
-    int y;
-    if (!ov->bits || !on) return;
-    for (y = y0; y < y1; y++)
-        memset((unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4, 0,
-               (size_t)(x1 - x0) * 4);
-}
-
-/* Save the band rect's pixels, punch the transparent hole, and hand
- * the saved block back so the caller can restore it after the upload.
- *
- * The ALPHA is per-pixel noise (PaperPixel derives it from grain, fibre and
- * blotch), so it cannot be guessed back - it has to be saved. That is what
- * makes the restore load-bearing, not a simplification: Housekeeping re-uploads
- * when the hole moves or closes with no rebuild behind it, and a texture left
- * punched would keep a transparent band after the taskbar parked. Forcing a
- * constant alpha back would instead flatten the paper's own transparency. The
- * save is only ever the hole rect (a taskbar strip), and RestoreHoleAlpha
- * frees it. */
-static void ClearHoleAlpha(OVL *ov, unsigned char **saved, size_t *saved_len, int *rx0, int *ry0, int *rx1, int *ry1) {
-    int on, x0, y0, x1, y1, y;
-    size_t rowbytes;
-    *saved = NULL;
-    *saved_len = 0;
-    *rx0 = *ry0 = *rx1 = *ry1 = 0;
-    if (!ov->bits) return;
-    LocalHole(ov, &on, &x0, &y0, &x1, &y1);
-    if (!on) return;
-    *rx0 = x0; *ry0 = y0; *rx1 = x1; *ry1 = y1;
-    rowbytes = (size_t)(x1 - x0) * 4;
-    *saved = (unsigned char *)malloc(rowbytes * (size_t)(y1 - y0));
-    if (!*saved) return;                 /* cannot save: leave the texture alone */
-    *saved_len = rowbytes * (size_t)(y1 - y0);
-    for (y = y0; y < y1; y++)
-        memcpy(*saved + rowbytes * (size_t)(y - y0),
-               (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4,
-               rowbytes);
-    PunchHoleAlpha(ov, on, x0, y0, x1, y1);
-}
-
-/* Put the saved pixels back where they came from. Called after the upload, on
- * every path, so the master texture in ov->bits is never left mutated. */
-static void RestoreHoleAlpha(OVL *ov, unsigned char *saved, size_t saved_len, int x0, int y0, int x1, int y1) {
-    int y;
-    size_t rowbytes;
-    if (!saved || !ov->bits) return;
-    /* Restore by the rect that was actually saved, never by re-reading the
-     * live hole: the live state may already differ, but the pixels must
-     * come back regardless or the punched alpha stays permanent (that was
-     * the 2.7.7 regression). */
-    rowbytes = (size_t)(x1 - x0) * 4;
-    if (rowbytes * (size_t)(y1 - y0) != saved_len) { free(saved); return; }
-    for (y = y0; y < y1; y++) {
-        unsigned char *row = (unsigned char *)ov->bits + (size_t)y * ov->w * 4 + (size_t)x0 * 4;
-        memcpy(row, saved + rowbytes * (size_t)(y - y0), rowbytes);
-    }
-    free(saved);
 }
 
 /* A monitor can appear that has no baked texture yet. Fill it with a cheap
@@ -810,17 +722,10 @@ static void SeedPaperPreview(OVL *ov) {
 static int ApplyLayered(OVL *ov) {
     HDC screen = GetDC(NULL);
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    unsigned char *saved = NULL;
-    size_t saved_len = 0;
     int s, ok = 1;
-    int rx0=0, ry0=0, rx1=0, ry1=0;
-    /* Mask the taskbar hole out of this upload, then put the master texture
-     * back exactly as it was. Housekeeping re-uploads when the hole closes or
-     * moves WITHOUT rebuilding, so ov->bits must not be left mutated - that is
-     * the regression a no-restore version caused (a permanent transparent band
-     * across the bottom of the screen once the taskbar parked). */
-    if (g_s.mode == MODE_PAPER)
-        ClearHoleAlpha(ov, &saved, &saved_len, &rx0, &ry0, &rx1, &ry1);
+    /* The taskbar modes never touch the texture (see TaskbarZorder): every
+     * upload is a plain copy of the master bits - nothing to mask, nothing
+     * to restore. */
     for (s = 0; s < ov->n_strips; s++) {
         SIZE size = { ov->w, min(STRIP_H, ov->h - s * STRIP_H) };
         POINT src = { 0, s * STRIP_H };
@@ -830,7 +735,6 @@ static int ApplyLayered(OVL *ov) {
             ok = 0;
         }
     }
-    RestoreHoleAlpha(ov, saved, saved_len, rx0, ry0, rx1, ry1);
     ReleaseDC(NULL, screen);
     return ok;
 }
@@ -1026,11 +930,12 @@ static void SyncOverlays(void) {
  * themselves and end up ABOVE the veil. A periodic
  * SetWindowPos(HWND_TOPMOST) re-claims the top of the topmost band; when
  * the order is already correct the call is a no-op. The veil never
- * withdraws: it still covers the whole screen, and in Not cover mode the
- * taskbar band is punched transparent instead (see g_hole). */
+ * withdraws and never punches a hole: both taskbar modes keep the full
+ * texture, and which side of the veil the taskbar sits on is z-order only
+ * (see TaskbarZorder). */
 /* One taskbar slot per monitor, not per screenful: Windows shows a taskbar
  * on every display when that option is on, so this has to track MAX_MON or a
- * 5-monitor desk silently drops taskbars 5..N - no hole punched, no add-only
+ * 5-monitor desk silently drops taskbars 5..N - no slot, no add-only
  * raise, and the veil paints straight over them with nothing logged
  * (2026-10-08 round-10 review). */
 #define TB_MAX MAX_MON
@@ -1039,31 +944,11 @@ static HWND g_tbw[TB_MAX];
 static int  g_ntb;
 static int  g_tb_state[TB_MAX];   /* 0 unknown, 1 parked, 2 revealed */
 
-/* Pills-only hole: on Windows 11 the taskbar WINDOW is a full-width strip
- * while it only DRAWS three floating surfaces (Start button, icon pill,
- * tray pill). Holing the full window rect wipes the paper off the whole
- * bottom band and makes the empty gaps read as a dead strip. Union the
- * visible child surfaces instead - verified live: the children carry real
- * rects (Start, ReBarWindow32 icon area, TrayNotifyWnd tray pill) - and
- * hole only that union (+6px margin), clipped to the band. If the children
- * do not add up (older shells, future changes), fall back to the full
- * band: holing more than needed is safe, holing less is not. */
-typedef struct { const WCHAR *want; RECT u; int have; } PillScan;
-
-/* grow *into to the union with *r (PillEnumProc and RefinePillHole used to
- * hand-write this min/max chain twice; 2026-10-04 review) */
-static void GrowRect(RECT *into, const RECT *r) {
-    if (r->left   < into->left)   into->left   = r->left;
-    if (r->top    < into->top)    into->top    = r->top;
-    if (r->right  > into->right)  into->right  = r->right;
-    if (r->bottom > into->bottom) into->bottom = r->bottom;
-}
-
-/* shrink *r to the part of it that lies inside *to. The union direction got
- * GrowRect above; this is its sibling, and four sites were hand-writing it
- * (2026-10-08 round-10 review): LocalHole, RefinePillHole, ComputeHoles and
- * DxgiPoll's on-slot bound. An empty result is left as an inverted rect for
- * the caller to test, never silently clamped to something non-empty. */
+/* shrink *r to the part of it that lies inside *to. Several sites used to
+ * hand-write this min/max chain (2026-10-08 round-10 review); DxgiPoll's
+ * on-slot bound and ClassifyTaskbars' band clipping still call it. An empty
+ * result is left as an inverted rect for the caller to test, never silently
+ * clamped to something non-empty. */
 static void ClipRect(RECT *r, const RECT *to) {
     if (r->left   < to->left)   r->left   = to->left;
     if (r->top    < to->top)    r->top    = to->top;
@@ -1071,43 +956,7 @@ static void ClipRect(RECT *r, const RECT *to) {
     if (r->bottom > to->bottom) r->bottom = to->bottom;
 }
 
-static BOOL CALLBACK PillEnumProc(HWND hwnd, LPARAM lp) {
-    PillScan *s = (PillScan *)lp;
-    WCHAR cls[64];
-    RECT r;
-    GetClassNameW(hwnd, cls, 64);
-    if (lstrcmpW(cls, s->want) != 0) return TRUE;
-    if (!GetWindowRect(hwnd, &r)) return TRUE;
-    if (r.right <= r.left || r.bottom <= r.top) return TRUE;
-    if (!s->have) { s->u = r; s->have = 1; }
-    else GrowRect(&s->u, &r);
-    return TRUE;
-}
-
-static void RefinePillHole(HWND taskbar, RECT *hole) {
-    static const WCHAR *const pills[] = { L"Start", L"ReBarWindow32", L"TrayNotifyWnd" };
-    RECT u;
-    int have = 0, k;
-    const LONG m = 6;
-    u.left = u.right = u.top = u.bottom = 0;
-    for (k = 0; k < 3; k++) {
-        PillScan ps;
-        ps.want = pills[k];
-        ps.u.left = ps.u.right = ps.u.top = ps.u.bottom = 0;
-        ps.have = 0;
-        EnumChildWindows(taskbar, PillEnumProc, (LPARAM)&ps);
-        if (!ps.have) continue;
-        if (!have) { u = ps.u; have = 1; }
-        else GrowRect(&u, &ps.u);
-    }
-    if (!have) return;                       /* keep the full band */
-    u.left -= m; u.top -= m; u.right += m; u.bottom += m;
-    ClipRect(&u, hole);                        /* the margin may reach outside */
-    if (u.right > u.left && u.bottom > u.top) *hole = u;
-}
-
 static int IsTaskbarWnd(HWND h);
-static void EinkPresent(void);   /* e-ink arm of the hole-dirty refresh below */
 
 static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     RECT r;
@@ -1119,17 +968,16 @@ static BOOL CALLBACK TbEnumProc(HWND hwnd, LPARAM lp) {
     /* The cap is tested only once a real taskbar wants the slot. It used to be
      * the callback's first statement, so on a desk whose table was exactly full
      * the first window enumerated AFTER the fill - any window, taskbar or not -
-     * stopped the walk and logged "a further taskbar gets no hole", a claim
-     * about a taskbar that was never refused (gate round-10 review; same class
-     * as the DXGI caps, which probe past the bound before logging a drop). */
+     * stopped the walk and logged a refusal claim about a taskbar that was
+     * never refused (gate round-10 review; same class as the DXGI caps, which
+     * probe past the bound before logging a drop). */
     if (g_ntb >= TB_MAX) {
-        L("taskbars: stopped at TB_MAX=%d - a further taskbar gets no hole and stays textured over", TB_MAX);
+        L("taskbars: stopped at TB_MAX=%d - a further taskbar gets no slot and cannot be lifted in Not cover", TB_MAX);
         return FALSE;
     }
     if (!GetWindowRect(hwnd, &r)) return TRUE;
     if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return TRUE;
     g_tb[g_ntb] = r;
-    RefinePillHole(hwnd, &g_tb[g_ntb]);   /* hole the pills, keep the paper on the gaps */
     g_tbw[g_ntb] = hwnd;
     g_ntb++;
     return TRUE;
@@ -1174,20 +1022,20 @@ static HWND LiveDlg(void) {
  * bottom-docked one leaves a short band, a left- or right-docked one leaves a
  * full-height strip that is a few pixels WIDE. Testing only the height misses
  * the side docks entirely, which classifies a parked side taskbar as revealed:
- * a permanent see-through band down that edge, a pointless topmost raise on
- * every tick, and tb_up latched so the z-order re-claim walk never runs again.
+ * a pointless topmost raise on every tick in Not cover, and the Not cover
+ * z-order walk skipped for as long as it stays misclassified.
  * The smaller extent is the one the taskbar hides along, so test that. */
 static int TbParked(const RECT *on) {
     return min(on->bottom - on->top, on->right - on->left) <= 16;
 }
 
-static void ComputeHoles(void) {
+/* Parked/revealed classification for the taskbars CollectTaskbars just
+ * gathered: 1 = parked sliver, 2 = revealed band. A taskbar matching no
+ * overlay (a monitor without a veil) keeps 0, "unknown". Runs on the
+ * Housekeeping timer, right after the enumeration, so no thread ever
+ * re-walks another's taskbar table. */
+static void ClassifyTaskbars(void) {
     int i, j;
-    RECT newh[MAX_MON];
-    int  newon[MAX_MON];
-
-    memset(newh, 0, sizeof(newh));
-    for (i = 0; i < g_n; i++) newon[i] = 0;
     for (j = 0; j < g_ntb; j++) {
         int mon = -1;
         RECT on;
@@ -1199,83 +1047,31 @@ static void ComputeHoles(void) {
         if (mon < 0) continue;
         on = g_tb[j];
         ClipRect(&on, &g_ov[mon].rc);            /* the band, inside this monitor */
-        if (TbParked(&on)) {                     /* parked sliver          */
-            g_tb_state[j] = 1;                    /* unlatch: armed again   */
-            continue;
-        }
-        g_tb_state[j] = 2;
-        /* The veil steps aside from the taskbar by default: painting paper
-         * over it makes Windows drop the taskbar's topmost state and sink it
-         * behind every window (see the hole note above g_hole). The user can
-         * opt into covering the taskbar (g_s.tbmode == TB_COVER), and that
-         * choice is only safe while we keep re-asserting the taskbar's topmost
-         * bit here: the shell strips it whenever a topmost full-screen veil is
-         * up, so without the raise the bar would sink exactly as it did
-         * before the hole existed - which is the whole reason the hole
-         * exists. Raising stays ADD-ONLY and applies to the one taskbar
-         * window, never to our own strips. */
-        if (g_tbw[j])
+        g_tb_state[j] = TbParked(&on) ? 1 : 2;
+    }
+}
+
+/* Put the taskbar where the chosen mode wants it - this is the whole
+ * mechanism the two modes have. Not cover: a revealed taskbar is raised to
+ * the top of the topmost band so the paper never sits on it; the bar keeps
+ * every click and hover. Cover: nothing to do here - the veil's strips
+ * already sit above the bar and cover it, and the bar keeps working
+ * underneath them because the strips are click-through (WS_EX_TRANSPARENT).
+ * Live-verified before 2.7.19 on the reference desktop: with a strip parked
+ * above the auto-hidden taskbar for minutes - including same-second
+ * raise/re-assert pairs - the shell never dropped the bar's topmost bit, so
+ * Cover needs no counter-raise. Raising stays ADD-ONLY and applies to the
+ * one taskbar window, never to our own strips. No transparency is punched
+ * in either mode: the texture itself is never cut open for the taskbar (the
+ * hole era ended in 2.7.19 - the punched band was what showed the desktop's
+ * white frame around the bar's rounded corners). */
+static void TaskbarZorder(void) {
+    int j;
+    if (g_s.tbmode == TB_COVER) return;
+    for (j = 0; j < g_ntb; j++)
+        if (g_tb_state[j] == 2 && g_tbw[j])
             SetWindowPos(g_tbw[j], HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-        if (g_s.tbmode != TB_COVER) {    /* Not cover: punch a transparent hole */
-            if (newon[mon]) UnionRect(&newh[mon], &newh[mon], &on);
-            else { newh[mon] = on; newon[mon] = 1; }
-        }
-    }
-    for (i = 0; i < g_n; i++) {
-        /* A band is dirty when it opens, closes, or MOVES. */
-        int changed = newon[i] != g_hole_on[i];
-        if (!changed && newon[i] &&
-            (newh[i].left != g_hole[i].left || newh[i].top != g_hole[i].top ||
-             newh[i].right != g_hole[i].right || newh[i].bottom != g_hole[i].bottom))
-            changed = 1;
-        if (changed) {
-            g_hole[i] = newh[i];
-            g_hole_on[i] = newon[i];
-            g_hole_dirty = 1;
-            L("taskbar hole %d %s rect=(%ld,%ld)-(%ld,%ld) on-screen=%ld",
-              i, newon[i] ? "ON" : "off",
-              newh[i].left, newh[i].top, newh[i].right, newh[i].bottom,
-              newon[i] ? newh[i].bottom - newh[i].top : 0);
-        }
-    }
-}
-
-static void RequestPaper(void);
-
-/* The shared hole-dirty apply: RecomputeHoles and Housekeeping both land
- * here, so the gating and the mode dispatch live in exactly one place. */
-static void ApplyHoleRefresh(void) {
-    int i;
-    if (!g_hole_dirty) return;
-    g_hole_dirty = 0;
-    if (g_s.master && g_s.mode == MODE_PAPER)
-        for (i = 0; i < g_n; i++) ApplyLayered(&g_ov[i]);
-    else if (g_s.master && g_s.mode == MODE_EINK)
-        /* the punch lives in ov->bits and a static screen publishes no
-         * frames, so without this the parked taskbar leaves the last
-         * published frame's transparent band on screen indefinitely
-         * (2026-10-05 review) */
-        EinkPresent();
-}
-
-/* Re-decide the holes and apply the result at once, so the taskbar radios
- * and the tray item take effect on the click instead of on the next timer
- * tick. Nothing is forced here: ComputeHoles compares newon[i] against the
- * latched g_hole_on[i] as well as the rect, so a hole OPENING and a hole
- * CLOSING are both changes and both arm the re-upload - which is the whole
- * reason every direction of g_s.tbmode reaches the screen. Pre-clearing the
- * latched state to "make sure" a change is seen does the opposite: a hole
- * that is now closed compares equal to the cleared zero, no re-upload runs,
- * and the band keeps the transparency of the previous upload, so the taskbar
- * stays untextured for good on a static screen (2026-10-11 review).
- * CollectTaskbars is deliberately NOT called here: this runs on the UI thread
- * (a radio click or a tray command) while Housekeeping owns the taskbar
- * enumeration on its own timer, and re-walking it from two threads would race
- * the g_tb table. The next Housekeeping pass re-walks and confirms. */
-static void RecomputeHoles(void) {
-    ComputeHoles();
-    ApplyHoleRefresh();
 }
 
 static void Housekeeping(void) {
@@ -1295,16 +1091,21 @@ static void Housekeeping(void) {
     vs.right  = vs.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
     vs.bottom = vs.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    /* While a taskbar is revealed, do not fight foreign windows for the top
-       of the band: the shell's auto-hide manager sets WS_EX_TOPMOST on the
-       taskbar when it reveals, and a veil re-assert above it within the
-       same second makes the shell drop the bit again (observed: taskbar
-       stuck at rank ~330, topmost=0, hidden behind every window). The cost
-       is a possibly untextured mascot while the taskbar is up. */
+    /* Not cover: while a taskbar is revealed, do not fight foreign windows
+       for the top of the band. The bar was deliberately raised above the
+       veil (TaskbarZorder), and a veil re-assert above it within the same
+       second as the reveal risks the shell dropping the bar's topmost bit
+       (the historical auto-hide disaster: taskbar stuck at rank ~330,
+       topmost=0, hidden behind every window). The cost is a possibly
+       uncovered mascot while the bar is up. Cover never raises the bar, so
+       its steady state (strips above the bar) has nothing to defend here and
+       the walk keeps running: if the shell ever hoists the bar above the
+       strips, this same walk re-covers it on the next tick. */
     {
         int tb_up = 0;
-        for (j = 0; j < g_ntb; j++)      /* only slots this cycle produced */
-            if (g_tb_state[j] == 2) { tb_up = 1; break; }
+        if (g_s.tbmode != TB_COVER)
+            for (j = 0; j < g_ntb; j++)  /* only slots this cycle produced */
+                if (g_tb_state[j] == 2) { tb_up = 1; break; }
         if (!tb_up) {
             h = GetTopWindow(NULL);
             walked = 0;
@@ -1340,12 +1141,12 @@ static void Housekeeping(void) {
         }
     }
 
-    /* No z-order fight with the taskbar any more: in Not cover mode the veil
-       simply stops painting over the revealed taskbar (see g_hole). The walk
-       above skips taskbars entirely. */
+    /* The taskbar modes are pure z-order now: classify what CollectTaskbars
+       gathered, then park the bar on the chosen side of the veil. No pixels
+       change, so nothing here re-uploads the texture. */
     CollectTaskbars();
-    ComputeHoles();
-    ApplyHoleRefresh();
+    ClassifyTaskbars();
+    TaskbarZorder();
     /* the settings window floats above the veil (the veil used to swallow
        it, which is what made the sliders feel laggy and unreadable). */
     {
@@ -1768,14 +1569,6 @@ static int PresentEinkRect(OVL *ov) {
     }
     LeaveCriticalSection(&g_ecs);
     if (!got) return 0;
-    /* Same band rule as the paper path, applied in place: this buffer is
-     * re-copied from g_eproc_show at the top of every present, so the pixels
-     * under the band are disposable. Housekeeping re-presents on every hole
-     * change, so a parked taskbar cannot leave a stale band in the upload. */
-    { int hon, hx0, hy0, hx1, hy1;
-      LocalHole(ov, &hon, &hx0, &hy0, &hx1, &hy1);
-      if (hon)
-          PunchHoleAlpha(ov, hon, hx0, hy0, hx1, hy1); }
     return 1;
 }
 
@@ -2657,14 +2450,21 @@ static const WCHAR *TB_MODE_NAMES[2] = { L"Cover", L"Not cover" };
 static void SyncTbRadios(HWND dlg, int id);   /* defined with the other radio mirrors */
 
 /* The one path that changes the taskbar mode: dialog radio or tray item.
- * Saves, re-decides the bands so the click takes effect immediately, mirrors
- * the open settings window and logs. 121 is Cover, 122 is Not cover. */
+ * Saves, applies the z-order consequence on the click itself (Not cover
+ * lifts the bar above the veil; Cover lifts the strips back over it),
+ * mirrors the open settings window and logs. 121 is Cover, 122 is Not
+ * cover. Nothing re-uploads the texture: the modes never touch pixels. */
 static void ApplyTbMode(int mode) {
     HWND dlg;
+    int i;
     if (mode != TB_COVER) mode = TB_NOT_COVER;
     g_s.tbmode = mode;
     SaveSettings();
-    RecomputeHoles();
+    if (mode == TB_COVER) {
+        for (i = 0; i < g_n; i++) RaiseOverlay(&g_ov[i]);   /* paper back over the bar */
+    } else {
+        TaskbarZorder();                                    /* bar back above the paper */
+    }
     dlg = LiveDlg();
     if (dlg) SyncTbRadios(dlg, g_s.tbmode == TB_COVER ? 121 : 122);
     L("tbmode=%d", mode);
@@ -2717,13 +2517,14 @@ static const WCHAR HELP_TEXT[] =
     L"    that always keeps the texture.\r\n"
     L"      Cover - the paper texture covers the whole screen including the\r\n"
     L"        taskbar, so the entire desktop reads as one uniform surface.\r\n"
-    L"      Not cover (default) - the paper steps aside over the taskbar's\r\n"
-    L"        buttons, leaving them completely crisp and untextured.\r\n"
-    L"    Cover fights the shell: Windows likes to drop the taskbar's\r\n"
-    L"    always-on-top state when a full-screen texture sits over it, so\r\n"
-    L"    mnPaper keeps re-asserting the taskbar on top while Cover is chosen.\r\n"
-    L"    If the taskbar ever disappears, pick Not cover - it comes back\r\n"
-    L"    immediately.\r\n"
+    L"        The taskbar keeps working underneath: every click and hover\r\n"
+    L"        still reaches it through the texture.\r\n"
+    L"      Not cover (default) - the taskbar stays above the texture while\r\n"
+    L"        it is up, so its buttons show completely crisp; the texture\r\n"
+    L"        returns the moment it hides again.\r\n"
+    L"    Both choices only move windows around - the texture itself is\r\n"
+    L"    never cut open, so no frame or sliver of the desktop can show\r\n"
+    L"    through either way.\r\n"
     L"  ?        - this window.\r\n"
     L"  Check for updates - compares your version with the published one. "
     L"If a new version exists it offers to download and install it: the "
@@ -3660,7 +3461,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 14, 300, 352, 20, hwnd, (HMENU)120,
             GetModuleHandleW(NULL), NULL);
         /* Taskbar band: two mutually exclusive ways the veil meets a revealed
-         * taskbar (see ComputeHoles): Cover or Not cover. */
+         * taskbar (see TaskbarZorder): Cover or Not cover. */
         CreateWindowExW(0, L"STATIC", L"Taskbar:",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 14, 324, 72, 16, hwnd, (HMENU)130,
             GetModuleHandleW(NULL), NULL);

@@ -10,7 +10,7 @@ Currently Windows only. Local, lightweight and free. Download `mnPaper.exe` from
 
 ![Reading a PDF under the texture](assets/screenshot-pdf.png)
 
-![The settings window and the taskbar, with the texture kept off the taskbar's own buttons and the gaps still textured](assets/screenshot-gui-taskbar.png)
+![The settings window and a revealed taskbar lifted above the texture in Not cover mode](assets/screenshot-gui-taskbar.png)
 
 Expected usage: **paper mode** - roughly 40 MB per monitor (the texture is
 kept in memory at full resolution), near-zero CPU when nothing is changing,
@@ -94,17 +94,14 @@ The build produces `mnPaper.exe` in the repo root.
   rest of the desktop.
     - **Cover**: the paper texture covers the whole screen including the
       taskbar, so the entire desktop reads as one uniform paper surface. The
-      taskbar is completely visible and interactive underneath with light
-      paper grain.
-    - **Not cover** (default): the paper steps out of the way of the taskbar's
-      own buttons (the Start button, the icon pill and the tray pill) so they
-      stay completely crisp with nothing textured on top of them; the gaps
-      between them keep the paper, as shown in the screenshot above.
-  `Cover` fights the shell: Windows likes to drop the taskbar's always-on-top
-  state when a full-screen texture sits over it, so mnPaper keeps re-asserting
-  the taskbar on top while Cover is chosen. If the taskbar ever disappears,
-  pick `Not cover`: the bar comes straight back. Taskbars shown on secondary
-  displays get the same treatment either way.
+      taskbar keeps working underneath: every click and hover still reaches
+      it through the click-through texture.
+    - **Not cover** (default): the taskbar is lifted above the paper while it
+      is up, so its buttons show completely crisp; the moment it hides again,
+      the paper covers the spot again.
+  Both choices only move windows around: the texture itself is never cut open,
+  so no frame or sliver of the desktop can ever show through either way.
+  Taskbars shown on secondary displays get the same treatment either way.
 - The settings window keeps a compact fixed-size layout rather than scaling
   with your display DPI, so it looks small on a high-DPI screen; every
   control still fits and works.

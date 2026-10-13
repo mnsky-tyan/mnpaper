@@ -98,7 +98,7 @@ performance from changing labels or process launch time.
 mouse event" can fail on a busy machine: the run still shows the final render in
 flight (e.g. 11 requested, 10 completed) and the assertion waits for it to land.
 Measured over 16 runs of the same code: 15 clean, 1 flaky. It is a timing
-threshold, not a logic fault, and the hole code is dormant during that section.
+threshold, not a logic fault, and the taskbar code is dormant during that section.
 Re-run before treating it as a regression.
 
 ## Build recipe (Windows host)
@@ -112,7 +112,7 @@ at a cmd prompt):
 call "C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Auxiliary\Build\vcvars64.bat"
 rc /nologo mnPaper.rc
 cl /nologo /O2 /W3 mnPaper.c mnPaper.res /FemnPaper.exe
-for %%f in (layout_fit slider_latency verify_fixes hole_cycle dialog_push gdi_fallback eink_thread tall_coverage) do ^
+for %%f in (layout_fit slider_latency verify_fixes tbzorder dialog_push gdi_fallback eink_thread tall_coverage) do ^
   cl /nologo /O2 /W3 tests\%%f.c /Fe%%f.exe
 cl /nologo /O2 /W3 /MTd /D_DEBUG tests\update_help_capture.c /Fetest_extra.exe
 ```
@@ -134,15 +134,15 @@ above). Each is idempotent and leaves no windows or scratch files behind.
 If a freshly built test exe will not start or vanishes between build and
 run, check Windows Defender before suspecting the build: its ML heuristics
 intermittently quarantine these unsigned exes (`Behavior:Win32/Execution.A!ml`,
-seen 2026-10-04 on a hole_cycle build). `Get-MpThreatDetection` shows it;
+seen 2026-10-04 on a hole-era test build). `Get-MpThreatDetection` shows it;
 rebuild and run in one go, or exclude the temp directory.
 
 ### What each suite asserts
 
 - `slider_latency.c` - drag latency end to end (request-to-upload budget with
   METRIC lines), the final bitmap, worker preemption, close-before-timer, the
-  taskbar hole cycle (hole moves/parks with no texture rebuild, master
-  byte-identical - every byte), odd preview sizes, warmth/grain/fibre/blotch
+  taskbar upload invariance (uploads around a latched revealed taskbar leave
+  the master texture byte-identical in both modes - every byte), odd preview sizes, warmth/grain/fibre/blotch
   structure, help window, update-feed parsing (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
   63/65-char runs refused), the share/mode/texture-on/autostart controls and
@@ -162,34 +162,29 @@ rebuild and run in one go, or exclude the temp directory.
   ticks (no per-tick reallocation), exact whole-buffer change detection (an
   edit at any coordinate is seen, not one pixel in 97), shadow resync, clean
   rebuild after a reset.
-- `hole_cycle.c` - the taskbar hole over a fixed geometry (2880x1800 monitor,
-  48px band): reveal/park cycles produce the right hole rect, the master
-  texture comes back byte-identical every time (full-byte hash), 20 round
-  trips leave no residue, and `ComputeHoles`' parked/revealed decision is
-  driven directly for a bottom band, a left-docked sliver and a right-docked
-  sliver (the side docks a height-only test used to misread as revealed). It
-  also drives the `ClipRect` helper directly: an overhanging taskbar band
-  through `ComputeHoles` and an overhanging/wholly off-screen hole through
-  `LocalHole`/`ClearHoleAlpha` must clip to the monitor/overlay, punch only the
-  intersection and restore the master byte for byte. Finally it registers a
-  process-local `Shell_TrayWnd` class, creates five visible fake taskbar
-  windows parked outside every virtual screen and drives the real production
-  chain (`EnumWindows` -> `TbEnumProc` -> `CollectTaskbars` -> `ComputeHoles`),
-  so the taskbar slot cap (`TB_MAX >= MAX_MON`) is exercised as behaviour and
-  hitting the cap is proven to log what was dropped, and `MonRectCb` is driven
-  headlessly past `MAX_MON` to prove the monitor cap stores a monitor with one
-  slot free and logs what is lost; the fakes are destroyed before the suite
-  returns and never intersect the virtual screen. Both taskbar modes are
-  driven through the real click entry `RecomputeHoles` from the LATCHED state:
-  not-cover (default) opens the hole over a revealed band, cover closes it,
-  and switching back re-opens it. The change is observed as the
-  `taskbar hole N ON/off` line that arms the re-upload, plus the latched rect,
-  so a pass that fails to notice the change fails the suite, and an unchanged
-  pass must log nothing (no re-upload on every tick).
-  The band transform itself is asserted on pixels: `ClearHoleAlpha` and
-  `RestoreHoleAlpha` are driven directly so what actually goes to the screen is
-  measured - not-cover means zero alpha in the hole, and the master comes back
-  byte-identical after restore.
+- `tbzorder.c` - the two taskbar modes over a fixed geometry (2880x1800
+  monitor, 48px band). Since 2.7.19 the modes are pure z-order and never
+  touch the texture: the parked/revealed classifier is driven directly
+  (`TbParked` for bottom/left/right docks and the 16px threshold, then
+  `ClassifyTaskbars` for the same geometries plus a taskbar on a monitor
+  without a veil keeping state 0), the z-order pass is driven on real but
+  invisible off-screen windows (Not cover raises a revealed bar above a
+  later reference window and sets its topmost bit while never touching a
+  parked sliver; Cover raises nothing), and the no-punch invariant is
+  asserted on the upload path (uploads around a latched revealed taskbar
+  leave the master texture byte-identical in BOTH modes, the band keeps
+  full paper alpha, 20 reveal/park round trips across both modes leave no
+  residue).
+  It also registers a process-local `Shell_TrayWnd` class, creates five
+  visible fake taskbar windows parked outside every virtual screen and drives
+  the real production chain (`EnumWindows` -> `TbEnumProc` -> `CollectTaskbars`
+  -> `ClassifyTaskbars`), so the taskbar slot cap (`TB_MAX >= MAX_MON`) is
+  exercised as behaviour and hitting the cap is proven to log what was
+  dropped (`no slot`, not just the bound), a plain non-taskbar window on a
+  full table is passed through with no refusal and no log, and `MonRectCb`
+  is driven headlessly past `MAX_MON` to prove the monitor cap stores a
+  monitor with one slot free and logs what is lost; the fakes are destroyed
+  before the suite returns and never intersect the virtual screen.
 - `dialog_push.c` - one `DialogPushSettings` call drives every control from
   the settings struct (sliders, checkboxes, the mode radio pair and the
   taskbar radio group 121/122, whose push must clear the sibling radio),
