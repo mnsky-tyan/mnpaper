@@ -146,7 +146,7 @@ rebuild and run in one go, or exclude the temp directory.
   structure, help window, update-feed parsing (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
   63/65-char runs refused), the share/mode/texture-on/autostart controls and
-  the taskbar mode radio group (ids 121/122/123) against a PID-suffixed
+  the taskbar mode radio group (ids 121/122) against a PID-suffixed
   scratch hive.
 - `eink_thread.c` - the e-ink worker machinery headlessly: pure render
   properties, capture-slot ownership (the ring is 3 deep), publish, worker

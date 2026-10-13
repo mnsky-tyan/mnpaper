@@ -63,7 +63,7 @@ int main(void) {
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 80, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
-                      .autostart = 0, .share = 0, .tbmode = TB_HOLE, .autoupd = 1 };
+                      .autostart = 0, .share = 0, .tbmode = TB_NOT_COVER, .autoupd = 1 };
     BuildPaper(&ov);
     clean = H(px, (size_t)w * h * 4);
     Check(px[(size_t)band_y * w * 4 + 1400 * 4 + 3] != 0,
@@ -202,7 +202,6 @@ int main(void) {
             unsigned char *saved = NULL;
             size_t saved_len = 0;
             int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0, x;
-            int bare_mx = 0;
             long bare_tot = 0;
 
             g_hole_on[0] = 1;
@@ -212,7 +211,7 @@ int main(void) {
                   "ClearHoleAlpha saved its pixels before punching");
             for (x = rx0; x < rx1; x++) {
                 int a = ((unsigned char *)ov.bits)[(size_t)ry0 * w * 4 + x * 4 + 3];
-                bare_tot += a; if (a > bare_mx) bare_mx = a;
+                bare_tot += a;
             }
             Check(bare_tot == 0,
                   "the bare band really is zero alpha on the way up (the hole still works)");

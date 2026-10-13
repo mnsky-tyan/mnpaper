@@ -71,7 +71,7 @@
 #define IDM_SETTINGS    9004
 #define IDM_STRENGTH    9007      /* + index: 10/20/30/40 */
 #define IDM_SHARE       9020
-#define IDM_TBMODE      9023      /* + mode index: hole / cover / paper over */
+#define IDM_TBMODE      9023      /* + index: cover / not cover */
 #define IDM_AUTOSTART   9005
 #define IDM_AUTOUPD     9021
 #define IDM_EXIT        9006
@@ -145,7 +145,6 @@ typedef struct {
 
 #define TB_NOT_COVER 0  /* punch the bar transparent: do not cover the taskbar */
 #define TB_COVER     1  /* no hole: the paper texture covers the taskbar */
-#define TB_HOLE      TB_NOT_COVER
 
 static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep);
 
@@ -176,7 +175,7 @@ static LONG WINAPI CrashDump(EXCEPTION_POINTERS *ep) {
 static SETTINGS g_s = { .master = 1, .mode = MODE_PAPER, .intensity = 30,
                         .warmth = 45, .grain = 4, .fibre = 40, .blotch = 30,
                         .shades = 4, .contrast = 50, .dither = 75,
-                        .autostart = 0, .share = 0, .tbmode = TB_HOLE,
+                        .autostart = 0, .share = 0, .tbmode = TB_NOT_COVER,
                         .autoupd = 1 };
 /* Test mode: the hidden regression suites set this before anything runs. It
  * gates every side effect a test must not perform (windows on the working
@@ -350,7 +349,7 @@ static void LoadSettings(void) {
         g_s.share     = GetDword(k, L"share",     g_s.share);
         /* tbmode replaced the tapebar switch. An install that never chose
          * tbmode still has tapebar on disk, and dropping it would silently
-         * revert that machine to the default: 0 -> hole, 1 -> cover. A tbmode
+         * revert that machine to the default: 0 -> not cover, 1 -> cover. A tbmode
          * value, once written, wins outright and the old key is ignored. */
         {
             DWORD v = 0, sz = sizeof(v), t = 0;
@@ -358,7 +357,7 @@ static void LoadSettings(void) {
                 && t == REG_DWORD)
                 g_s.tbmode = (int)v;
             else
-                g_s.tbmode = GetDword(k, L"tapebar", TB_HOLE) ? TB_COVER : TB_HOLE;
+                g_s.tbmode = GetDword(k, L"tapebar", TB_NOT_COVER) ? TB_COVER : TB_NOT_COVER;
         }
         g_s.autoupd   = GetDword(k, L"autoupd",   1);   /* default: daily check on */
         {
@@ -2628,9 +2627,8 @@ static int ConfirmEink(HWND owner) {
 /* One place for the boolean settings that behave identically: the dialog
  * checkboxes set them, the tray menu toggles them, and both paths save, run
  * the side effect, mirror the open settings window and log through here.
- * The taskbar choice is NOT in this table: it has three values, so toggling
- * it (value ? 1 : 0) would silently fold "paper over" back to "cover";
- * ApplyTbMode owns that one. */
+ * The taskbar choice is NOT in this table: it is a radio pair (Cover / Not
+ * cover) with its own apply path, ApplyTbMode. */
 enum { BB_SHARE, BB_AUTOSTART, BB_AUTOUPD, BB_COUNT };
 static const struct {
     int *field;
@@ -2655,7 +2653,7 @@ static void ApplyBool(int which, int value) {
     L("%s=%d", g_bprops[which].name, *g_bprops[which].field);
 }
 
-static const WCHAR *TB_MODE_NAMES[2] = { L"Cover the taskbar", L"Not cover the taskbar" };
+static const WCHAR *TB_MODE_NAMES[2] = { L"Cover", L"Not cover" };
 static void SyncTbRadios(HWND dlg, int id);   /* defined with the other radio mirrors */
 
 /* The one path that changes the taskbar mode: dialog radio or tray item.
@@ -3670,7 +3668,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 92, 320, 88, 20, hwnd, (HMENU)121,
             GetModuleHandleW(NULL), NULL);
         CreateWindowExW(0, L"BUTTON", L"Not cover",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 186, 320, 110, 20, hwnd, (HMENU)122,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON, 186, 320, 180, 20, hwnd, (HMENU)122,
             GetModuleHandleW(NULL), NULL);
         /* "?" circle: explanations open only when pressed. Owner-drawn
          * round button, id 116. */
