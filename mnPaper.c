@@ -469,10 +469,10 @@ static OVL  g_ov[MAX_MON];
 static int  g_n;
 /* Hole-in-the-veil state. Fighting the shell over the taskbar's z-order
  * turned out to be intermittent (the shell re-orders it whenever it feels
- * like it), so instead the veil stops painting over the taskbar entirely:
- * while the taskbar is revealed, the veil pixels there are fully
- * transparent alpha and the real taskbar shows through pristine, no matter
- * which side of the overlay it sits on. */
+ * like it), so in the default Not cover mode the veil instead stops painting
+ * over the taskbar entirely: while the taskbar is revealed, the veil pixels
+ * there are fully transparent alpha and the real taskbar shows through
+ * pristine, no matter which side of the overlay it sits on. */
 static RECT g_hole[MAX_MON];
 static int  g_hole_on[MAX_MON];
 static int  g_hole_dirty;
@@ -1025,9 +1025,9 @@ static void SyncOverlays(void) {
  * (Live2D mascots, computer-use overlays) re-assert WS_EX_TOPMOST
  * themselves and end up ABOVE the veil. A periodic
  * SetWindowPos(HWND_TOPMOST) re-claims the top of the topmost band; when
- * the order is already correct the call is a no-op. The whole screen is
- * supposed to stay textured, so the veil never withdraws - not even where the
- * taskbar reveals. */
+ * the order is already correct the call is a no-op. The veil never
+ * withdraws: it still covers the whole screen, and in Not cover mode the
+ * taskbar band is punched transparent instead (see g_hole). */
 /* One taskbar slot per monitor, not per screenful: Windows shows a taskbar
  * on every display when that option is on, so this has to track MAX_MON or a
  * 5-monitor desk silently drops taskbars 5..N - no hole punched, no add-only
@@ -1259,7 +1259,7 @@ static void ApplyHoleRefresh(void) {
         EinkPresent();
 }
 
-/* Re-decide the holes and apply the result at once, so the taskbar checkbox
+/* Re-decide the holes and apply the result at once, so the taskbar radios
  * and the tray item take effect on the click instead of on the next timer
  * tick. Nothing is forced here: ComputeHoles compares newon[i] against the
  * latched g_hole_on[i] as well as the rect, so a hole OPENING and a hole
@@ -1270,7 +1270,7 @@ static void ApplyHoleRefresh(void) {
  * and the band keeps the transparency of the previous upload, so the taskbar
  * stays untextured for good on a static screen (2026-10-11 review).
  * CollectTaskbars is deliberately NOT called here: this runs on the UI thread
- * (a checkbox click or a tray command) while Housekeeping owns the taskbar
+ * (a radio click or a tray command) while Housekeeping owns the taskbar
  * enumeration on its own timer, and re-walking it from two threads would race
  * the g_tb table. The next Housekeeping pass re-walks and confirms. */
 static void RecomputeHoles(void) {
@@ -1340,9 +1340,9 @@ static void Housekeeping(void) {
         }
     }
 
-    /* No z-order fight with the taskbar any more: the veil simply stops
-       painting over the revealed taskbar (see g_hole). The walk above
-       skips taskbars entirely. */
+    /* No z-order fight with the taskbar any more: in Not cover mode the veil
+       simply stops painting over the revealed taskbar (see g_hole). The walk
+       above skips taskbars entirely. */
     CollectTaskbars();
     ComputeHoles();
     ApplyHoleRefresh();
