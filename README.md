@@ -10,7 +10,7 @@ Currently Windows only. Local, lightweight and free. Download `mnPaper.exe` from
 
 ![Reading a PDF under the texture](assets/screenshot-pdf.png)
 
-![The settings window and a revealed taskbar lifted above the texture in Not cover mode](assets/screenshot-gui-taskbar.png)
+![The settings window floating above the texture](assets/screenshot-gui-taskbar.png)
 
 Expected usage: **paper mode** - roughly 40 MB per monitor (the texture is
 kept in memory at full resolution), near-zero CPU when nothing is changing,
