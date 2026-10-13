@@ -509,41 +509,44 @@ int main(void) {
         Check(IsWindowEnabled(g_chk_share), "share checkbox re-enabled in paper mode");
         /* The taskbar mode radios: what this suite can prove about them is the
          * click path - the real WM_COMMAND handler persists tbmode to the
-         * scratch hive and moves the live setting. The band state the setting
-         * decides is asserted by hole_cycle.c, which drives the same click
-         * entry (RecomputeHoles) with a synthesized taskbar; here master is off
-         * and no taskbar is enumerated, so ApplyHoleRefresh has nothing to
-         * re-upload. */
+         * scratch hive and moves the live setting. 121 is Cover, 122 is Not cover. */
         {
             int saved_tb = -1;
-            HWND r1 = GetDlgItem(g_dlg, 121), r3 = GetDlgItem(g_dlg, 123);
-            Check(r1 && IsWindow(r1) && r3 && IsWindow(r3),
+            HWND r_cov = GetDlgItem(g_dlg, 121), r_ncov = GetDlgItem(g_dlg, 122);
+            Check(r_cov && IsWindow(r_cov) && r_ncov && IsWindow(r_ncov),
                   "the taskbar radio group is live controls in the settings window");
-            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(123, BN_CLICKED), (LPARAM)r3);
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r_cov);
             Pump(50);
             if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
                 saved_tb = GetDword(key, L"tbmode", -1); RegCloseKey(key);
             }
-            Check(saved_tb == TB_PAPER, "clicking 'Paper over' persists tbmode=2");
-            Check(g_s.tbmode == TB_PAPER, "clicking 'Paper over' sets the live setting");
-            Check(IsDlgButtonChecked(g_dlg, 123) == BST_CHECKED &&
-                  IsDlgButtonChecked(g_dlg, 121) != BST_CHECKED,
+            Check(saved_tb == TB_COVER, "clicking 'Cover' persists tbmode=1");
+            Check(g_s.tbmode == TB_COVER, "clicking 'Cover' sets the live setting");
+            Check(IsDlgButtonChecked(g_dlg, 121) == BST_CHECKED &&
+                  IsDlgButtonChecked(g_dlg, 122) != BST_CHECKED,
                   "the radio group followed the click (one group, one value)");
-            /* the alias an old command line still uses, through the same door */
-            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
+            /* clicking Not cover */
+            SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(122, BN_CLICKED), (LPARAM)r_ncov);
             Pump(50);
-            Check(g_s.tbmode == TB_HOLE, "clicking 'Bare' clears the live setting to hole");
+            saved_tb = -1;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                saved_tb = GetDword(key, L"tbmode", -1); RegCloseKey(key);
+            }
+            Check(saved_tb == TB_NOT_COVER, "clicking 'Not cover' persists tbmode=0");
+            Check(g_s.tbmode == TB_NOT_COVER, "clicking 'Not cover' clears the live setting");
+            Check(IsDlgButtonChecked(g_dlg, 122) == BST_CHECKED &&
+                  IsDlgButtonChecked(g_dlg, 121) != BST_CHECKED,
+                  "Not cover is checked and Cover is unchecked");
             /* The legacy key must not survive, and it has to be SEEDED first:
              * the scratch hive is fresh for this run and nothing ever wrote
              * tapebar into it, so reading it without seeding pins nothing (it
              * would still pass with the deletion removed). Seed the state an
              * install last touched by an older build is actually in, then take
              * one more click so SaveSettings runs, and only then assert it is
-             * gone. The click leaves tbmode at hole, the default. */
+             * gone. */
             {
                 HKEY seed;
                 int one = 1, seeded = -1;
-                HWND r2 = GetDlgItem(g_dlg, 122);
                 if (RegCreateKeyExW(HKEY_CURRENT_USER, scratch, 0, NULL, 0,
                                     KEY_SET_VALUE, NULL, &seed, NULL) == ERROR_SUCCESS) {
                     RegSetValueExW(seed, L"tapebar", 0, REG_DWORD, (BYTE *)&one, sizeof one);
@@ -553,9 +556,9 @@ int main(void) {
                     seeded = GetDword(key, L"tapebar", -1); RegCloseKey(key);
                 }
                 Check(seeded == 1, "the seeded legacy tapebar key is present before the save");
-                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(122, BN_CLICKED), (LPARAM)r2);
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r_cov);
                 Pump(50);
-                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(121, BN_CLICKED), (LPARAM)r1);
+                SendMessageW(g_dlg, WM_COMMAND, MAKELPARAM(122, BN_CLICKED), (LPARAM)r_ncov);
                 Pump(50);
                 saved_tb = -1;
                 if (RegOpenKeyExW(HKEY_CURRENT_USER, scratch, 0, KEY_READ, &key) == ERROR_SUCCESS) {
@@ -563,7 +566,7 @@ int main(void) {
                 }
                 Check(saved_tb == -1,
                       "the legacy tapebar key is deleted on save (tbmode is the only truth)");
-                Check(g_s.tbmode == TB_HOLE,
+                Check(g_s.tbmode == TB_NOT_COVER,
                       "the seeded-legacy sequence leaves the live mode back at the default");
             }
         }

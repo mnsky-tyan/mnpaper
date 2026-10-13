@@ -184,14 +184,16 @@ int main(void) {
         SETTINGS p = g_s;
         int saw;   /* SetKeyValue returns nonzero for a recognised key */
 
-        saw = SetKeyValue(&p, L"tbmode=2");
-        Check(saw && p.tbmode == TB_PAPER, "tbmode=2 is accepted and stored");
+        saw = SetKeyValue(&p, L"tbmode=1");
+        Check(saw && p.tbmode == TB_COVER, "tbmode=1 is accepted and stored");
+        saw = SetKeyValue(&p, L"tbmode=0");
+        Check(saw && p.tbmode == TB_NOT_COVER, "tbmode=0 sets not cover");
         saw = SetKeyValue(&p, L"tbmode=9");
-        Check(saw && p.tbmode == TB_PAPER, "tbmode above the top mode clamps to paper over");
+        Check(saw && p.tbmode == TB_COVER, "tbmode above 1 clamps to cover");
         saw = SetKeyValue(&p, L"tapebar=1");
         Check(saw && p.tbmode == TB_COVER, "legacy tapebar=1 means cover");
         saw = SetKeyValue(&p, L"tapebar=0");
-        Check(saw && p.tbmode == TB_HOLE, "legacy tapebar=0 means leave it bare");
+        Check(saw && p.tbmode == TB_NOT_COVER, "legacy tapebar=0 means not cover");
 
         p.intensity = 1;
         saw = SetKeyValue(&p, L"intensity=999");

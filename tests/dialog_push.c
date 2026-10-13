@@ -75,7 +75,7 @@ int main(void) {
           "autostart checkbox matches the setting after creation");
     Check(DlgCheck(dlg, 120, g_s.autoupd ? BST_CHECKED : BST_UNCHECKED),
           "auto-update checkbox matches the setting after creation");
-    Check(IsDlgButtonChecked(dlg, 121 + g_s.tbmode) == BST_CHECKED,
+    Check(IsDlgButtonChecked(dlg, g_s.tbmode == TB_COVER ? 121 : 122) == BST_CHECKED,
           "taskbar radio group matches the setting after creation");
     Check(DlgCheck(dlg, 113, g_s.share ? BST_CHECKED : BST_UNCHECKED),
           "share checkbox matches the setting after creation");
@@ -91,7 +91,7 @@ int main(void) {
      * every control must follow, including ones the old per-site code missed. */
     g_s.intensity = 23; g_s.warmth = 77; g_s.grain = 6; g_s.fibre = 31;
     g_s.blotch = 12;  g_s.shades = 5;   g_s.contrast = 41; g_s.dither = 62;
-    g_s.master = 0; g_s.autostart = 0; g_s.autoupd = 0; g_s.share = 1; g_s.tbmode = TB_PAPER;
+    g_s.master = 0; g_s.autostart = 0; g_s.autoupd = 0; g_s.share = 1; g_s.tbmode = TB_COVER;
     DialogPushSettings(dlg);
     for (i = 0; i < 8; i++)
         Check((int)SendMessageW(GetDlgItem(dlg, bars[i].id), TBM_GETPOS, 0, 0) == *bars[i].slot,
@@ -99,11 +99,16 @@ int main(void) {
     Check(!DlgCheck(dlg, 118, BST_CHECKED), "master off is pushed to its checkbox");
     Check(!DlgCheck(dlg, 119, BST_CHECKED), "autostart off is pushed to its checkbox");
     Check(!DlgCheck(dlg, 120, BST_CHECKED), "auto-update off is pushed to its checkbox");
-    Check(IsDlgButtonChecked(dlg, 123) == BST_CHECKED,
-          "taskbar mode 'paper over' is pushed to its radio");
-    Check(IsDlgButtonChecked(dlg, 121) != BST_CHECKED &&
-          IsDlgButtonChecked(dlg, 122) != BST_CHECKED,
-          "the other two taskbar radios are cleared by the push (one group, one value)");
+    Check(IsDlgButtonChecked(dlg, 121) == BST_CHECKED,
+          "taskbar mode 'Cover' is pushed to its radio");
+    Check(IsDlgButtonChecked(dlg, 122) != BST_CHECKED,
+          "the 'Not cover' radio is cleared by the push (one group, one value)");
+    g_s.tbmode = TB_NOT_COVER;
+    DialogPushSettings(dlg);
+    Check(IsDlgButtonChecked(dlg, 122) == BST_CHECKED,
+          "taskbar mode 'Not cover' is pushed to its radio");
+    Check(IsDlgButtonChecked(dlg, 121) != BST_CHECKED,
+          "the 'Cover' radio is cleared by the push");
     Check(DlgCheck(dlg, 113, BST_CHECKED), "share on is pushed to its checkbox");
 
     /* The numeric readout beside each bar must show THAT bar's value. Nothing
