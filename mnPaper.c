@@ -2465,6 +2465,13 @@ static void ApplyTbMode(int mode) {
     } else {
         TaskbarZorder();                                    /* bar back above the paper */
     }
+    /* the strip sweep lifts the strips over the dialog: the dialog goes back
+       on top immediately instead of waiting for the next 50ms tick */
+    {
+        HWND d = LiveDlg();
+        if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
     dlg = LiveDlg();
     if (dlg) SyncTbRadios(dlg, g_s.tbmode == TB_COVER ? 121 : 122);
     L("tbmode=%d", mode);
