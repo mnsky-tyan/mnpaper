@@ -26,7 +26,8 @@ Covered:
 - The full-quality final pixels exactly match the final settings.
 - A new drag cancels full-resolution refinement instead of waiting for it.
 - Closing before the autosave timer fires saves and refines the final change.
-- Taskbar masking uploads without resynthesizing or corrupting the texture.
+- Taskbar z-order changes upload without resynthesizing the texture: the
+  master stays byte-identical and the band keeps its paper alpha in both modes.
 - Odd dimensions, transparent zero strength and premultiplied-alpha validity.
 - Two-monitor rendering after a 200-request burst.
 - The settings-window share checkbox (id 113) persists `share` and flips the
@@ -142,8 +143,9 @@ rebuild and run in one go, or exclude the temp directory.
 - `slider_latency.c` - drag latency end to end (request-to-upload budget with
   METRIC lines), the final bitmap, worker preemption, close-before-timer, the
   taskbar upload invariance (uploads around a latched revealed taskbar leave
-  the master texture byte-identical in both modes - every byte), odd preview sizes, warmth/grain/fibre/blotch
-  structure, help window, update-feed parsing (ParseVersionTriple,
+  the master texture byte-identical in both modes - every byte), odd preview
+  sizes, warmth/grain/fibre/blotch structure, help window, update-feed parsing
+  (ParseVersionTriple,
   CompareVersion and FindHash64 driven directly: pin at start/middle/end,
   63/65-char runs refused), the share/mode/texture-on/autostart controls and
   the taskbar mode radio group (ids 121/122) against a PID-suffixed
@@ -202,12 +204,12 @@ rebuild and run in one go, or exclude the temp directory.
   slack, and the real dialog is rendered for a visual check (the scratch BMPs
   are deleted before the suite returns).
 - `verify_fixes.c` - the extracted feed-size cap (`FeedFits`) boundary, the
-  show path never falling back to a full synchronous build, the hole
-  save/restore being byte-identical, the `LiveDlg` owner rule, and the
-  `--set key=value` contract driven through the real parser: recognised keys
-  case-insensitively (`tbmode`, `master`, `mode`, and the legacy `tapebar`
-  alias), values digits only, so a negative, non-numeric, empty or unknown
-  entry is refused rather than stored as a silent 0. Out-of-range values parse
+  show path never falling back to a full synchronous build, the `LiveDlg`
+  owner rule, and the `--set key=value` contract driven through the real
+  parser: recognised keys case-insensitively (`tbmode`, `master`, `mode`, and
+  the legacy `tapebar` alias), values digits only, so a negative, non-numeric,
+  empty or unknown entry is refused rather than stored as a silent 0.
+  Out-of-range values parse
   unclamped and are then bounded by the `ClampSettingsOf` pass `ApplySets`
   runs after them - except `tbmode`, which clamps inside the parser too, so
   its bound is asserted directly.
