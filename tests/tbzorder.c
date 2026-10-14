@@ -65,19 +65,30 @@ int main(void) {
         RegisterClassW(&fc);
     }
     printf("taskbar z-order modes on a %dx%d monitor (fixed reference geometry)\n", w, h);
-    memset(&ov, 0, sizeof ov);
-    ov.idx = 0; ov.w = w; ov.h = h; ov.rc = mon;
-    px = (unsigned char *)malloc((size_t)w * h * 4);
-    if (!px) { printf("RESULT 1 failure(s)\n"); return 1; }
-    ov.bits = px;
+    /* The veil below is the real MakeOverlay one: hidden layered strips plus
+       a real DIB, exactly what slider_latency builds. With a stripless OVL
+       ApplyLayered's upload loop would no-op and its ok could never fail,
+       so the upload checks in the no-mode section need the genuine stack. */
+    {
+        WNDCLASSW oc = {0};
+        oc.hInstance = GetModuleHandleW(NULL);
+        oc.lpfnWndProc = OvlProc;
+        oc.lpszClassName = L"MnPaperOverlay";
+        if (!RegisterClassW(&oc)) { printf("RESULT 1 failure(s)\n"); return 1; }
+    }
     g_s = (SETTINGS){ .master = 1, .mode = MODE_PAPER, .intensity = 40,
                       .warmth = 80, .grain = 4, .fibre = 40, .blotch = 26,
                       .shades = 4, .contrast = 50, .dither = 75,
                       .autostart = 0, .share = 0, .tbmode = TB_NOT_COVER, .autoupd = 1 };
+    if (!MakeOverlay(&ov, NULL, &mon)) { printf("RESULT 1 failure(s)\n"); return 1; }
+    ov.idx = 0;
+    px = (unsigned char *)ov.bits;
     BuildPaper(&ov);
     clean = H(px, (size_t)w * h * 4);
     Check(px[(size_t)band_y * w * 4 + 1400 * 4 + 3] != 0,
           "the band carries real paper alpha (the texture is never cut open)");
+    Check(ov.n_strips > 0,
+          "the veil carries real strips, so the upload checks below can fail");
 
     /* --------------- the parked/revealed classifier ------------------
      * TbParked (2026-10-06 review): an auto-hidden taskbar leaves a short
@@ -225,8 +236,9 @@ int main(void) {
      * around a latched revealed taskbar leaves the master texture
      * byte-identical in BOTH modes, and the band keeps full paper alpha
      * (the punched hole that showed the desktop's white frame is gone).
-     * This scratch OVL has no strips, so ApplyLayered's upload loop no-ops
-     * (it cannot fail) and the byte-identity hashes are the real checks -
+     * The OVL carries the real strip stack MakeOverlay built, so these are
+     * genuine UpdateLayeredWindow uploads whose ok must hold, and the
+     * byte-identity hashes pin that the master buffer is never mutated -
      * exactly the path where the 2.7.7 regression lived. */
     {
         g_n = 1;
@@ -455,7 +467,7 @@ int main(void) {
         g_nmi = saved_nmi;
     }
 
-    free(px);
+    DestroyOverlay(&ov);   /* frees the DIB: ov.bits is not a malloc */
     printf("\nRESULT %d failure(s) across %d checks\n", fails, checks);
     return fails ? 1 : 0;
 }

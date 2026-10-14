@@ -173,10 +173,11 @@ rebuild and run in one go, or exclude the temp directory.
   invisible off-screen windows (Not cover raises a revealed bar above a
   later reference window and sets its topmost bit while never touching a
   parked sliver; Cover raises nothing), and the no-punch invariant is
-  asserted on the upload path (uploads around a latched revealed taskbar
-  leave the master texture byte-identical in BOTH modes, the band keeps
-  full paper alpha, 20 reveal/park round trips across both modes leave no
-  residue).
+  asserted on a real layered upload (the suite builds the genuine hidden
+  strip stack with MakeOverlay, so the UpdateLayeredWindow calls must
+  actually succeed): uploads around a latched revealed taskbar leave the
+  master texture byte-identical in BOTH modes, the band keeps full paper
+  alpha, and 20 reveal/park round trips across both modes leave no residue.
   It also registers a process-local `Shell_TrayWnd` class, creates five
   visible fake taskbar windows parked outside every virtual screen and drives
   the real production chain (`EnumWindows` -> `TbEnumProc` -> `CollectTaskbars`

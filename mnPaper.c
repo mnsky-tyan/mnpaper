@@ -1012,6 +1012,16 @@ static HWND g_dlg;   /* settings window (LiveDlg below and the UI block both use
 static HWND LiveDlg(void) {
     return (g_dlg && IsWindow(g_dlg)) ? g_dlg : NULL;
 }
+
+/* One place for the "settings window floats above the veil" rule: the dialog
+ * is topmost like the strips, so whatever hoists the strips (the Housekeeping
+ * re-claim, ApplyTbMode's Cover sweep) must re-assert the dialog above them
+ * or it sits behind the paper until the next tick. */
+static void RaiseSettingsDialog(void) {
+    HWND d = LiveDlg();
+    if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
 /* Hover tooltips RETIRED 2026-09-30 (user feedback: "the information window
  * is bad"): hover popups replaced by a ? button that opens a help window only
  * when pressed. The comctl32 tooltip had crashed; the own tip popup worked
@@ -1154,12 +1164,8 @@ static void Housekeeping(void) {
     ClassifyTaskbars();
     TaskbarZorder();
     /* the settings window floats above the veil (the veil used to swallow
-       it, which is what made the sliders feel laggy and unreadable). */
-    {
-        HWND d = LiveDlg();   /* the veil floats the settings window above itself */
-        if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-    }
+       it, which is what made the sliders feel laggy and unreadable) */
+    RaiseSettingsDialog();
 
     if (!logged) {
         logged = 1;
@@ -2473,11 +2479,7 @@ static void ApplyTbMode(int mode) {
     }
     /* the strip sweep lifts the strips over the dialog: the dialog goes back
        on top immediately instead of waiting for the next 50ms tick */
-    {
-        HWND d = LiveDlg();
-        if (d) SetWindowPos(d, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-    }
+    RaiseSettingsDialog();
     dlg = LiveDlg();
     if (dlg) SyncTbRadios(dlg, g_s.tbmode == TB_COVER ? 121 : 122);
     L("tbmode=%d", mode);
