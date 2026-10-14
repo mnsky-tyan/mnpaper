@@ -99,6 +99,8 @@ The build produces `mnPaper.exe` in the repo root.
     - **Not cover** (default): the taskbar is lifted above the paper while it
       is up, so its buttons show completely crisp; the moment it hides again,
       the paper covers the spot again.
+      If the taskbar ever seems stuck under the texture, pick Not cover - it
+      lifts the bar back above the paper immediately.
   Both choices only move windows around: the texture itself is never cut open,
   so no frame or sliver of the desktop can ever show through either way.
   Taskbars shown on secondary displays get the same treatment either way.

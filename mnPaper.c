@@ -1060,11 +1060,17 @@ static void ClassifyTaskbars(void) {
  * Live-verified before 2.7.19 on the reference desktop: with a strip parked
  * above the auto-hidden taskbar for minutes - including same-second
  * raise/re-assert pairs - the shell never dropped the bar's topmost bit, so
- * Cover needs no counter-raise. Raising stays ADD-ONLY and applies to the
- * one taskbar window, never to our own strips. No transparency is punched
- * in either mode: the texture itself is never cut open for the taskbar (the
- * hole era ended in 2.7.19 - the punched band was what showed the desktop's
- * white frame around the bar's rounded corners). */
+ * Cover needs no counter-raise. The bar's own raise is why: STRIP_H stays at
+ * 450 because the shell's full-screen raise trigger is ~800-900px, and the
+ * bar's raise measured 4/4 at 450px strips against 0/2 at 1800px (the
+ * STRIP_H note above). That check ran with apps on screen, and Housekeeping
+ * re-asserts the veil above the bar on every hoist, so a bar hoisted above
+ * the strips is covered again on the next 50ms tick.
+ * Raising stays ADD-ONLY and applies to the one taskbar window, never to our
+ * own strips. No transparency is punched in either mode: the texture itself
+ * is never cut open for the taskbar (the hole era ended in 2.7.19 - the
+ * punched band was what showed the desktop's white frame around the bar's
+ * rounded corners). */
 static void TaskbarZorder(void) {
     int j;
     if (g_s.tbmode == TB_COVER) return;
@@ -2529,6 +2535,8 @@ static const WCHAR HELP_TEXT[] =
     L"      Not cover (default) - the taskbar stays above the texture while\r\n"
     L"        it is up, so its buttons show completely crisp; the texture\r\n"
     L"        returns the moment it hides again.\r\n"
+    L"      If the taskbar ever seems stuck under the texture, pick Not\r\n"
+    L"      cover - it lifts the bar back above the paper immediately.\r\n"
     L"    Both choices only move windows around - the texture itself is\r\n"
     L"    never cut open, so no frame or sliver of the desktop can show\r\n"
     L"    through either way.\r\n"
