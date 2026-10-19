@@ -610,8 +610,13 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     wl_buffer_add_listener(buf, &BufferListener, o);
     wl_buffer_add_listener(hbuf, &BufferListener, o);
     /* the whole old set (both halves share one mapping) is retired together */
-    RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-              o->buf_released, o->hbuf_released);
+    FlushRetired(o);
+    if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+                   o->buf_released, o->hbuf_released)) {
+        if (o->buf) wl_buffer_destroy(o->buf);
+        if (o->hbuf) wl_buffer_destroy(o->hbuf);
+        if (o->pool) wl_shm_pool_destroy(o->pool);
+    }
     o->fd = fd;
     o->data = data;
     o->map_bytes = bytes * 2;
@@ -830,7 +835,6 @@ static void CancelFrame(struct OUT *o) {
 }
 
 static void OutTeardown(struct OUT *o) {
-    int tracked;
     if (!o) return;
     if (o->ls) zwlr_layer_surface_v1_destroy(o->ls);
     if (o->sfc) wl_surface_destroy(o->sfc);
@@ -840,8 +844,13 @@ static void OutTeardown(struct OUT *o) {
      * compositor released both halves (never unmap memory a live compositor
      * reads).  The OUT itself must outlive those releases: the buffers'
      * listener data points here. */
-    tracked = RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-                        o->buf_released, o->hbuf_released);
+    FlushRetired(o);
+    if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+                   o->buf_released, o->hbuf_released)) {
+        if (o->buf) wl_buffer_destroy(o->buf);
+        if (o->hbuf) wl_buffer_destroy(o->hbuf);
+        if (o->pool) wl_shm_pool_destroy(o->pool);
+    }
     o->buf = o->hbuf = NULL;
     o->pool = NULL;
     o->data = NULL;
@@ -853,8 +862,6 @@ static void OutTeardown(struct OUT *o) {
     memset(&g_job[o->idx], 0, sizeof g_job[o->idx]);
     g_baking[o->idx] = 0;
     pthread_mutex_unlock(&g_wlock);
-    if (!tracked) return;         /* untrackable set: leak this OUT, not its
-                                   * listener data */
     o->teardown = 1;
     FlushRetired(o);              /* frees o itself once nothing is outstanding */
 }
@@ -1243,7 +1250,6 @@ static int SendToRunning(int argc, char **argv) {
     int fd, i, k;
     char req[4096];
     size_t len = 0;
-    int sets = 0;                        /* set lines written, apply not yet */
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 2;
@@ -1256,14 +1262,22 @@ static int SendToRunning(int argc, char **argv) {
     }
     for (i = 1; i < argc && len < sizeof req - 8; i++) {
         if (!strcmp(argv[i], "--set") && i + 1 < argc) {
-            /* every --set on the command line is one batch: the single
-             * apply at the end writes settings.conf once and bumps the
-             * generation once, so only the final state is ever baked */
-            for (i++; i < argc && strchr(argv[i], '=') && len < sizeof req - 8; i++) {
-                len += (size_t)snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
-                sets++;
+            int sent = 0;
+            for (;;) {
+                if (i + 1 < argc && !strcmp(argv[i + 1], "--set")) {
+                    i++;
+                    continue;
+                }
+                if (i + 1 < argc && strchr(argv[i + 1], '=') && len < sizeof req - 8) {
+                    i++;
+                    len += (size_t)snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
+                    sent++;
+                    continue;
+                }
+                break;
             }
-            i--;
+            if (sent && len < sizeof req - 8)
+                len += (size_t)snprintf(req + len, sizeof req - len, "apply\n");
             continue;
         }
         for (k = 0; k < CMD_TABLE_N; k++)
@@ -1273,8 +1287,6 @@ static int SendToRunning(int argc, char **argv) {
                 break;
             }
     }
-    if (sets && len < sizeof req - 8)
-        len += (size_t)snprintf(req + len, sizeof req - len, "apply\n");
     if (len) {
         ssize_t ignored = write(fd, req, len);
         (void)ignored;
@@ -1442,6 +1454,7 @@ int main(int argc, char **argv) {
                     L("ignoring unknown or malformed --set entry: %s", sets[k]);
             ClampSettingsOf(&g_s);
         }
+        RequestMode(g_s.mode);
         if (dump_w <= 0 || dump_h <= 0 || dump_w > 16384 || dump_h > 16384) {
             L("dump size out of range: %dx%d", dump_w, dump_h);
             return 2;
