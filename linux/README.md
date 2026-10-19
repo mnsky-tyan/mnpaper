@@ -49,7 +49,6 @@ mnpaper --eink                   refused on Wayland, see the table above
 mnpaper --set k=v [--set k=v]    change parameters live (or at startup)
 mnpaper --status                 print the running instance's state
 mnpaper --quit                   stop the running instance
-mnpaper --settings               answers "no GUI on Wayland yet"
 mnpaper --dump-tex FILE W H [bg] headless: bake the texture to a 24bpp BMP
 mnpaper --log FILE               append diagnostics to FILE as well as stderr
 ```
@@ -57,7 +56,7 @@ mnpaper --log FILE               append diagnostics to FILE as well as stderr
 Keys accepted by `--set` (same names and bounds as the Windows registry
 values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 (2-12), `fibre` (0-100), `blotch` (0-100), `shades`, `contrast`, `dither`,
-`share`, `tbmode`, `tapebar` (legacy alias), `autostart`, `autoupd`.
+`share`, `tbmode`, `autostart`, `autoupd`.
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
 Values are digits only; unknown keys and malformed values are refused and

@@ -88,7 +88,6 @@ static int SetKeyValue(SETTINGS *s, const char *arg) {
     else if (!strcasecmp(key, "autostart")) s->autostart = v ? 1 : 0;
     else if (!strcasecmp(key, "share")) s->share = v ? 1 : 0;
     else if (!strcasecmp(key, "tbmode")) s->tbmode = v ? TB_COVER : TB_NOT_COVER;
-    else if (!strcasecmp(key, "tapebar")) s->tbmode = v ? TB_COVER : TB_NOT_COVER;
     else if (!strcasecmp(key, "autoupd")) s->autoupd = v ? 1 : 0;
     else if (!strcasecmp(key, "master")) s->master = v ? 1 : 0;
     else return 0;
@@ -113,6 +112,16 @@ static void ClampSettingsOf(SETTINGS *s) {
         if (*f[i].v < f[i].lo) *f[i].v = f[i].lo;
         if (*f[i].v > f[i].hi) *f[i].v = f[i].hi;
     }
+}
+
+/* The only mode this build can represent: e-ink needs screen capture, which
+ * the Wayland port does not implement.  Every settings path funnels through
+ * here so a refused request can never be persisted, reported or baked as
+ * e-ink.  Returns 1 when the request is representable. */
+static int NormalizeMode(SETTINGS *s) {
+    if (s->mode != MODE_EINK) return 1;
+    s->mode = MODE_PAPER;
+    return 0;
 }
 
 /* ------------------------------------------------------------ the paper --- */

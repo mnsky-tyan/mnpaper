@@ -70,8 +70,8 @@ static void TestSetKeyValueGrammar(void) {
     CHECK(s.intensity == 10, "set: case-insensitive applied");
     CHECK(SetKeyValue(&s, "mode=1"), "set: mode accepted");
     CHECK(s.mode == MODE_EINK, "set: mode eink");
-    CHECK(SetKeyValue(&s, "tapebar=1"), "set: legacy alias accepted");
-    CHECK(s.tbmode == TB_COVER, "set: legacy alias mapped to tbmode");
+    CHECK(SetKeyValue(&s, "tbmode=1"), "set: tbmode accepted");
+    CHECK(s.tbmode == TB_COVER, "set: tbmode mapped");
 
     CHECK(!SetKeyValue(&s, "intensity="), "set: empty value refused");
     CHECK(!SetKeyValue(&s, "intensity=x"), "set: non-numeric refused");
@@ -158,13 +158,15 @@ static void TestEinkNotRepresentable(void) {
     /* the raw parser accepts the value (it is platform-neutral) ... */
     CHECK(SetKeyValue(&s, "mode=1"), "set: mode=1 parses");
     CHECK(s.mode == MODE_EINK, "set: parser yields eink");
-    /* ... and the Wayland layer must refuse it, not store it.  This mirrors
-     * RequestMode: paper is the only representable mode here. */
-    s.mode = MODE_PAPER;                  /* what RequestMode(MODE_EINK) does */
+    /* ... and the Wayland layer must refuse it, not store it: the same
+     * NormalizeMode the daemon's RequestMode funnels every settings path
+     * through maps it back to paper and reports the refusal. */
+    CHECK(!NormalizeMode(&s), "eink request reported unrepresentable");
     CHECK(s.mode == MODE_PAPER, "refused mode normalizes to paper");
     /* and a paper mode request is honoured without side effects */
-    s.mode = MODE_PAPER;
-    CHECK(s.mode == MODE_PAPER, "paper mode is representable");
+    CHECK(SetKeyValue(&s, "mode=0"), "set: mode=0 parses");
+    CHECK(NormalizeMode(&s), "paper request is representable");
+    CHECK(s.mode == MODE_PAPER, "paper mode stays paper");
 }
 
 int main(void) {

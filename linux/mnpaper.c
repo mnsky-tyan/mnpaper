@@ -33,7 +33,6 @@
  *                           push settings to a running instance, or start
  *                           fresh with them when none is running
  *   mnpaper --status        print the running instance's state
- *   mnpaper --settings      accepted; answers "no GUI on Wayland yet"
  *   mnpaper --dump-tex out.bmp W H [bg]
  *                           headless: bake a texture to a 24bpp BMP
  *                           (composite over `bg` gray, default 235), no
@@ -178,6 +177,7 @@ static void LoadSettings(void) {
     }
     fclose(f);
     ClampSettingsOf(&g_s);
+    NormalizeMode(&g_s);       /* a stored mode=1 is never representable */
     AutostartSyncFromDisk();   /* the .desktop file overrides any stored value */
     if (loaded) L("config: loaded %d keys from %s", loaded, path);
 }
@@ -484,8 +484,17 @@ struct OUT {
     struct wl_buffer *hbuf;             /* transparent */
     int buf_released, hbuf_released;    /* wl_buffer.release seen; both start
                                          * released because they are new */
+    struct wl_callback *frame_cb;       /* the one frame callback in flight,
+                                         * or NULL.  Its listener data is this
+                                         * OUT, so the OUT is freed only after
+                                         * it fired or was cancelled. */
     struct RETIRED retired[4];
     int nretired;
+    int teardown;                       /* global removed: this OUT is off
+                                         * g_ov and is freed only once the
+                                         * compositor released its last
+                                         * buffer set (the buffers' listener
+                                         * data points here) */
     /* wl_output state */
     int out_w, out_h;
     char make[64], model[64];
@@ -506,31 +515,42 @@ static void FlushRetired(struct OUT *o) {
         }
     }
     o->nretired = k;
+    /* A torn-down OUT is freed only once nothing can still reach it: every
+     * retired set released and no frame callback still holding its address.
+     * A callback whose surface died may never fire, so that output is parked
+     * for process exit - the same bargain its buffers get when the
+     * compositor keeps them. */
+    if (o->teardown && !o->nretired && !o->frame_cb) free(o);
 }
 
 /* Park a whole buffer set for later release.  Never freed here: the
  * compositor may still be scanning it (wl_shm contract), and unmapping a
- * page it reads is a use-after-free in the compositor, not in us. */
-static void RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbuf,
-                      struct wl_shm_pool *pool, int fd, void *data, size_t bytes,
-                      int rel_buf, int rel_hbuf) {
+ * page it reads is a use-after-free in the compositor, not in us.
+ * Returns 0 when the set could not be tracked: its buffers keep this OUT as
+ * listener data, so the caller must then keep the OUT alive. */
+static int RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbuf,
+                     struct wl_shm_pool *pool, int fd, void *data, size_t bytes,
+                     int rel_buf, int rel_hbuf) {
+    struct RETIRED *r;
     if (!buf) {
         if (fd >= 0) close(fd);
-        return;
+        return 1;
     }
-    if (o->nretired < (int)(sizeof o->retired / sizeof o->retired[0])) {
-        struct RETIRED *r = &o->retired[o->nretired++];
-        r->buf = buf; r->hbuf = hbuf; r->pool = pool; r->fd = fd;
-        r->data = data; r->bytes = bytes;
-        r->rel_buf = rel_buf; r->rel_hbuf = rel_hbuf;
-        return;
+    if (o->nretired >= (int)(sizeof o->retired / sizeof o->retired[0])) {
+        L("output %d: retired-buffer slots exhausted - leaking one buffer set "
+          "rather than unmapping memory the compositor may still read", o->idx);
+        return 0;
     }
-    L("output %d: retired-buffer slots exhausted - leaking one buffer set "
-      "rather than unmapping memory the compositor may still read", o->idx);
+    r = &o->retired[o->nretired++];
+    r->buf = buf; r->hbuf = hbuf; r->pool = pool; r->fd = fd;
+    r->data = data; r->bytes = bytes;
+    r->rel_buf = rel_buf; r->rel_hbuf = rel_hbuf;
+    return 1;
 }
 
 static void QueueBake(struct OUT *o);
 static void BufferRelease(void *data, struct wl_buffer *buf);
+static void CancelFrame(struct OUT *o);
 
 static const struct wl_buffer_listener BufferListener = { BufferRelease };
 
@@ -539,18 +559,24 @@ static const struct wl_buffer_listener BufferListener = { BufferRelease };
  * texture half, and a bake that had to wait for it is re-queued here. */
 static void BufferRelease(void *data, struct wl_buffer *buf) {
     struct OUT *o = data;
+    int i;
     if (buf == o->buf) {
         o->buf_released = 1;
         if (o->baked_gen != g_settings_gen) QueueBake(o);
-    } else if (buf == o->hbuf) {
-        o->hbuf_released = 1;
-    } else {
-        int i;
-        for (i = 0; i < o->nretired; i++) {
-            if (o->retired[i].buf == buf) { o->retired[i].rel_buf = 1; break; }
-            if (o->retired[i].hbuf == buf) { o->retired[i].rel_hbuf = 1; break; }
-        }
+        return;
     }
+    if (buf == o->hbuf) {
+        o->hbuf_released = 1;
+        return;
+    }
+    for (i = 0; i < o->nretired; i++) {
+        if (o->retired[i].buf == buf) { o->retired[i].rel_buf = 1; break; }
+        if (o->retired[i].hbuf == buf) { o->retired[i].rel_hbuf = 1; break; }
+    }
+    /* A torn-down output has no surface left to deliver the frame callback
+     * that normally proves a frame elapsed, so its release events are the
+     * only remaining signal - and the event that frees the OUT itself. */
+    if (o->teardown) FlushRetired(o);
 }
 
 static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
@@ -586,6 +612,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     /* the whole old set (both halves share one mapping) is retired together */
     RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
               o->buf_released, o->hbuf_released);
+    o->fd = fd;
     o->data = data;
     o->map_bytes = bytes * 2;
     o->pool = pool; o->buf = buf; o->hbuf = hbuf;
@@ -656,6 +683,7 @@ static void FrameDone(void *data, struct wl_callback *cb, uint32_t t) {
     struct OUT *o = data;
     (void)t;
     wl_callback_destroy(cb);
+    if (o->frame_cb == cb) o->frame_cb = NULL;
     FlushRetired(o);
 }
 
@@ -680,15 +708,19 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
      * owe a release.  Clearing the token while hidden would wait forever for
      * an event that never comes and wedge every later bake. */
     if (o->visible) {
-        struct wl_callback *cb;
         o->buf_released = 0;             /* until the compositor returns it */
         wl_surface_attach(o->sfc, o->buf, 0, 0);
         if (g_comp_version >= 4)
             wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
         else
             wl_surface_damage(o->sfc, 0, 0, o->lw, o->lh);
-        cb = wl_surface_frame(o->sfc);
-        wl_callback_add_listener(cb, &CbListener, o);
+        /* one tracked callback at a time: it only proves that a frame
+         * elapsed before retired memory is unmapped, so a present that
+         * arrives while one is pending reuses it */
+        if (!o->frame_cb) {
+            o->frame_cb = wl_surface_frame(o->sfc);
+            wl_callback_add_listener(o->frame_cb, &CbListener, o);
+        }
         wl_surface_commit(o->sfc);
     }
 }
@@ -729,6 +761,7 @@ static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
     L("output %d: layer surface closed by compositor, rebuilding", o->idx);
     o->configured = 0;
     o->visible = 0;
+    CancelFrame(o);              /* the destroyed surface never delivers done */
     if (o->wl_gone) return;
     if (o->ls) { zwlr_layer_surface_v1_destroy(o->ls); o->ls = NULL; }
     if (o->sfc) { wl_surface_destroy(o->sfc); o->sfc = NULL; }
@@ -788,30 +821,51 @@ static const struct wl_output_listener OutputListener = {
     OutputDescription,
 };
 
+/* Drop the pending frame callback, if any.  A destroyed surface never
+ * delivers done, so waiting for it would stall the retirement flush. */
+static void CancelFrame(struct OUT *o) {
+    if (!o->frame_cb) return;
+    wl_callback_destroy(o->frame_cb);
+    o->frame_cb = NULL;
+}
+
 static void OutTeardown(struct OUT *o) {
+    int tracked;
     if (!o) return;
     if (o->ls) zwlr_layer_surface_v1_destroy(o->ls);
     if (o->sfc) wl_surface_destroy(o->sfc);
+    CancelFrame(o);
     if (o->wl) wl_output_destroy(o->wl);
-    /* the current set joins the retired list and is freed only if the
-     * compositor has released both halves; otherwise the process exit
-     * reclaims it (never unmap memory a live compositor may be reading) */
-    /* RetireSet owns the mapping from here on: it either frees it (when both
-     * halves are released) or leaves it parked for process exit.  Unmapping
-     * it again here would double-munmap a freed region. */
-    RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-              o->buf_released, o->hbuf_released);
-    FlushRetired(o);
+    /* the current set joins the retired list and is freed only once the
+     * compositor released both halves (never unmap memory a live compositor
+     * reads).  The OUT itself must outlive those releases: the buffers'
+     * listener data points here. */
+    tracked = RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+                        o->buf_released, o->hbuf_released);
+    o->buf = o->hbuf = NULL;
+    o->pool = NULL;
+    o->data = NULL;
+    o->fd = -1;
+    o->configured = 0;
+    o->visible = 0;
+    o->baked_gen = 0;
     pthread_mutex_lock(&g_wlock);
     memset(&g_job[o->idx], 0, sizeof g_job[o->idx]);
     g_baking[o->idx] = 0;
     pthread_mutex_unlock(&g_wlock);
-    free(o);
+    if (!tracked) return;         /* untrackable set: leak this OUT, not its
+                                   * listener data */
+    o->teardown = 1;
+    FlushRetired(o);              /* frees o itself once nothing is outstanding */
 }
 
 /* build the wl_surface + layer surface for an existing OUT (used both by
- * OutCreate and by the closed/rebuild path) */
+ * OutCreate and by the closed/rebuild path).  Refuses to build anything
+ * before the globals it needs are bound: wl_output is advertised before
+ * wl_compositor, wl_shm and zwlr_layer_shell_v1 in some registry orders, and
+ * a missing layer-shell is a hard error, not a NULL dereference. */
 static void LayerSurfaceInit(struct OUT *o) {
+    if (!g_comp || !g_shm || !g_shell || o->ls || o->wl_gone) return;
     o->sfc = wl_compositor_create_surface(g_comp);
     ApplyClickThrough(o);
     o->ls = zwlr_layer_shell_v1_get_layer_surface(g_shell, o->sfc, o->wl,
@@ -826,6 +880,16 @@ static void LayerSurfaceInit(struct OUT *o) {
                                      ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
     zwlr_layer_surface_v1_add_listener(o->ls, &LayerListener, o);
     wl_surface_commit(o->sfc);          /* triggers the configure */
+}
+
+/* Create every output that is still waiting for its globals.  Called once
+ * after the registry enumeration has bound everything: an output announced
+ * before wl_compositor or layer-shell simply waits here instead of
+ * dereferencing a NULL proxy. */
+static void OutSurfaceInitAll(void) {
+    int i;
+    for (i = 0; i < MAX_MON; i++)
+        if (g_ov[i]) LayerSurfaceInit(g_ov[i]);
 }
 
 static void OutCreate(struct wl_output *wl, uint32_t name) {
@@ -850,8 +914,8 @@ static void OutCreate(struct wl_output *wl, uint32_t name) {
 
     wl_output_add_listener(wl, &OutputListener, o);
 
-    LayerSurfaceInit(o);
-    L("output %d: global %u surface requested (overlay layer)", slot, name);
+    LayerSurfaceInit(o);                /* no-op until the globals are bound */
+    L("output %d: global %u registered", slot, name);
 }
 
 static void RegistryGlobal(void *data, struct wl_registry *reg, uint32_t name,
@@ -910,14 +974,14 @@ static void RepaintAll(void) {
  * compositor path does not provide).  The mode is therefore NOT a state we
  * can hold: reporting `mode eink` while painting paper made --status, the
  * config file and the screen disagree permanently, because the refused value
- * was still persisted.  Normalize here, at the single choke point every
- * settings path funnels through, so no caller can leave mode=1 behind. */
+ * was still persisted.  Normalization lives in paper_core.h (NormalizeMode)
+ * so the headless suite pins the same contract this daemon relies on. */
 static int RequestMode(int mode) {
-    if (mode == MODE_EINK)
-        L("e-ink mode is not implemented on Wayland yet: it needs screen "
-          "capture and this compositor path is not built (staying in paper mode)");
-    g_s.mode = MODE_PAPER;
-    return mode != MODE_EINK;
+    g_s.mode = mode;
+    if (NormalizeMode(&g_s)) return 1;
+    L("e-ink mode is not implemented on Wayland yet: it needs screen "
+      "capture and this compositor path is not built (staying in paper mode)");
+    return 0;
 }
 
 static void ApplySettings(int save) {
@@ -928,7 +992,7 @@ static void ApplySettings(int save) {
     ClampSettingsOf(&g_s);
     /* refused modes are normalized to paper BEFORE the rest of the function
      * (and before the config write) can observe them */
-    if (g_s.mode == MODE_EINK) RequestMode(MODE_EINK);
+    RequestMode(g_s.mode);
 
     /* Only texture content invalidates the generation.  A toggle, share or
      * tray change must NOT cost a re-bake (Windows behaves the same way:
@@ -1028,7 +1092,6 @@ static int SockStart(void) {
 /* The one place the command flags live.  The CLI parser, the client-side
  * request builder and the IPC command names all read this table, so a new
  * command cannot be added to one and forgotten in the others. */
-#define CMD_SETTINGS 99     /* not an IPC command: answered locally */
 #define CMD_STATUS   98     /* not an IPC command: answered by StatusLine */
 
 static const struct { const char *flag, *proto; int cmd; } CMD_TABLE[] = {
@@ -1037,7 +1100,6 @@ static const struct { const char *flag, *proto; int cmd; } CMD_TABLE[] = {
     { "--off",      "off",      CMD_OFF      },
     { "--paper",    "paper",    CMD_PAPER    },
     { "--eink",     "eink",     CMD_EINK     },
-    { "--settings", "settings", CMD_SETTINGS },
     { "--quit",     "quit",     CMD_QUIT     },
     { "--status",   "status",   CMD_STATUS   },
 };
@@ -1105,12 +1167,6 @@ static void IpcCommand(struct IPC *c, char *line) {
         IpcSend(c, "ok mode eink\n");
         return;
     }
-    if (!strcmp(line, "settings")) {
-        IpcSend(c, "ok no-gui-on-wayland-yet\n");
-        L("settings GUI requested: not built for Wayland yet (edit %s or use --set)",
-          ConfigPath() ? ConfigPath() : "(unset)");
-        return;
-    }
     if (!strncmp(line, "set ", 4)) {
         if (!c->have_pend) { c->pend = g_s; c->have_pend = 1; }
         if (SetKeyValue(&c->pend, line + 4)) c->sets++;
@@ -1125,6 +1181,8 @@ static void IpcCommand(struct IPC *c, char *line) {
         } else {
             IpcSend(c, "ok nothing-to-apply\n");
         }
+        c->have_pend = 0;               /* the batch is consumed, applied or not */
+        c->sets = 0;
         return;
     }
     IpcSend(c, "err unknown %s\n", line);
@@ -1185,6 +1243,7 @@ static int SendToRunning(int argc, char **argv) {
     int fd, i, k;
     char req[4096];
     size_t len = 0;
+    int sets = 0;                        /* set lines written, apply not yet */
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 2;
@@ -1196,21 +1255,26 @@ static int SendToRunning(int argc, char **argv) {
         return 2;                            /* nobody is running */
     }
     for (i = 1; i < argc && len < sizeof req - 8; i++) {
-        int mapped = 0;
+        if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+            /* every --set on the command line is one batch: the single
+             * apply at the end writes settings.conf once and bumps the
+             * generation once, so only the final state is ever baked */
+            for (i++; i < argc && strchr(argv[i], '=') && len < sizeof req - 8; i++) {
+                len += (size_t)snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
+                sets++;
+            }
+            i--;
+            continue;
+        }
         for (k = 0; k < CMD_TABLE_N; k++)
             if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
                 len += (size_t)snprintf(req + len, sizeof req - len, "%s\n",
                                         CMD_TABLE[k].proto);
-                mapped = 1;
                 break;
             }
-        if (mapped) continue;
-        if (!strcmp(argv[i], "--set") && i + 1 < argc) {
-            for (i++; i < argc && strchr(argv[i], '=') && len < sizeof req - 8; i++)
-                len += (size_t)snprintf(req + len, sizeof req - len, "set %s\napply\n", argv[i]);
-            i--;
-        }
     }
+    if (sets && len < sizeof req - 8)
+        len += (size_t)snprintf(req + len, sizeof req - len, "apply\n");
     if (len) {
         ssize_t ignored = write(fd, req, len);
         (void)ignored;
@@ -1447,6 +1511,9 @@ int main(int argc, char **argv) {
           "wlroots compositors work; GNOME/Mutter does not)");
         return 1;
     }
+    /* outputs announced before the globals above waited in OutCreate; build
+     * their surfaces now that every global they need is bound */
+    OutSurfaceInitAll();
     wl_display_roundtrip(g_dpy);            /* outputs finish their geometry */
     if (!g_nov) {
         L("no outputs found - nothing to cover");
