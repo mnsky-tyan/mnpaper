@@ -80,6 +80,11 @@
  * texture at all - same cap and same policy as mnPaper.c's MAX_MON. */
 #define MAX_MON 16
 
+/* One --set batch bound, shared by the fresh-start path and the client
+ * request builder, so the same command line behaves the same whether or not
+ * an instance is already running. */
+#define MAX_SETS 64
+
 /* ------------------------------------------------------------------ log --- */
 
 static FILE *g_log;
@@ -216,9 +221,10 @@ static char *ExePath(void) {
 }
 
 /* Is the existing entry ours?  Same ownership rule as RunEntryMatchesExe:
- * only an entry naming THIS executable is ours to change or remove, so a
- * second copy of the binary at another path cannot disable the installed
- * one's autostart. */
+ * only an entry naming THIS executable is ours to remove, so a second copy
+ * of the binary at another path cannot disable the installed one's
+ * autostart.  Enabling rewrites the one slot unconditionally, like the
+ * Windows Run key. */
 static int AutostartEntryIsOurs(const char *file, const char *exe) {
     FILE *f = fopen(file, "r");
     char line[1024];
@@ -339,7 +345,8 @@ static pthread_mutex_t g_wlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_wake  = PTHREAD_COND_INITIALIZER;
 static pthread_t       g_worker;
 static int             g_worker_on;
-static int             g_wstop;
+static PAPERCANCEL     g_wcancel;        /* live stop flag the worker re-reads
+                                        * every row; WorkerStop raises it */
 
 static int g_pipe[2] = { -1, -1 };     /* worker -> event loop "done" ping */
 
@@ -361,7 +368,7 @@ static void *WorkerMain(void *unused) {
     for (;;) {
         struct JOB job;
         int i = -1, found = 0;
-        while (!g_wstop) {
+        while (!g_wcancel.stop) {
             int k;
             for (k = 0; k < MAX_MON; k++)
                 if (g_job[k].used) break;
@@ -378,13 +385,7 @@ static void *WorkerMain(void *unused) {
             size_t bytes = (size_t)job.w * job.h * 4;
             unsigned char *px = malloc(bytes ? bytes : 4);
             double began = NowMs();
-            PAPERCANCEL cancel;
-            int built;
-            memset(&cancel, 0, sizeof cancel);
-            pthread_mutex_lock(&g_wlock);
-            cancel.stop = g_wstop;
-            pthread_mutex_unlock(&g_wlock);
-            built = px && BuildPaperFull(px, job.w, job.h, &job.s, &cancel);
+            int built = px && BuildPaperFull(px, job.w, job.h, &job.s, &g_wcancel);
             if (built) {
                 struct RESULT r;
                 r.idx = job.idx; r.w = job.w; r.h = job.h; r.gen = job.gen;
@@ -416,7 +417,7 @@ static void *WorkerMain(void *unused) {
 
 static void WorkerStop(void) {
     pthread_mutex_lock(&g_wlock);
-    g_wstop = 1;
+    g_wcancel.stop = 1;
     pthread_cond_broadcast(&g_wake);
     pthread_mutex_unlock(&g_wlock);
     if (g_worker_on) pthread_join(g_worker, NULL);
@@ -575,6 +576,10 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
     if (o->teardown) FlushRetired(o);
 }
 
+/* (Re)create this output's buffer set for logical size lw x lh at scale.
+ * No-op when nothing changed.  The fd stays open: libwayland forwards it to
+ * the compositor on the next flush, so it is only closed when the pool dies
+ * (see RetireSet/OutTeardown). */
 static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     size_t bytes;
     int fd = -1;
@@ -625,11 +630,6 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     if (g_comp_version >= 3)
         wl_surface_set_buffer_scale(o->sfc, scale);
 }
-
-/* (Re)create this output's buffer set for logical size lw x lh at scale.
- * No-op when nothing changed.  The fd stays open: libwayland forwards it to
- * the compositor on the next flush, so it is only closed when the pool dies
- * (see RetireSet/OutTeardown). */
 
 /* Attach whichever half master asks for, right now.  The surface stays
  * MAPPED in both cases (see the buffer-state comment). */
@@ -1139,7 +1139,10 @@ static void IpcSend(struct IPC *c, const char *fmt, ...) {
     n = vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (n > 0) {
-        if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+        if ((size_t)n >= sizeof buf) {
+            n = (int)sizeof buf - 1;
+            buf[n - 1] = '\n';       /* a truncated reply must stay one line */
+        }
         {
             ssize_t ignored = write(c->fd, buf, (size_t)n);
             (void)ignored;
@@ -1260,6 +1263,7 @@ static int SendToRunning(int argc, char **argv) {
     int fd, i, k;
     char req[4096];
     size_t len = 0;
+    int sets = 0, dropped = 0;
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 2;
@@ -1270,7 +1274,7 @@ static int SendToRunning(int argc, char **argv) {
         close(fd);
         return 2;                            /* nobody is running */
     }
-    for (i = 1; i < argc && len < sizeof req - 8; i++) {
+    for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--set") && i + 1 < argc) {
             int sent = 0;
             for (;;) {
@@ -1278,38 +1282,46 @@ static int SendToRunning(int argc, char **argv) {
                     i++;
                     continue;
                 }
-                if (i + 1 < argc && strchr(argv[i + 1], '=') && len < sizeof req - 8) {
+                if (i + 1 < argc && strchr(argv[i + 1], '=')) {
                     int n;
                     i++;
-                    n = snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
-                    if (n < 0) break;
-                    if ((size_t)n >= sizeof req - len) { len = sizeof req - 1; break; }
+                    /* 8 bytes stay reserved so the trailing apply always fits */
+                    if (sets >= MAX_SETS || len + 8 >= sizeof req) {
+                        dropped++;
+                        continue;
+                    }
+                    n = snprintf(req + len, sizeof req - len - 8, "set %s\n", argv[i]);
+                    if (n < 0 || (size_t)n >= sizeof req - len - 8) {
+                        dropped++;
+                        continue;
+                    }
                     len += (size_t)n;
+                    sets++;
                     sent++;
                     continue;
                 }
                 break;
             }
-            if (sent && len < sizeof req - 8) {
-                int n = snprintf(req + len, sizeof req - len, "apply\n");
-                if (n > 0) {
-                    if ((size_t)n >= sizeof req - len) len = sizeof req - 1;
-                    else len += (size_t)n;
-                }
+            if (sent) {                    /* the reservation above guarantees room */
+                memcpy(req + len, "apply\n", 6);
+                len += 6;
             }
             continue;
         }
         for (k = 0; k < CMD_TABLE_N; k++)
             if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
-                int n = snprintf(req + len, sizeof req - len, "%s\n",
-                                 CMD_TABLE[k].proto);
-                if (n > 0) {
-                    if ((size_t)n >= sizeof req - len) len = sizeof req - 1;
-                    else len += (size_t)n;
-                }
+                int n;
+                if (len + 8 >= sizeof req) { dropped++; break; }
+                n = snprintf(req + len, sizeof req - len - 8, "%s\n",
+                             CMD_TABLE[k].proto);
+                if (n > 0 && (size_t)n < sizeof req - len - 8) len += (size_t)n;
+                else dropped++;
                 break;
             }
     }
+    if (dropped)
+        L("--request truncated: %d item(s) dropped (max %d sets, %zu-byte buffer)",
+          dropped, MAX_SETS, sizeof req);
     if (len) {
         ssize_t ignored = write(fd, req, len);
         (void)ignored;
@@ -1434,7 +1446,7 @@ static void Usage(void) {
 int main(int argc, char **argv) {
     int i;
     int cmd = 0;
-    char *sets[64];
+    char *sets[MAX_SETS];
     int nsets = 0;
     char dump_tex[512] = "";
     int dump_w = 960, dump_h = 600, dump_bg = 235;
@@ -1449,8 +1461,12 @@ int main(int argc, char **argv) {
             dump_h = atoi(argv[++i]);
             if (i + 1 < argc && argv[i + 1][0] != '-') dump_bg = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
-            while (i + 1 < argc && strchr(argv[i + 1], '=') && nsets < 64)
+            while (i + 1 < argc && strchr(argv[i + 1], '=') && nsets < MAX_SETS)
                 sets[nsets++] = argv[++i];
+            while (i + 1 < argc && strchr(argv[i + 1], '=')) {
+                L("--set batch full (max %d): ignoring %s", MAX_SETS, argv[i + 1]);
+                i++;
+            }
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             Usage();
             return 0;
@@ -1482,6 +1498,10 @@ int main(int argc, char **argv) {
             L("dump size out of range: %dx%d", dump_w, dump_h);
             return 2;
         }
+        if (dump_bg < 0 || dump_bg > 255) {
+            L("dump bg out of range: %d (expected 0-255)", dump_bg);
+            return 2;
+        }
         px = malloc((size_t)dump_w * dump_h * 4);
         if (!px) { L("out of memory"); return 2; }
         BuildPaperFull(px, dump_w, dump_h, &g_s, NULL);
@@ -1497,9 +1517,8 @@ int main(int argc, char **argv) {
     if (cmd || nsets) {
         int rc = SendToRunning(argc, argv);
         if (rc == 0) return 0;
-        if (cmd && !(nsets || cmd == CMD_ON)) {
-            /* a bare command with nobody to hear it is a dropped command
-             * (the Windows build exits 2 in exactly the same case) */
+        if (cmd && !(nsets || cmd == CMD_ON || cmd == CMD_PAPER)) {
+            /* a bare command with nobody to hear it is a dropped command */
             L("no running mnpaper instance; start one with: mnpaper");
             return 2;
         }
@@ -1513,6 +1532,10 @@ int main(int argc, char **argv) {
                 L("ignoring unknown or malformed --set entry: %s", sets[k]);
         ClampSettingsOf(&g_s);
     }
+    /* a visibility command on the fresh path means what it means against a
+     * running instance: start shown, in paper mode */
+    if (cmd == CMD_ON) g_s.master = 1;
+    else if (cmd == CMD_PAPER) { g_s.mode = MODE_PAPER; g_s.master = 1; }
 
     /* ---- become the daemon ---- */
     /* At login the autostart entry can fire before the compositor's socket

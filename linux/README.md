@@ -82,9 +82,11 @@ XDG-compliant desktop launch at login. Points worth knowing:
 - **The `.desktop` file is the truth**, exactly like the Windows Run key:
   `autostart` is not stored in `settings.conf`, it is derived from the file on
   every load, so a stored copy can never diverge from reality.
-- Only an entry naming **this** executable (recorded in `X-Mnpaper-Exe=`) is
-  ever changed or removed, so a second copy at another path cannot disable
-  the installed one.
+- Removing the entry is guarded by `X-Mnpaper-Exe=`: only an entry naming
+  **this** executable is ever removed, so a second copy at another path
+  cannot disable the installed one. Enabling writes this executable's path
+  into the single `mnpaper.desktop` slot, replacing any existing entry (the
+  Windows Run key behaves the same way).
 - Install the binary somewhere stable first (`~/.local/bin/mnpaper`); an
   autostart entry pointing into a build directory breaks the moment you
   `make clean`.

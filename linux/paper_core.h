@@ -241,8 +241,8 @@ static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
 
 /* Uncancellable full bake: epoch == NULL means nothing can cancel us (the
  * dump path).  Returns 0 only when a cancel was requested. */
-typedef struct { int stop; } PAPERCANCEL;   /* portable stand-in for the
-                                             * Windows interlocked flags */
+typedef struct { volatile int stop; } PAPERCANCEL;   /* portable stand-in for
+                                             * the Windows interlocked flags */
 static int PaperCancelledOf(const PAPERCANCEL *c) { return c && c->stop; }
 
 static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
