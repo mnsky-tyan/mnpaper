@@ -1,0 +1,1608 @@
+/* mnpaper - Linux (Wayland) port of mnPaper.
+ *
+ * Scope of this port (v1, Wayland only - there is no X11 fallback by design):
+ *
+ *   The paper texture is one layer-shell surface per output, placed on the
+ *   OVERLAY layer (above panels and fullscreen windows - the closest thing
+ *   Wayland has to Windows' WS_EX_TOPMOST), anchored to all four edges with
+ *   an exclusive zone of -1 so panels never shrink it.  The input region is
+ *   empty, so every click, hover and keystroke falls through to whatever is
+ *   underneath - the Wayland equivalent of WS_EX_TRANSPARENT.
+ *
+ *   The texture itself is plain software rendering into wl_shm buffers.
+ *   wl_shm's ARGB8888 is premultiplied BGRA in memory - byte-for-byte the
+ *   format the Windows build paints into its top-down DIBs - so the
+ *   generator (paper_core.h) is shared verbatim.
+ *
+ * Not ported yet (each is its own piece of work, listed here so the gaps
+ * are explicit):
+ *   - e-ink mode: needs screen capture.  KWin (this desktop) implements
+ *     neither wlr-screencopy nor ext-image-copy-capture, so the capture
+ *     backend would be KDE's PipeWire screencast.  Requests for e-ink are
+ *     refused with a log line; mode stays paper.
+ *   - settings GUI, tray icon (StatusNotifierItem), global hotkeys
+ *     (ext-global-shortcuts-v1), update feed.  Everything they control is
+ *     reachable through the CLI below.
+ *   Autostart IS implemented (an XDG .desktop file; see ApplyAutostart).
+ *
+ * CLI (mirrors the Windows flags where it makes sense):
+ *   mnpaper                 start the overlay daemon (foreground)
+ *   mnpaper --on|--off|--toggle|--paper|--eink|--quit
+ *                           command a running instance
+ *   mnpaper --set k=v [--set k=v ...] [--on]
+ *                           push settings to a running instance, or start
+ *                           fresh with them when none is running
+ *   mnpaper --status        print the running instance's state
+ *   mnpaper --settings      accepted; answers "no GUI on Wayland yet"
+ *   mnpaper --dump-tex out.bmp W H [bg]
+ *                           headless: bake a texture to a 24bpp BMP
+ *                           (composite over `bg` gray, default 235), no
+ *                           display needed - the test harness uses this
+ *   mnpaper --log FILE      append diagnostics to FILE as well as stderr
+ *
+ * Second instance: a unix socket at $XDG_RUNTIME_DIR/mnpaper.sock replaces
+ * the Windows FindWindow/WM_COPYDATA dance.  Text lines in, text lines out.
+ *
+ * Settings: $XDG_CONFIG_HOME/mnpaper/settings.conf (default
+ * ~/.config/...), same keys and bounds as the Windows registry values,
+ * written atomically on every applied change.
+ */
+
+#define _GNU_SOURCE            /* pipe2 */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <sys/mman.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+
+#include <wayland-client.h>
+
+#include "protocols/wlr-layer-shell-unstable-v1.h"
+#include "paper_core.h"
+#include "../version.h"
+
+#define APP_VERSION MNVER_STR "-wayland"
+
+/* The veil covers every output, so an output past this count would get no
+ * texture at all - same cap and same policy as mnPaper.c's MAX_MON. */
+#define MAX_MON 16
+
+/* ------------------------------------------------------------------ log --- */
+
+static FILE *g_log;
+static void L(const char *fmt, ...) {
+    va_list ap;
+    char buf[512];
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "%s\n", buf);
+    if (g_log) {
+        fprintf(g_log, "%s\n", buf);
+        fflush(g_log);
+    }
+}
+
+static double NowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* ------------------------------------------------------------- settings --- */
+
+static SETTINGS g_s;
+static int g_settings_gen = 1;   /* bumped on every applied change: results
+                                  * baked from an older generation are dropped */
+
+static const char *ConfigDir(void) {
+    static char dir[512];
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg)
+        snprintf(dir, sizeof dir, "%s/mnpaper", xdg);
+    else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return NULL;
+        snprintf(dir, sizeof dir, "%s/.config/mnpaper", home);
+    }
+    return dir;
+}
+
+static const char *ConfigPath(void) {
+    static char path[600];
+    const char *dir = ConfigDir();
+    if (!dir) return NULL;
+    snprintf(path, sizeof path, "%s/settings.conf", dir);
+    return path;
+}
+
+static int ConfigWrite(const SETTINGS *s) {
+    const char *dir = ConfigDir(), *path = ConfigPath();
+    char tmp[700];
+    FILE *f;
+    if (!dir || !path) return 0;
+    if (mkdir(dir, 0755) && errno != EEXIST) return 0;
+    snprintf(tmp, sizeof tmp, "%s/settings.conf.tmp.%d", dir, (int)getpid());
+    f = fopen(tmp, "w");
+    if (!f) return 0;
+    /* canonical form: every key, always, so the file is diff-friendly */
+    fprintf(f,
+        "# mnpaper settings (same keys as the Windows registry values;\n"
+        "# autostart is not stored here - the autostart .desktop file is the\n"
+        "# truth, exactly as the Windows Run key is)\n"
+        "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
+        "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
+        "share=%d\ntbmode=%d\nautoupd=%d\n",
+        s->master, s->mode, s->intensity, s->warmth, s->grain,
+        s->fibre, s->blotch, s->shades, s->contrast, s->dither,
+        s->share, s->tbmode, s->autoupd);
+    if (fclose(f)) { unlink(tmp); return 0; }
+    if (rename(tmp, path)) { unlink(tmp); return 0; }
+    return 1;
+}
+
+static void AutostartSyncFromDisk(void);   /* defined with the autostart code */
+
+static void LoadSettings(void) {
+    FILE *f;
+    char line[256];
+    int loaded = 0;
+    const char *path;
+    g_s = PaperDefaultSettings();
+    path = ConfigPath();
+    if (!path) return;
+    f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *nl;
+        if (line[0] == '#' || line[0] == '\n') continue;
+        nl = line + strlen(line);
+        if (nl > line && nl[-1] == '\n') nl[-1] = 0;
+        if (!SetKeyValue(&g_s, line))
+            L("config: ignoring unknown or malformed line: %s", line);
+        else loaded++;
+    }
+    fclose(f);
+    ClampSettingsOf(&g_s);
+    AutostartSyncFromDisk();   /* the .desktop file overrides any stored value */
+    if (loaded) L("config: loaded %d keys from %s", loaded, path);
+}
+
+/* ------------------------------------------------------------ autostart --- */
+
+/* Windows writes an entry under HKCU\...\Run and, crucially, never stores
+ * `autostart` in its settings: LoadSettings derives it from the Run entry, so
+ * a stored copy could only diverge from the truth.  The Linux counterpart is
+ * an XDG autostart file, and it follows the same rule: the .desktop file IS
+ * the truth, and the config key is a request that is applied to it.
+ *
+ * Written for the current user only, under $XDG_CONFIG_HOME/autostart, which
+ * KDE, GNOME and every other XDG-compliant desktop reads at login. */
+
+static const char *AutostartPath(void) {
+    static char path[600];
+    const char *dir = ConfigDir();          /* <config>/mnpaper */
+    char base[512];
+    char *slash;
+    if (!dir) return NULL;
+    snprintf(base, sizeof base, "%s", dir);
+    slash = strrchr(base, '/');             /* strip the trailing /mnpaper */
+    if (!slash) return NULL;
+    *slash = 0;
+    snprintf(path, sizeof path, "%s/autostart/mnpaper.desktop", base);
+    return path;
+}
+
+static char *ExePath(void) {
+    static char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (n <= 0) return NULL;
+    path[n] = 0;
+    return path;
+}
+
+/* Is the existing entry ours?  Same ownership rule as RunEntryMatchesExe:
+ * only an entry naming THIS executable is ours to change or remove, so a
+ * second copy of the binary at another path cannot disable the installed
+ * one's autostart. */
+static int AutostartEntryIsOurs(const char *file, const char *exe) {
+    FILE *f = fopen(file, "r");
+    char line[1024];
+    int ours = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *nl = line + strlen(line);
+        if (nl > line && nl[-1] == '\n') nl[-1] = 0;
+        if (!strncmp(line, "X-Mnpaper-Exe=", 14) && !strcmp(line + 14, exe))
+            ours = 1;
+    }
+    fclose(f);
+    return ours;
+}
+
+/* Apply the requested autostart state to the desktop entry.
+ * Returns 1 when the on-disk truth matches the request. */
+static int ApplyAutostart(void) {
+    const char *path = AutostartPath();
+    char *exe = ExePath();
+    if (!path || !exe) {
+        L("autostart: cannot determine %s - entry not touched",
+          !path ? "the config directory" : "this executable's path");
+        return 0;
+    }
+    if (g_s.autostart) {
+        char dir[600], tmp[700];
+        FILE *f;
+        /* already enabled and ours: nothing to write, nothing to log.  This
+         * runs on every settings change, so an unconditional rewrite spammed
+         * one "autostart: enabled" line per --set. */
+        if (AutostartEntryIsOurs(path, exe)) return 1;
+        snprintf(dir, sizeof dir, "%s", path);
+        {
+            char *slash = strrchr(dir, '/');
+            if (slash) *slash = 0;
+        }
+        if (mkdir(dir, 0755) && errno != EEXIST) {
+            L("autostart: cannot create %s (errno %d)", dir, errno);
+            return 0;
+        }
+        snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+        f = fopen(tmp, "w");
+        if (!f) {
+            L("autostart: cannot write %s (errno %d)", tmp, errno);
+            return 0;
+        }
+        fprintf(f,
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=mnPaper\n"
+            "Comment=A soft paper texture over your whole screen\n"
+            "Exec=%s\n"
+            "Terminal=false\n"
+            "Hidden=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+            "X-KDE-autostart-enabled=true\n"
+            "X-Mnpaper-Exe=%s\n",
+            exe, exe);
+        if (fclose(f) || rename(tmp, path)) {
+            unlink(tmp);
+            L("autostart: could not install %s (errno %d)", path, errno);
+            return 0;
+        }
+        L("autostart: enabled (%s)", path);
+        return 1;
+    }
+    /* disabling: remove only an entry that names this executable */
+    if (access(path, F_OK) == 0) {
+        if (AutostartEntryIsOurs(path, exe)) {
+            if (unlink(path)) {
+                L("autostart: cannot remove %s (errno %d)", path, errno);
+                return 0;
+            }
+            L("autostart: disabled (%s removed)", path);
+        } else {
+            L("autostart: %s belongs to another copy - left alone", path);
+        }
+    }
+    return 1;
+}
+
+/* The on-disk entry decides `autostart`, exactly like the Windows Run key:
+ * no stored copy can diverge from the truth. */
+static void AutostartSyncFromDisk(void) {
+    const char *path = AutostartPath();
+    char *exe = ExePath();
+    if (!path || !exe) return;
+    g_s.autostart = AutostartEntryIsOurs(path, exe);
+}
+
+/* ----------------------------------------------------------- wayland app --- */
+
+struct OUT;
+
+static struct wl_display *g_dpy;
+static struct wl_registry *g_reg;
+static struct wl_compositor *g_comp;
+static int g_comp_version;
+static struct wl_shm *g_shm;
+static struct zwlr_layer_shell_v1 *g_shell;
+static int g_sock_fd = -1;         /* command socket listen fd */
+static int g_sig_fd = -1;          /* signalfd for SIGINT/SIGTERM */
+
+static struct OUT *g_ov[MAX_MON];
+static int g_nov;
+
+static volatile sig_atomic_t g_quit;
+
+/* ---- bake worker: one thread, one job at a time, results over a pipe ----
+ * Same shape as the Windows build's PaperWorker/PostMessage(WM_APP_PAPER):
+ * the UI thread never runs the noise loops, the worker never touches the
+ * compositor.  A settings change does not abort an in-flight bake (the
+ * Windows build cancels row-wise); the stale result is simply dropped at
+ * present time by its generation number, at the cost of one wasted bake. */
+
+struct JOB { int used; int idx, w, h, gen; SETTINGS s; };
+static struct JOB g_job[MAX_MON];
+static int g_baking[MAX_MON];          /* gen the worker is baking now, 0 = idle */
+
+static pthread_mutex_t g_wlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_wake  = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_worker;
+static int             g_worker_on;
+static int             g_wstop;
+
+static int g_pipe[2] = { -1, -1 };     /* worker -> event loop "done" ping */
+
+struct RESULT {
+    int idx, w, h, gen;
+    double build_ms;
+    unsigned char *px;                 /* worker-malloc'd; main thread copies
+                                        * into the surface buffer and frees */
+};
+#define RESULTQ 32
+static struct RESULT g_results[RESULTQ];
+static int g_nresults;
+
+static void WorkerKick(void) { pthread_cond_broadcast(&g_wake); }
+
+static void *WorkerMain(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&g_wlock);
+    for (;;) {
+        struct JOB job;
+        int i = -1, found = 0;
+        while (!g_wstop) {
+            int k;
+            for (k = 0; k < MAX_MON; k++)
+                if (g_job[k].used) break;
+            if (k < MAX_MON) { i = k; found = 1; break; }
+            pthread_cond_wait(&g_wake, &g_wlock);
+        }
+        if (!found) break;              /* stopping */
+        job = g_job[i];
+        memset(&g_job[i], 0, sizeof g_job[i]);
+        g_baking[i] = job.gen;
+        pthread_mutex_unlock(&g_wlock);
+
+        {
+            size_t bytes = (size_t)job.w * job.h * 4;
+            unsigned char *px = malloc(bytes ? bytes : 4);
+            double began = NowMs();
+            PAPERCANCEL cancel;
+            int built;
+            memset(&cancel, 0, sizeof cancel);
+            pthread_mutex_lock(&g_wlock);
+            cancel.stop = g_wstop;
+            pthread_mutex_unlock(&g_wlock);
+            built = px && BuildPaperFull(px, job.w, job.h, &job.s, &cancel);
+            if (built) {
+                struct RESULT r;
+                r.idx = job.idx; r.w = job.w; r.h = job.h; r.gen = job.gen;
+                r.build_ms = NowMs() - began;
+                r.px = px;
+                pthread_mutex_lock(&g_wlock);
+                if (g_nresults < RESULTQ) {
+                    g_results[g_nresults++] = r;
+                    r.px = NULL;
+                }
+                pthread_mutex_unlock(&g_wlock);
+                if (r.px) {                 /* queue full: this should not
+                                             * happen at RESULTQ 32 */
+                    L("worker: result queue full, dropped bake for output %d", r.idx);
+                    free(r.px);
+                } else if (write(g_pipe[1], "r", 1) < 0 && errno != EAGAIN) {
+                    /* the loop always drains; a full pipe just means the
+                     * main thread is momentarily busy */
+                }
+            } else {
+                free(px);
+            }
+        }
+        pthread_mutex_lock(&g_wlock);
+    }
+    pthread_mutex_unlock(&g_wlock);
+    return NULL;
+}
+
+static void WorkerStop(void) {
+    pthread_mutex_lock(&g_wlock);
+    g_wstop = 1;
+    pthread_cond_broadcast(&g_wake);
+    pthread_mutex_unlock(&g_wlock);
+    if (g_worker_on) pthread_join(g_worker, NULL);
+    g_worker_on = 0;
+}
+
+/* ------------------------------- shm buffers ------------------------------ */
+
+static int ShmFdFor(size_t bytes) {
+    char name[64];
+    int fd;
+    snprintf(name, sizeof name, "/mnpaper-%d", (int)getpid());
+    fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) shm_unlink(name);      /* the fd keeps the object alive */
+    if (fd >= 0 && ftruncate(fd, (off_t)bytes)) { close(fd); return -1; }
+    return fd;
+}
+
+/* ---------------------------------- outputs ------------------------------- */
+
+/* One retired buffer set (texture + transparent halves over one mapping).
+ * Freed only after the compositor released BOTH halves and a frame callback
+ * proved it: that is the earliest moment unmapping is safe. */
+struct RETIRED {
+    struct wl_buffer *buf, *hbuf;
+    struct wl_shm_pool *pool;
+    int fd;
+    void *data;
+    size_t bytes;
+    int rel_buf, rel_hbuf;
+};
+
+struct OUT {
+    int idx;                            /* slot in g_ov */
+    uint32_t global_name;
+    struct wl_output *wl;
+    int wl_gone;                        /* output global removed: never reuse */
+    struct wl_surface *sfc;
+    struct zwlr_layer_surface_v1 *ls;
+    int lw, lh;                         /* logical size from configure */
+    int w, h, scale;                    /* buffer size = logical * scale */
+    int configured;
+    /* Layer-shell mapping state.  visible = the texture half is the one
+     * currently attached.  The surface itself is NEVER unmapped: KWin sends
+     * no further configure for an unmapped layer surface, so a remap would
+     * never be licensed (this cost two live sessions to find).  Hiding is a
+     * swap to the transparent half, which keeps the surface mapped. */
+    int visible;
+    int baked_gen;                      /* generation the texture half holds, 0 = none */
+    /* Buffer state: ONE shm pool holding TWO buffers over ONE mapping -
+     * [ texture | transparent ].  Hiding never unmaps the surface: KWin
+     * sends no new configure for an unmapped layer surface, so a remap
+     * would never be licensed again (that failure mode cost two live
+     * sessions).  Hide/show is therefore a pure buffer swap: the texture
+     * stays in the mapping, so re-showing costs zero bakes. */
+    int fd;
+    void *data;                         /* mapping: texture half, then transparent half */
+    size_t map_bytes;                   /* both halves together        */
+    struct wl_shm_pool *pool;
+    struct wl_buffer *buf;              /* texture  */
+    struct wl_buffer *hbuf;             /* transparent */
+    int buf_released, hbuf_released;    /* wl_buffer.release seen; both start
+                                         * released because they are new */
+    struct RETIRED retired[4];
+    int nretired;
+    /* wl_output state */
+    int out_w, out_h;
+    char make[64], model[64];
+};
+
+static void FlushRetired(struct OUT *o) {
+    int i, k = 0;
+    for (i = 0; i < o->nretired; i++) {
+        struct RETIRED *r = &o->retired[i];
+        if (r->rel_buf && r->rel_hbuf) {
+            wl_buffer_destroy(r->buf);
+            wl_buffer_destroy(r->hbuf);
+            wl_shm_pool_destroy(r->pool);
+            if (r->fd >= 0) close(r->fd);
+            if (r->data && r->data != MAP_FAILED) munmap(r->data, r->bytes);
+        } else {
+            o->retired[k++] = *r;        /* still in use by the compositor */
+        }
+    }
+    o->nretired = k;
+}
+
+/* Park a whole buffer set for later release.  Never freed here: the
+ * compositor may still be scanning it (wl_shm contract), and unmapping a
+ * page it reads is a use-after-free in the compositor, not in us. */
+static void RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbuf,
+                      struct wl_shm_pool *pool, int fd, void *data, size_t bytes,
+                      int rel_buf, int rel_hbuf) {
+    if (!buf) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    if (o->nretired < (int)(sizeof o->retired / sizeof o->retired[0])) {
+        struct RETIRED *r = &o->retired[o->nretired++];
+        r->buf = buf; r->hbuf = hbuf; r->pool = pool; r->fd = fd;
+        r->data = data; r->bytes = bytes;
+        r->rel_buf = rel_buf; r->rel_hbuf = rel_hbuf;
+        return;
+    }
+    L("output %d: retired-buffer slots exhausted - leaking one buffer set "
+      "rather than unmapping memory the compositor may still read", o->idx);
+}
+
+static void QueueBake(struct OUT *o);
+static void BufferRelease(void *data, struct wl_buffer *buf);
+
+static const struct wl_buffer_listener BufferListener = { BufferRelease };
+
+/* wl_shm: the compositor owns the pixels from the commit that handed a
+ * buffer out until this event.  buf_released gates the next write into the
+ * texture half, and a bake that had to wait for it is re-queued here. */
+static void BufferRelease(void *data, struct wl_buffer *buf) {
+    struct OUT *o = data;
+    if (buf == o->buf) {
+        o->buf_released = 1;
+        if (o->baked_gen != g_settings_gen) QueueBake(o);
+    } else if (buf == o->hbuf) {
+        o->hbuf_released = 1;
+    } else {
+        int i;
+        for (i = 0; i < o->nretired; i++) {
+            if (o->retired[i].buf == buf) { o->retired[i].rel_buf = 1; break; }
+            if (o->retired[i].hbuf == buf) { o->retired[i].rel_hbuf = 1; break; }
+        }
+    }
+}
+
+static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
+    size_t bytes;
+    int fd = -1;
+    void *data;
+    struct wl_shm_pool *pool;
+    struct wl_buffer *buf, *hbuf;
+
+    if (o->buf && o->hbuf && o->lw == lw && o->lh == lh && o->scale == scale) return;
+
+    bytes = (size_t)lw * scale * lh * scale * 4;
+    fd = ShmFdFor(bytes * 2);
+    if (fd < 0) {
+        L("output %d: shm allocation for %dx%d failed - output left untextured",
+          o->idx, lw * scale, lh * scale);
+        return;
+    }
+    data = mmap(NULL, bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        L("output %d: mmap failed - output left untextured", o->idx);
+        return;
+    }
+    memset((char *)data + bytes, 0, bytes);   /* the transparent half */
+    pool = wl_shm_create_pool(g_shm, fd, (int32_t)(bytes * 2));
+    buf  = wl_shm_pool_create_buffer(pool, 0, lw * scale, lh * scale,
+                                     lw * scale * 4, WL_SHM_FORMAT_ARGB8888);
+    hbuf = wl_shm_pool_create_buffer(pool, (int32_t)bytes, lw * scale, lh * scale,
+                                     lw * scale * 4, WL_SHM_FORMAT_ARGB8888);
+    wl_buffer_add_listener(buf, &BufferListener, o);
+    wl_buffer_add_listener(hbuf, &BufferListener, o);
+    /* the whole old set (both halves share one mapping) is retired together */
+    RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+              o->buf_released, o->hbuf_released);
+    o->data = data;
+    o->map_bytes = bytes * 2;
+    o->pool = pool; o->buf = buf; o->hbuf = hbuf;
+    o->buf_released = o->hbuf_released = 1;   /* new buffers: never busy */
+    o->lw = lw; o->lh = lh;
+    o->w = lw * scale; o->h = lh * scale; o->scale = scale;
+    o->baked_gen = 0;                   /* a fresh texture half holds nothing */
+
+    if (g_comp_version >= 3)
+        wl_surface_set_buffer_scale(o->sfc, scale);
+}
+
+/* (Re)create this output's buffer set for logical size lw x lh at scale.
+ * No-op when nothing changed.  The fd stays open: libwayland forwards it to
+ * the compositor on the next flush, so it is only closed when the pool dies
+ * (see RetireSet/OutTeardown). */
+
+/* Attach whichever half master asks for, right now.  The surface stays
+ * MAPPED in both cases (see the buffer-state comment). */
+static void AttachCurrentBuffer(struct OUT *o) {
+    struct wl_buffer *want;
+    if (!o->buf || !o->configured) return;
+    want = g_s.master ? o->buf : o->hbuf;
+    o->visible = g_s.master;
+    /* attaching the texture half hands it to the compositor: it is busy
+     * until the release event, exactly like a bake commit */
+    if (g_s.master) o->buf_released = 0;
+    else o->hbuf_released = 0;
+    wl_surface_attach(o->sfc, want, 0, 0);
+    if (g_comp_version >= 4)
+        wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
+    else
+        wl_surface_damage(o->sfc, 0, 0, o->lw, o->lh);
+    wl_surface_commit(o->sfc);
+}
+
+static void HideSurface(struct OUT *o) {
+    if (!o->buf || !o->configured || !o->visible) return;
+    AttachCurrentBuffer(o);              /* master is 0 here: transparent half */
+}
+
+/* Queue one bake for this output's current buffer geometry (deduped). */
+static void QueueBake(struct OUT *o) {
+    /* Neither visible nor master is required: a bake landing while hidden
+     * fills the texture half without attaching it, so the next show is
+     * instant.  Requiring master here made the "armed while hidden" promise
+     * false - hidden outputs simply never baked. */
+    if (!o->buf || !o->configured) return;
+    if (o->baked_gen == g_settings_gen) return;   /* this exact paper is ready */
+    pthread_mutex_lock(&g_wlock);
+    if (g_job[o->idx].used || g_baking[o->idx] == g_settings_gen) {
+        pthread_mutex_unlock(&g_wlock);   /* already queued, or in flight */
+        return;
+    }
+    g_job[o->idx].used = 1;
+    g_job[o->idx].idx = o->idx;
+    g_job[o->idx].w = o->w;
+    g_job[o->idx].h = o->h;
+    g_job[o->idx].gen = g_settings_gen;
+    g_job[o->idx].s = g_s;
+    pthread_mutex_unlock(&g_wlock);
+    WorkerKick();
+}
+
+/* Frame callback: the frame that used the previous buffer set is on screen,
+ * which (with both release events) is the earliest safe moment to free. */
+static void FrameDone(void *data, struct wl_callback *cb, uint32_t t) {
+    struct OUT *o = data;
+    (void)t;
+    wl_callback_destroy(cb);
+    FlushRetired(o);
+}
+
+static const struct wl_callback_listener CbListener = { FrameDone };
+
+/* Copy a finished bake into the texture half and, when that half is the
+ * visible one, hand it to the compositor.  A hidden output gets its texture
+ * armed so the next show costs nothing. */
+static void PresentBake(struct OUT *o, const unsigned char *px) {
+    /* The copy is safe whenever the previous commit that handed this buffer
+     * out has come back released; if it has not, the compositor may still be
+     * scanning it, so the bake waits for the release event.  One frame of
+     * latency, never a torn or stolen buffer. */
+    if (!o->buf_released) {
+        L("output %d: texture half still in use by the compositor - "
+          "bake parked until its release arrives", o->idx);
+        return;                          /* caller re-queues on release */
+    }
+    memcpy(o->data, px, (size_t)o->w * o->h * 4);
+    o->baked_gen = g_settings_gen;
+    /* Only a commit hands the buffer to the compositor, so only a commit can
+     * owe a release.  Clearing the token while hidden would wait forever for
+     * an event that never comes and wedge every later bake. */
+    if (o->visible) {
+        struct wl_callback *cb;
+        o->buf_released = 0;             /* until the compositor returns it */
+        wl_surface_attach(o->sfc, o->buf, 0, 0);
+        if (g_comp_version >= 4)
+            wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
+        else
+            wl_surface_damage(o->sfc, 0, 0, o->lw, o->lh);
+        cb = wl_surface_frame(o->sfc);
+        wl_callback_add_listener(cb, &CbListener, o);
+        wl_surface_commit(o->sfc);
+    }
+}
+
+/* Empty input region: the compositor never routes pointer or keyboard
+ * events to us, everything falls through to the windows underneath. */
+static void ApplyClickThrough(struct OUT *o) {
+    struct wl_region *r = wl_compositor_create_region(g_comp);
+    wl_region_add(r, 0, 0, 0, 0);       /* zero-area: an empty region */
+    wl_surface_set_input_region(o->sfc, r);
+    wl_region_destroy(r);
+}
+
+static void LayerSurfaceInit(struct OUT *o);
+
+static void LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls,
+                           uint32_t serial, uint32_t w, uint32_t h) {
+    struct OUT *o = data;
+    (void)ls;
+    zwlr_layer_surface_v1_ack_configure(ls, serial);
+    o->configured = 1;
+    if ((int)w != o->lw || (int)h != o->lh || !o->buf) {
+        BufferResize(o, (int)w, (int)h, o->scale);
+        if (!o->buf) return;              /* allocation failed: stay bare */
+    }
+    /* Always leave the surface with SOMETHING attached: an unmapped layer
+     * surface gets no further configure from KWin and could never show
+     * again.  master decides which half; a missing bake is queued. */
+    AttachCurrentBuffer(o);
+    if (g_s.master && o->baked_gen != g_settings_gen) QueueBake(o);
+}
+
+static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
+    struct OUT *o = data;
+    (void)ls;
+    /* the layer surface object is dead per protocol: rebuild the whole
+     * surface stack on the same wl_output (unless the output itself left) */
+    L("output %d: layer surface closed by compositor, rebuilding", o->idx);
+    o->configured = 0;
+    o->visible = 0;
+    if (o->wl_gone) return;
+    if (o->ls) { zwlr_layer_surface_v1_destroy(o->ls); o->ls = NULL; }
+    if (o->sfc) { wl_surface_destroy(o->sfc); o->sfc = NULL; }
+    LayerSurfaceInit(o);
+}
+
+static const struct zwlr_layer_surface_v1_listener LayerListener = {
+    LayerConfigure, LayerClosed,
+};
+
+static void OutputGeometry(void *data, struct wl_output *wl, int32_t x, int32_t y,
+                           int32_t pw, int32_t ph, int32_t subpixel,
+                           const char *make, const char *model,
+                           int32_t transform) {
+    struct OUT *o = data;
+    (void)wl; (void)x; (void)y; (void)subpixel; (void)transform;
+    o->out_w = pw; o->out_h = ph;
+    snprintf(o->make, sizeof o->make, "%s", make ? make : "?");
+    snprintf(o->model, sizeof o->model, "%s", model ? model : "?");
+}
+
+static void OutputMode(void *data, struct wl_output *wl, uint32_t flags,
+                       int32_t w, int32_t h, int32_t refresh) {
+    struct OUT *o = data;
+    (void)wl; (void)refresh;
+    if (flags & WL_OUTPUT_MODE_CURRENT) { o->out_w = w; o->out_h = h; }
+}
+
+static void OutputDone(void *data, struct wl_output *wl) {
+    struct OUT *o = data;
+    (void)wl;
+    /* scale can change under us (display settings); keep the buffer in step */
+    if (o->configured && o->buf) {
+        BufferResize(o, o->lw, o->lh, o->scale);
+        if (o->buf) QueueBake(o);
+    }
+}
+
+static void OutputScale(void *data, struct wl_output *wl, int32_t scale) {
+    struct OUT *o = data;
+    (void)wl;
+    if (scale < 1) scale = 1;
+    o->scale = (int)scale;
+}
+
+static void OutputName(void *data, struct wl_output *wl, const char *name) {
+    (void)data; (void)wl; (void)name;
+}
+
+static void OutputDescription(void *data, struct wl_output *wl,
+                              const char *description) {
+    (void)data; (void)wl; (void)description;
+}
+
+static const struct wl_output_listener OutputListener = {
+    OutputGeometry, OutputMode, OutputDone, OutputScale, OutputName,
+    OutputDescription,
+};
+
+static void OutTeardown(struct OUT *o) {
+    if (!o) return;
+    if (o->ls) zwlr_layer_surface_v1_destroy(o->ls);
+    if (o->sfc) wl_surface_destroy(o->sfc);
+    if (o->wl) wl_output_destroy(o->wl);
+    /* the current set joins the retired list and is freed only if the
+     * compositor has released both halves; otherwise the process exit
+     * reclaims it (never unmap memory a live compositor may be reading) */
+    /* RetireSet owns the mapping from here on: it either frees it (when both
+     * halves are released) or leaves it parked for process exit.  Unmapping
+     * it again here would double-munmap a freed region. */
+    RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+              o->buf_released, o->hbuf_released);
+    FlushRetired(o);
+    pthread_mutex_lock(&g_wlock);
+    memset(&g_job[o->idx], 0, sizeof g_job[o->idx]);
+    g_baking[o->idx] = 0;
+    pthread_mutex_unlock(&g_wlock);
+    free(o);
+}
+
+/* build the wl_surface + layer surface for an existing OUT (used both by
+ * OutCreate and by the closed/rebuild path) */
+static void LayerSurfaceInit(struct OUT *o) {
+    o->sfc = wl_compositor_create_surface(g_comp);
+    ApplyClickThrough(o);
+    o->ls = zwlr_layer_shell_v1_get_layer_surface(g_shell, o->sfc, o->wl,
+                                                  ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+                                                  "mnpaper");
+    zwlr_layer_surface_v1_set_anchor(o->ls, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    zwlr_layer_surface_v1_set_exclusive_zone(o->ls, -1);   /* never shrink for panels */
+    zwlr_layer_surface_v1_set_keyboard_interactivity(o->ls,
+                                     ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    zwlr_layer_surface_v1_add_listener(o->ls, &LayerListener, o);
+    wl_surface_commit(o->sfc);          /* triggers the configure */
+}
+
+static void OutCreate(struct wl_output *wl, uint32_t name) {
+    struct OUT *o;
+    int slot = -1, i;
+
+    for (i = 0; i < MAX_MON; i++)
+        if (!g_ov[i]) { slot = i; break; }
+    if (slot < 0) {
+        L("output global %u dropped: %d outputs already covered (MAX_MON)", name, MAX_MON);
+        return;
+    }
+    o = calloc(1, sizeof *o);
+    if (!o) return;
+    o->idx = slot;
+    o->wl = wl;
+    o->global_name = name;
+    o->fd = -1;
+    o->scale = 1;
+    g_ov[slot] = o;
+    if (slot >= g_nov) g_nov = slot + 1;
+
+    wl_output_add_listener(wl, &OutputListener, o);
+
+    LayerSurfaceInit(o);
+    L("output %d: global %u surface requested (overlay layer)", slot, name);
+}
+
+static void RegistryGlobal(void *data, struct wl_registry *reg, uint32_t name,
+                           const char *iface, uint32_t version) {
+    (void)data;
+    if (strcmp(iface, wl_compositor_interface.name) == 0) {
+        g_comp_version = (int)version;
+        g_comp = wl_registry_bind(reg, name, &wl_compositor_interface,
+                                  version < 6 ? version : 6);
+    } else if (strcmp(iface, wl_shm_interface.name) == 0) {
+        g_shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    } else if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
+        g_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
+                                   version < 5 ? version : 5);
+    } else if (strcmp(iface, wl_output_interface.name) == 0) {
+        struct wl_output *wl = wl_registry_bind(reg, name, &wl_output_interface,
+                                                version < 4 ? version : 4);
+        if (wl) OutCreate(wl, name);
+    }
+}
+
+static void RegistryRemove(void *data, struct wl_registry *reg, uint32_t name) {
+    int i;
+    (void)data; (void)reg;
+    for (i = 0; i < MAX_MON; i++) {
+        struct OUT *o = g_ov[i];
+        if (o && o->global_name == name) {
+            L("output %d: gone (global %u)", i, name);
+            o->wl_gone = 1;
+            g_ov[i] = NULL;
+            OutTeardown(o);
+        }
+    }
+}
+
+static const struct wl_registry_listener RegistryListener = {
+    RegistryGlobal, RegistryRemove,
+};
+
+/* -------------------------------------------------- apply / state change --- */
+
+static void RepaintAll(void) {
+    int i;
+    for (i = 0; i < MAX_MON; i++) {
+        struct OUT *o = g_ov[i];
+        if (!o || !o->configured || !o->buf) continue;
+        if (g_s.master && !o->visible) AttachCurrentBuffer(o);   /* show */
+        else if (!g_s.master && o->visible) HideSurface(o);
+        /* bake regardless of visibility: a hidden output keeps its texture
+         * armed so showing it later costs no bake */
+        if (o->baked_gen != g_settings_gen) QueueBake(o);
+    }
+}
+
+/* e-ink is not implemented on Wayland (it needs screen capture this
+ * compositor path does not provide).  The mode is therefore NOT a state we
+ * can hold: reporting `mode eink` while painting paper made --status, the
+ * config file and the screen disagree permanently, because the refused value
+ * was still persisted.  Normalize here, at the single choke point every
+ * settings path funnels through, so no caller can leave mode=1 behind. */
+static int RequestMode(int mode) {
+    if (mode == MODE_EINK)
+        L("e-ink mode is not implemented on Wayland yet: it needs screen "
+          "capture and this compositor path is not built (staying in paper mode)");
+    g_s.mode = MODE_PAPER;
+    return mode != MODE_EINK;
+}
+
+static void ApplySettings(int save) {
+    static int last_tex[5];              /* texture fields at the last gen bump */
+    int i, dirty;
+    int tex[5] = { g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch };
+
+    ClampSettingsOf(&g_s);
+    /* refused modes are normalized to paper BEFORE the rest of the function
+     * (and before the config write) can observe them */
+    if (g_s.mode == MODE_EINK) RequestMode(MODE_EINK);
+
+    /* Only texture content invalidates the generation.  A toggle, share or
+     * tray change must NOT cost a re-bake (Windows behaves the same way:
+     * toggling only shows/hides the strips over the same DIB). */
+    dirty = memcmp(tex, last_tex, sizeof tex) != 0;
+    if (dirty) {
+        memcpy(last_tex, tex, sizeof tex);
+        g_settings_gen++;
+        pthread_mutex_lock(&g_wlock);
+        /* re-stamp queued jobs with the new generation and settings: one
+         * bake per change, never a stale one */
+        for (i = 0; i < MAX_MON; i++)
+            if (g_job[i].used) {
+                g_job[i].gen = g_settings_gen;
+                g_job[i].s = g_s;
+            }
+        pthread_mutex_unlock(&g_wlock);
+    }
+
+    ApplyAutostart();       /* idempotent; the .desktop file is the truth */
+    RepaintAll();
+    if (save && !ConfigWrite(&g_s))
+        L("warning: could not write settings to %s", ConfigPath() ? ConfigPath() : "(unset)");
+}
+
+/* --------------------------------------------------------------- commands -- */
+
+static void SetMaster(int on) {
+    if (g_s.master == on) return;
+    g_s.master = on;
+    ApplySettings(1);
+}
+
+static void SetMode(int mode) {
+    if (mode == MODE_EINK) {
+        RequestMode(MODE_EINK);
+        return;
+    }
+    if (g_s.mode == MODE_PAPER && g_s.master) return;
+    g_s.mode = MODE_PAPER;
+    g_s.master = 1;
+    ApplySettings(1);
+}
+
+/* --------------------------------------------------------------- ipc ------- */
+
+#define CMD_TOGGLE 1
+#define CMD_ON     2
+#define CMD_OFF    3
+#define CMD_PAPER  4
+#define CMD_EINK   5
+#define CMD_QUIT   6
+
+static const char *SockPath(void) {
+    static char path[200];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !*rt) return NULL;
+    snprintf(path, sizeof path, "%s/mnpaper.sock", rt);
+    return path;
+}
+
+static int SockStart(void) {
+    struct sockaddr_un addr;
+    const char *path = SockPath();
+    int fd;
+    if (!path) { L("XDG_RUNTIME_DIR is not set; cannot create the command socket"); return -1; }
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr)) {
+        if (errno != EADDRINUSE) { close(fd); return -1; }
+        /* in use: is a live instance serving on it, or is it stale? */
+        {
+            int c = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            int alive = 0;
+            if (c >= 0) {
+                alive = (connect(c, (struct sockaddr *)&addr, sizeof addr) == 0);
+                close(c);
+            }
+            if (alive) { close(fd); return -2; }
+            /* stale: nobody accepts on it - steal the path.  A second live
+             * instance racing us here is impossible in practice: it would
+             * have answered the probe above. */
+            unlink(path);
+            if (bind(fd, (struct sockaddr *)&addr, sizeof addr)) {
+                close(fd);
+                return -2;
+            }
+        }
+    }
+    if (listen(fd, 4)) { close(fd); return -1; }
+    return fd;
+}
+
+/* The one place the command flags live.  The CLI parser, the client-side
+ * request builder and the IPC command names all read this table, so a new
+ * command cannot be added to one and forgotten in the others. */
+#define CMD_SETTINGS 99     /* not an IPC command: answered locally */
+#define CMD_STATUS   98     /* not an IPC command: answered by StatusLine */
+
+static const struct { const char *flag, *proto; int cmd; } CMD_TABLE[] = {
+    { "--toggle",   "toggle",   CMD_TOGGLE   },
+    { "--on",       "on",       CMD_ON       },
+    { "--off",      "off",      CMD_OFF      },
+    { "--paper",    "paper",    CMD_PAPER    },
+    { "--eink",     "eink",     CMD_EINK     },
+    { "--settings", "settings", CMD_SETTINGS },
+    { "--quit",     "quit",     CMD_QUIT     },
+    { "--status",   "status",   CMD_STATUS   },
+};
+#define CMD_TABLE_N ((int)(sizeof CMD_TABLE / sizeof CMD_TABLE[0]))
+
+/* one connected client: parse lines, mutate state, answer text.  The fd is
+ * nonblocking; the client drops the connection after its request and we
+ * close ours when the reply is written or the peer goes away. */
+struct IPC {
+    int fd;
+    char buf[4096];
+    size_t len;
+    int sets;
+    SETTINGS pend;
+    int have_pend;
+};
+
+static void IpcSend(struct IPC *c, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        ssize_t ignored = write(c->fd, buf, (size_t)n);
+        (void)ignored;
+    }
+}
+
+static void StatusLine(struct IPC *c) {
+    int i, live = 0;
+    IpcSend(c, "version %s\n", APP_VERSION);
+    IpcSend(c, "master %d\n", g_s.master);
+    IpcSend(c, "mode %s\n", g_s.mode == MODE_PAPER ? "paper" : "eink");
+    IpcSend(c, "intensity %d\nwarmth %d\ngrain %d\nfibre %d\nblotch %d\n",
+            g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch);
+    IpcSend(c, "share %d\ntbmode %d\nautostart %d\nautoupd %d\n",
+            g_s.share, g_s.tbmode, g_s.autostart, g_s.autoupd);
+    for (i = 0; i < MAX_MON; i++) {
+        struct OUT *o = g_ov[i];
+        if (!o) continue;
+        live++;
+        IpcSend(c, "output %s %s %dx%d scale %d configured %d\n",
+                o->make, o->model, o->out_w, o->out_h, o->scale, o->configured);
+    }
+    IpcSend(c, "outputs %d\n", live);
+    IpcSend(c, ".\n");
+}
+
+static void IpcCommand(struct IPC *c, char *line) {
+    while (*line == ' ' || *line == '\t') line++;
+    if (!strcmp(line, "status")) { StatusLine(c); return; }
+    if (!strcmp(line, "quit")) {
+        IpcSend(c, "ok quit\n");
+        g_quit = 1;
+        return;
+    }
+    if (!strcmp(line, "toggle")) { SetMaster(!g_s.master); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "on"))     { SetMaster(1); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "off"))    { SetMaster(0); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "paper"))  { SetMode(MODE_PAPER); IpcSend(c, "ok mode paper\n"); return; }
+    if (!strcmp(line, "eink"))   {
+        if (!RequestMode(MODE_EINK)) { IpcSend(c, "err eink-not-implemented-on-wayland\n"); return; }
+        IpcSend(c, "ok mode eink\n");
+        return;
+    }
+    if (!strcmp(line, "settings")) {
+        IpcSend(c, "ok no-gui-on-wayland-yet\n");
+        L("settings GUI requested: not built for Wayland yet (edit %s or use --set)",
+          ConfigPath() ? ConfigPath() : "(unset)");
+        return;
+    }
+    if (!strncmp(line, "set ", 4)) {
+        if (!c->have_pend) { c->pend = g_s; c->have_pend = 1; }
+        if (SetKeyValue(&c->pend, line + 4)) c->sets++;
+        else IpcSend(c, "err bad-set %s\n", line + 4);
+        return;
+    }
+    if (!strcmp(line, "apply")) {
+        if (c->have_pend && c->sets) {
+            g_s = c->pend;
+            ApplySettings(1);           /* normalizes a refused mode=1 */
+            IpcSend(c, "ok applied %d\n", c->sets);
+        } else {
+            IpcSend(c, "ok nothing-to-apply\n");
+        }
+        return;
+    }
+    IpcSend(c, "err unknown %s\n", line);
+}
+
+static int IpcReadable(struct IPC *c) {   /* returns 0 when closed */
+    if (c->len >= sizeof c->buf - 1) { IpcSend(c, "err overflow\n"); goto bye; }
+    for (;;) {
+        ssize_t n = read(c->fd, c->buf + c->len, sizeof c->buf - 1 - c->len);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+            goto bye;
+        }
+        c->len += (size_t)n;
+        c->buf[c->len] = 0;
+        {
+            char *p = c->buf, *nl;
+            while ((nl = strchr(p, '\n'))) {
+                *nl = 0;
+                IpcCommand(c, p);
+                p = nl + 1;
+            }
+            memmove(c->buf, p, strlen(p) + 1);
+            c->len = strlen(c->buf);
+        }
+    }
+bye:
+    close(c->fd);
+    free(c);
+    return 0;
+}
+
+/* accept loop over the listen socket; each client gets its own IPC struct
+ * which the caller polls later */
+static struct IPC *g_ipc[64];
+
+static void SockAccept(void) {
+    for (;;) {
+        struct IPC *c;
+        int slot = -1, i;
+        int fd = accept4(g_sock_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (fd < 0) return;
+        for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]); i++)
+            if (!g_ipc[i]) { slot = i; break; }
+        if (slot < 0) { close(fd); return; }   /* table full: refuse politely */
+        c = calloc(1, sizeof *c);
+        if (!c) { close(fd); continue; }
+        c->fd = fd;
+        g_ipc[slot] = c;
+    }
+}
+
+/* client side: connect, send the command line as protocol lines, print the
+ * reply; returns 0 delivered, 2 nobody home */
+static int SendToRunning(int argc, char **argv) {
+    struct sockaddr_un addr;
+    const char *path = SockPath();
+    int fd, i, k;
+    char req[4096];
+    size_t len = 0;
+    if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 2;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr)) {
+        close(fd);
+        return 2;                            /* nobody is running */
+    }
+    for (i = 1; i < argc && len < sizeof req - 8; i++) {
+        int mapped = 0;
+        for (k = 0; k < CMD_TABLE_N; k++)
+            if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
+                len += (size_t)snprintf(req + len, sizeof req - len, "%s\n",
+                                        CMD_TABLE[k].proto);
+                mapped = 1;
+                break;
+            }
+        if (mapped) continue;
+        if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+            for (i++; i < argc && strchr(argv[i], '=') && len < sizeof req - 8; i++)
+                len += (size_t)snprintf(req + len, sizeof req - len, "set %s\napply\n", argv[i]);
+            i--;
+        }
+    }
+    if (len) {
+        ssize_t ignored = write(fd, req, len);
+        (void)ignored;
+        shutdown(fd, SHUT_WR);
+        for (;;) {
+            char rbuf[512];
+            ssize_t n = read(fd, rbuf, sizeof rbuf);
+            if (n <= 0) break;
+            fwrite(rbuf, 1, (size_t)n, stdout);
+            fflush(stdout);
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------- dump path --- */
+
+/* BMP with the exact layout of the Windows DumpBgra: 14-byte file header,
+ * 40-byte info header, bottom-up 24bpp rows padded to 4 bytes. */
+static int DumpBmp(const char *path, const unsigned char *bgra, int w, int h) {
+    int stride = ((w * 3 + 3) / 4) * 4;
+    unsigned char *row = calloc(1, (size_t)stride);
+    FILE *f = fopen(path, "wb");
+    unsigned char hdr[54];
+    uint32_t filesize = 54 + (uint32_t)stride * (uint32_t)h;
+    int x, y, ok = 1;
+    if (!row || !f) { free(row); if (f) fclose(f); return 0; }
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = (unsigned char)(filesize);       hdr[3] = (unsigned char)(filesize >> 8);
+    hdr[4] = (unsigned char)(filesize >> 16); hdr[5] = (unsigned char)(filesize >> 24);
+    hdr[10] = 54;                              /* bits offset */
+    hdr[14] = 40;                              /* info header size */
+    hdr[18] = (unsigned char)(w);  hdr[19] = (unsigned char)(w >> 8);
+    hdr[20] = (unsigned char)(w >> 16); hdr[21] = (unsigned char)(w >> 24);
+    hdr[22] = (unsigned char)(h);  hdr[23] = (unsigned char)(h >> 8);
+    hdr[24] = (unsigned char)(h >> 16); hdr[25] = (unsigned char)(h >> 24);
+    hdr[26] = 1;                               /* planes */
+    hdr[28] = 24;                              /* bpp */
+    fwrite(hdr, 1, sizeof hdr, f);
+    for (y = h - 1; y >= 0; y--) {
+        for (x = 0; x < w; x++) {
+            const unsigned char *s = bgra + 4 * ((size_t)y * w + x);
+            row[x * 3 + 0] = s[0];
+            row[x * 3 + 1] = s[1];
+            row[x * 3 + 2] = s[2];
+        }
+        if (fwrite(row, 1, (size_t)stride, f) != (size_t)stride) { ok = 0; break; }
+    }
+    fclose(f);
+    free(row);
+    return ok;
+}
+
+static void CompositeOver(unsigned char *bgra, int w, int h, int bg) {
+    int i;
+    for (i = 0; i < w * h; i++) {
+        unsigned char *p = bgra + 4 * (size_t)i;
+        int a = p[3];
+        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
+        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
+        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
+        p[3] = 255;
+    }
+}
+
+/* -------------------------------------------------- worker results pump --- */
+
+static void WorkerResultsReady(void) {
+    char drain[256];
+    while (read(g_pipe[0], drain, sizeof drain) > 0)
+        ;
+    for (;;) {
+        struct RESULT r;
+        struct OUT *o;
+        int stale = 1;
+        pthread_mutex_lock(&g_wlock);
+        if (!g_nresults) { pthread_mutex_unlock(&g_wlock); break; }
+        r = g_results[--g_nresults];
+        pthread_mutex_unlock(&g_wlock);
+        o = (r.idx >= 0 && r.idx < MAX_MON) ? g_ov[r.idx] : NULL;
+        if (o && o->configured && o->buf &&
+            r.gen == g_settings_gen && r.w == o->w && r.h == o->h) {
+            stale = 0;
+            PresentBake(o, r.px);
+            L("output %d: baked %dx%d in %.0f ms%s", r.idx, r.w, r.h,
+              r.build_ms, o->visible ? "" : " (hidden, armed)");
+        }
+        if (r.idx >= 0 && r.idx < MAX_MON) {
+            pthread_mutex_lock(&g_wlock);
+            g_baking[r.idx] = 0;         /* idle whatever happened above */
+            pthread_mutex_unlock(&g_wlock);
+        }
+        if (stale) {
+            /* A settings change or resize beat this bake.  Never a silent
+             * gap: re-queue deduped so the output converges. */
+            L("output %d: stale bake dropped (gen %d vs %d) - re-queued",
+              r.idx, r.gen, g_settings_gen);
+            if (o) QueueBake(o);
+        }
+        free(r.px);
+    }
+}
+
+/* ------------------------------------------------------------------ main --- */
+
+static void Usage(void) {
+    fprintf(stderr,
+        "mnpaper %s - a paper texture over your whole screen (Wayland)\n\n"
+        "  mnpaper                 run the overlay (foreground daemon)\n"
+        "  mnpaper --on|--off|--toggle\n"
+        "  mnpaper --paper|--eink  e-ink is refused on Wayland for now\n"
+        "  mnpaper --set k=v ...   intensity|warmth|grain|fibre|blotch|share|master|...\n"
+        "  mnpaper --status\n"
+        "  mnpaper --quit\n"
+        "  mnpaper --dump-tex out.bmp W H [bg]   headless texture render\n"
+        "  mnpaper --log FILE\n",
+        APP_VERSION);
+}
+
+int main(int argc, char **argv) {
+    int i;
+    int cmd = 0;
+    char *sets[64];
+    int nsets = 0;
+    char dump_tex[512] = "";
+    int dump_w = 960, dump_h = 600, dump_bg = 235;
+
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--log") && i + 1 < argc) {
+            g_log = fopen(argv[++i], "a");
+            L("=== mnpaper (wayland) start ===");
+        } else if (!strcmp(argv[i], "--dump-tex") && i + 3 < argc) {
+            snprintf(dump_tex, sizeof dump_tex, "%s", argv[++i]);
+            dump_w = atoi(argv[++i]);
+            dump_h = atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') dump_bg = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+            while (i + 1 < argc && strchr(argv[i + 1], '=') && nsets < 64)
+                sets[nsets++] = argv[++i];
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            Usage();
+            return 0;
+        } else {
+            int k, mapped = 0;
+            for (k = 0; k < CMD_TABLE_N; k++)
+                if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
+                    cmd = CMD_TABLE[k].cmd;
+                    mapped = 1;
+                    break;
+                }
+            if (!mapped) L("ignoring unknown argument: %s", argv[i]);
+        }
+    }
+
+    /* ---- headless texture dump: no display, no compositor ---- */
+    if (dump_tex[0]) {
+        unsigned char *px;
+        LoadSettings();
+        if (nsets) {
+            int k;
+            for (k = 0; k < nsets; k++)
+                if (!SetKeyValue(&g_s, sets[k]))
+                    L("ignoring unknown or malformed --set entry: %s", sets[k]);
+            ClampSettingsOf(&g_s);
+        }
+        if (dump_w <= 0 || dump_h <= 0 || dump_w > 16384 || dump_h > 16384) {
+            L("dump size out of range: %dx%d", dump_w, dump_h);
+            return 2;
+        }
+        px = malloc((size_t)dump_w * dump_h * 4);
+        if (!px) { L("out of memory"); return 2; }
+        BuildPaperFull(px, dump_w, dump_h, &g_s, NULL);
+        CompositeOver(px, dump_w, dump_h, dump_bg);
+        if (!DumpBmp(dump_tex, px, dump_w, dump_h)) L("dump write failed: %s", dump_tex);
+        else L("dump: %s (%dx%d, bg %d, mode %s)", dump_tex, dump_w, dump_h, dump_bg,
+               "paper");   /* e-ink is not implemented; never claim otherwise */
+        free(px);
+        return 0;
+    }
+
+    /* ---- command a running instance, or fall through and start ---- */
+    if (cmd || nsets) {
+        int rc = SendToRunning(argc, argv);
+        if (rc == 0) return 0;
+        if (cmd && !(nsets || cmd == CMD_ON)) {
+            /* a bare command with nobody to hear it is a dropped command
+             * (the Windows build exits 2 in exactly the same case) */
+            L("no running mnpaper instance; start one with: mnpaper");
+            return 2;
+        }
+    }
+
+    LoadSettings();
+    if (nsets) {
+        int k;
+        for (k = 0; k < nsets; k++)
+            if (!SetKeyValue(&g_s, sets[k]))
+                L("ignoring unknown or malformed --set entry: %s", sets[k]);
+        ClampSettingsOf(&g_s);
+    }
+
+    /* ---- become the daemon ---- */
+    /* At login the autostart entry can fire before the compositor's socket
+     * exists.  Without this retry the texture would silently never appear
+     * and there would be nothing running to ask.  Bounded: ~20 s, then the
+     * honest error below.  A human-started run usually connects on the
+     * first try and pays nothing. */
+    {
+        int tries;
+        for (tries = 0; !(g_dpy = wl_display_connect(NULL)) && tries < 40; tries++) {
+            if (!tries)
+                L("compositor not reachable yet - waiting (autostart race)");
+            struct timespec ts = { 0, 500 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    if (!g_dpy) {
+        L("cannot connect to a Wayland compositor (is WAYLAND_DISPLAY set?)");
+        return 1;
+    }
+    g_reg = wl_display_get_registry(g_dpy);
+    wl_registry_add_listener(g_reg, &RegistryListener, NULL);
+    wl_display_roundtrip(g_dpy);
+    if (!g_comp || !g_shm) {
+        L("compositor is missing %s - nothing to draw with",
+          !g_comp ? "wl_compositor" : "wl_shm");
+        return 1;
+    }
+    if (!g_shell) {
+        L("compositor does not advertise zwlr_layer_shell_v1: an overlay over "
+          "your windows is impossible there (KWin, sway, Hyprland and other "
+          "wlroots compositors work; GNOME/Mutter does not)");
+        return 1;
+    }
+    wl_display_roundtrip(g_dpy);            /* outputs finish their geometry */
+    if (!g_nov) {
+        L("no outputs found - nothing to cover");
+        return 1;
+    }
+
+    if (pipe2(g_pipe, O_CLOEXEC | O_NONBLOCK)) {
+        L("pipe failed");
+        return 1;
+    }
+
+    /* ---- command socket: claim it after the display is up, so a command
+     * sent to us in the first milliseconds finds a live instance ---- */
+    {
+        int sfd = SockStart();
+        if (sfd == -2) {
+            L("another mnpaper instance is already serving %s", SockPath());
+            return 2;
+        }
+        g_sock_fd = sfd;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+    /* SIGINT/SIGTERM through a signalfd: no async handler, the poll loop
+     * below wakes up like any other fd and we exit cleanly */
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGTERM);
+        sigprocmask(SIG_BLOCK, &mask, NULL);
+        g_sig_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+        if (g_sig_fd < 0) {
+            L("signalfd failed");
+            return 1;
+        }
+    }
+
+    ApplySettings(1);   /* stamps every queued job with the final generation */
+
+    /* worker starts last: any job queued by an early configure is baked at
+     * the current generation, so startup costs exactly one bake per output */
+    g_worker_on = (pthread_create(&g_worker, NULL, WorkerMain, NULL) == 0);
+    if (!g_worker_on) {
+        L("could not start the bake worker");
+        return 1;
+    }
+
+    L("mnpaper %s ready: master=%d mode=%s outputs=%d", APP_VERSION,
+      g_s.master, g_s.mode == MODE_PAPER ? "paper" : "eink", g_nov);
+
+    /* ---- main loop: one poll over the display, the worker pipe, the
+     * command socket and its clients, and the signalfd.  The display side
+     * uses the prepare-read/flush dance so a busy queue can never starve
+     * the other fds (the pattern wl_client docs recommend for clients). */
+    while (!g_quit) {
+        struct pollfd pfd[3 + 64];
+        int n = 0, widx, pipeidx, sigidx, sockidx;
+        int pr, rc;
+        int i;
+
+        /* prepare_read fails only while events are already queued: drain them
+         * and retry.  Bail out on a real error - retrying a dead display
+         * would spin forever.  Whatever happens, we leave this loop with the
+         * display in exactly one of two states: prepared, or not prepared at
+         * all (a failed dispatch_pending left nothing prepared, so no cancel
+         * is owed).  Mixing the two is a protocol error, so the loop never
+         * exits "prepared but unaccounted". */
+        pr = -1;
+        while (pr != 0) {
+            pr = wl_display_prepare_read(g_dpy);
+            if (pr == 0) break;
+            if (wl_display_dispatch_pending(g_dpy) < 0) {
+                if (errno != EINTR) {
+                    L("wayland dispatch failed (errno %d) - exiting", errno);
+                    g_quit = 1;
+                }
+                break;                   /* nothing prepared: no cancel owed */
+            }
+            if (g_quit) break;           /* not prepared here either */
+        }
+        if (pr != 0) break;              /* nothing prepared: leave the loop */
+        wl_display_flush(g_dpy);
+
+        widx = n;   pfd[n].fd = wl_display_get_fd(g_dpy);
+        pfd[n].events = POLLIN; pfd[n++].revents = 0;
+        pipeidx = n; pfd[n].fd = g_pipe[0];
+        pfd[n].events = POLLIN; pfd[n++].revents = 0;
+        sigidx = n; pfd[n].fd = g_sig_fd;
+        pfd[n].events = POLLIN; pfd[n++].revents = 0;
+        sockidx = -1;
+        if (g_sock_fd >= 0) {
+            sockidx = n; pfd[n].fd = g_sock_fd;
+            pfd[n].events = POLLIN; pfd[n++].revents = 0;
+        }
+        for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]) && n < (int)(sizeof pfd / sizeof pfd[0]); i++)
+            if (g_ipc[i]) {
+                pfd[n].fd = g_ipc[i]->fd;
+                pfd[n].events = POLLIN;
+                pfd[n++].revents = 0;
+            }
+
+        rc = poll(pfd, (nfds_t)n, -1);
+        if (rc < 0 && errno != EINTR) {
+            wl_display_cancel_read(g_dpy);
+            L("poll failed (errno %d) - exiting", errno);
+            break;
+        }
+        if (pfd[widx].revents & POLLIN) {
+            if (wl_display_read_events(g_dpy) < 0 && errno != EINTR) {
+                L("wayland read failed (errno %d) - exiting", errno);
+                g_quit = 1;
+            }
+            if (wl_display_dispatch_pending(g_dpy) < 0 && errno != EINTR) {
+                L("wayland dispatch failed (errno %d) - exiting", errno);
+                g_quit = 1;
+            }
+        } else {
+            wl_display_cancel_read(g_dpy);
+        }
+
+        if (pfd[pipeidx].revents & POLLIN) WorkerResultsReady();
+        if (pfd[sigidx].revents & POLLIN) {
+            struct signalfd_siginfo si;
+            while (read(g_sig_fd, &si, sizeof si) == sizeof si)
+                L("signal %u: shutting down", si.ssi_signo);
+            g_quit = 1;
+        }
+        if (sockidx >= 0 && (pfd[sockidx].revents & POLLIN)) SockAccept();
+        {
+            int base = sockidx >= 0 ? sockidx + 1 : 3;
+            int k = base;
+            for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]); i++) {
+                if (!g_ipc[i]) continue;
+                if (k < n && (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)))
+                    if (!IpcReadable(g_ipc[i])) {
+                        g_ipc[i] = NULL;   /* freed inside IpcReadable */
+                    }
+                k++;
+            }
+        }
+    }
+
+    L("shutting down");
+    WorkerStop();
+    for (i = 0; i < MAX_MON; i++) {
+        if (g_ov[i]) { OutTeardown(g_ov[i]); g_ov[i] = NULL; }
+    }
+    ConfigWrite(&g_s);
+    if (g_dpy) wl_display_disconnect(g_dpy);
+    if (g_sock_fd >= 0) close(g_sock_fd);
+    if (g_sig_fd >= 0) close(g_sig_fd);
+    {
+        const char *path = SockPath();
+        if (path) unlink(path);
+    }
+    if (g_log) fclose(g_log);
+    return 0;
+}

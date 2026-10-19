@@ -11,6 +11,10 @@ samples/
 AGENTS.md
 probes/
 docs/reviews/
+# linux/ (Wayland port) build output
+linux/mnpaper
+linux/tests/test_core
+linux/*.o
 # tests/ as a whole used to hide every NEW suite from git status and from
 # `git add tests/` (2026-10-04 review); the global patterns above already
 # cover tests build artefacts, so only the one internal file needs naming.
