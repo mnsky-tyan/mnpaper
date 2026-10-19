@@ -287,16 +287,12 @@ static int ApplyAutostart(void) {
         return 1;
     }
     /* disabling: remove only an entry that names this executable */
-    if (access(path, F_OK) == 0) {
-        if (AutostartEntryIsOurs(path, exe)) {
-            if (unlink(path)) {
-                L("autostart: cannot remove %s (errno %d)", path, errno);
-                return 0;
-            }
-            L("autostart: disabled (%s removed)", path);
-        } else {
-            L("autostart: %s belongs to another copy - left alone", path);
+    if (access(path, F_OK) == 0 && AutostartEntryIsOurs(path, exe)) {
+        if (unlink(path)) {
+            L("autostart: cannot remove %s (errno %d)", path, errno);
+            return 0;
         }
+        L("autostart: disabled (%s removed)", path);
     }
     return 1;
 }
@@ -755,7 +751,7 @@ static void LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls,
      * surface gets no further configure from KWin and could never show
      * again.  master decides which half; a missing bake is queued. */
     AttachCurrentBuffer(o);
-    if (g_s.master && o->baked_gen != g_settings_gen) QueueBake(o);
+    if (o->baked_gen != g_settings_gen) QueueBake(o);
 }
 
 static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
@@ -1067,12 +1063,19 @@ static int SockStart(void) {
     int fd;
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot create the command socket"); return -1; }
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        L("command socket: socket() failed (errno %d)", errno);
+        return -1;
+    }
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr)) {
-        if (errno != EADDRINUSE) { close(fd); return -1; }
+        if (errno != EADDRINUSE) {
+            L("command socket: cannot bind %s (errno %d)", path, errno);
+            close(fd);
+            return -1;
+        }
         /* in use: is a live instance serving on it, or is it stale? */
         {
             int c = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1092,7 +1095,11 @@ static int SockStart(void) {
             }
         }
     }
-    if (listen(fd, 4)) { close(fd); return -1; }
+    if (listen(fd, 4)) {
+        L("command socket: listen failed (errno %d)", errno);
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -1132,8 +1139,11 @@ static void IpcSend(struct IPC *c, const char *fmt, ...) {
     n = vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (n > 0) {
-        ssize_t ignored = write(c->fd, buf, (size_t)n);
-        (void)ignored;
+        if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+        {
+            ssize_t ignored = write(c->fd, buf, (size_t)n);
+            (void)ignored;
+        }
     }
 }
 
@@ -1269,21 +1279,34 @@ static int SendToRunning(int argc, char **argv) {
                     continue;
                 }
                 if (i + 1 < argc && strchr(argv[i + 1], '=') && len < sizeof req - 8) {
+                    int n;
                     i++;
-                    len += (size_t)snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
+                    n = snprintf(req + len, sizeof req - len, "set %s\n", argv[i]);
+                    if (n < 0) break;
+                    if ((size_t)n >= sizeof req - len) { len = sizeof req - 1; break; }
+                    len += (size_t)n;
                     sent++;
                     continue;
                 }
                 break;
             }
-            if (sent && len < sizeof req - 8)
-                len += (size_t)snprintf(req + len, sizeof req - len, "apply\n");
+            if (sent && len < sizeof req - 8) {
+                int n = snprintf(req + len, sizeof req - len, "apply\n");
+                if (n > 0) {
+                    if ((size_t)n >= sizeof req - len) len = sizeof req - 1;
+                    else len += (size_t)n;
+                }
+            }
             continue;
         }
         for (k = 0; k < CMD_TABLE_N; k++)
             if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
-                len += (size_t)snprintf(req + len, sizeof req - len, "%s\n",
-                                        CMD_TABLE[k].proto);
+                int n = snprintf(req + len, sizeof req - len, "%s\n",
+                                 CMD_TABLE[k].proto);
+                if (n > 0) {
+                    if ((size_t)n >= sizeof req - len) len = sizeof req - 1;
+                    else len += (size_t)n;
+                }
                 break;
             }
     }
@@ -1546,6 +1569,8 @@ int main(int argc, char **argv) {
             L("another mnpaper instance is already serving %s", SockPath());
             return 2;
         }
+        if (sfd < 0)
+            L("warning: no command socket - the overlay runs, but --on/--off/--set/--status cannot reach it");
         g_sock_fd = sfd;
     }
 

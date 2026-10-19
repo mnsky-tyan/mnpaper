@@ -168,7 +168,7 @@ needs no wayland-protocols package. `xdg-shell` is linked because
 
 `make test` runs the headless suite: defaults, clamping, `--set` grammar,
 determinism, premultiplied-alpha validity, odd sizes, cancellation, and
-preview-vs-full character. It mirrors the spirit of the Windows hidden
+e-ink normalization. It mirrors the spirit of the Windows hidden
 suites for the parts this port ships.
 
 Live checks that found real bugs during the port (worth re-running after
