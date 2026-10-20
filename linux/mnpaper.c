@@ -80,6 +80,11 @@
  * texture at all - same cap and same policy as mnPaper.c's MAX_MON. */
 #define MAX_MON 16
 
+/* Which half of an output's buffer set its surface currently shows. */
+#define HALF_NONE  0        /* nothing attached yet */
+#define HALF_TEX   1        /* the texture half */
+#define HALF_CLEAR 2        /* the transparent half */
+
 /* One --set batch bound, shared by the fresh-start path and the client
  * request builder, so the same command line behaves the same whether or not
  * an instance is already running. */
@@ -240,6 +245,23 @@ static int AutostartEntryIsOurs(const char *file, const char *exe) {
     return ours;
 }
 
+/* Quote a path for the Exec value of a desktop entry.  The spec splits the
+ * value on whitespace, so an unquoted path with a space would be exec'd as
+ * two words; inside double quotes it reserves ", `, $ and \, and a literal
+ * percent sign is written as %%. */
+static void DesktopQuote(const char *s, char *out, size_t outsz) {
+    size_t o = 0;
+    if (outsz < 4) { if (outsz) out[0] = 0; return; }
+    out[o++] = '"';
+    for (; *s && o + 3 < outsz; s++) {
+        if (*s == '%') { out[o++] = '%'; out[o++] = '%'; continue; }
+        if (*s == '"' || *s == '`' || *s == '$' || *s == '\\') out[o++] = '\\';
+        out[o++] = *s;
+    }
+    out[o++] = '"';
+    out[o] = 0;
+}
+
 /* Apply the requested autostart state to the desktop entry.
  * Returns 1 when the on-disk truth matches the request. */
 static int ApplyAutostart(void) {
@@ -252,6 +274,7 @@ static int ApplyAutostart(void) {
     }
     if (g_s.autostart) {
         char dir[600], tmp[700];
+        char quoted[8300];
         FILE *f;
         /* already enabled and ours: nothing to write, nothing to log.  This
          * runs on every settings change, so an unconditional rewrite spammed
@@ -272,6 +295,7 @@ static int ApplyAutostart(void) {
             L("autostart: cannot write %s (errno %d)", tmp, errno);
             return 0;
         }
+        DesktopQuote(exe, quoted, sizeof quoted);
         fprintf(f,
             "[Desktop Entry]\n"
             "Type=Application\n"
@@ -283,7 +307,7 @@ static int ApplyAutostart(void) {
             "X-GNOME-Autostart-enabled=true\n"
             "X-KDE-autostart-enabled=true\n"
             "X-Mnpaper-Exe=%s\n",
-            exe, exe);
+            quoted, exe);
         if (fclose(f) || rename(tmp, path)) {
             unlink(tmp);
             L("autostart: could not install %s (errno %d)", path, errno);
@@ -477,12 +501,13 @@ struct OUT {
     int lw, lh;                         /* logical size from configure */
     int w, h, scale;                    /* buffer size = logical * scale */
     int configured;
-    /* Layer-shell mapping state.  visible = the texture half is the one
-     * currently attached.  The surface itself is NEVER unmapped: KWin sends
-     * no further configure for an unmapped layer surface, so a remap would
-     * never be licensed (this cost two live sessions to find).  Hiding is a
-     * swap to the transparent half, which keeps the surface mapped. */
-    int visible;
+    /* Layer-shell mapping state.  attached = which half the surface
+     * currently shows (HALF_NONE until the first attach).  The surface
+     * itself is NEVER unmapped: KWin sends no further configure for an
+     * unmapped layer surface, so a remap would never be licensed (this cost
+     * two live sessions to find).  Hiding is a swap to the transparent half,
+     * which keeps the surface mapped. */
+    int attached;
     int baked_gen;                      /* generation the texture half holds, 0 = none */
     /* Buffer state: ONE shm pool holding TWO buffers over ONE mapping -
      * [ texture | transparent ].  Hiding never unmaps the surface: KWin
@@ -496,8 +521,9 @@ struct OUT {
     struct wl_shm_pool *pool;
     struct wl_buffer *buf;              /* texture  */
     struct wl_buffer *hbuf;             /* transparent */
-    int buf_released, hbuf_released;    /* wl_buffer.release seen; both start
-                                         * released because they are new */
+    int buf_pending, hbuf_pending;      /* commits the compositor still owns:
+                                         * a half may be handed out again only
+                                         * when its count is back to zero */
     struct wl_callback *frame_cb;       /* the one frame callback in flight,
                                          * or NULL.  Its listener data is this
                                          * OUT, so the OUT is freed only after
@@ -509,7 +535,9 @@ struct OUT {
                                          * compositor released its last
                                          * buffer set (the buffers' listener
                                          * data points here) */
-    /* wl_output state */
+    /* wl_output state: the resolution in PIXELS comes from the current
+     * mode; the geometry event's physical size is in MILLIMETRES and is not
+     * a resolution, so it is not stored here */
     int out_w, out_h;
     char make[64], model[64];
 };
@@ -565,28 +593,30 @@ static int RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbu
 static void QueueBake(struct OUT *o);
 static void BufferRelease(void *data, struct wl_buffer *buf);
 static void CancelFrame(struct OUT *o);
+static void AttachCurrentBuffer(struct OUT *o);
 
 static const struct wl_buffer_listener BufferListener = { BufferRelease };
 
 /* wl_shm: the compositor owns the pixels from the commit that handed a
- * buffer out until this event.  buf_released gates the next write into the
- * texture half, and a bake that had to wait for it is re-queued here. */
+ * buffer out until this event.  The pending counters gate the next write
+ * into a half and the next attach of it, and a bake that had to wait for a
+ * release is re-queued here. */
 static void BufferRelease(void *data, struct wl_buffer *buf) {
     struct OUT *o = data;
     int i;
     if (buf == o->buf) {
-        o->buf_released = 1;
+        if (o->buf_pending > 0) o->buf_pending--;
         if (o->baked_gen != g_settings_gen) QueueBake(o);
-        return;
+    } else if (buf == o->hbuf) {
+        if (o->hbuf_pending > 0) o->hbuf_pending--;
+    } else {
+        for (i = 0; i < o->nretired; i++) {
+            if (o->retired[i].buf == buf) { o->retired[i].rel_buf = 1; break; }
+            if (o->retired[i].hbuf == buf) { o->retired[i].rel_hbuf = 1; break; }
+        }
     }
-    if (buf == o->hbuf) {
-        o->hbuf_released = 1;
-        return;
-    }
-    for (i = 0; i < o->nretired; i++) {
-        if (o->retired[i].buf == buf) { o->retired[i].rel_buf = 1; break; }
-        if (o->retired[i].hbuf == buf) { o->retired[i].rel_hbuf = 1; break; }
-    }
+    /* the half that came back may be the one master wants right now */
+    AttachCurrentBuffer(o);
     /* A torn-down output has no surface left to deliver the frame callback
      * that normally proves a frame elapsed, so its release events are the
      * only remaining signal - and the event that frees the OUT itself. */
@@ -630,7 +660,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     /* the whole old set (both halves share one mapping) is retired together */
     FlushRetired(o);
     if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-                   o->buf_released, o->hbuf_released)) {
+                   o->buf_pending ? 0 : 1, o->hbuf_pending ? 0 : 1)) {
         if (o->buf) wl_buffer_destroy(o->buf);
         if (o->hbuf) wl_buffer_destroy(o->hbuf);
         if (o->pool) wl_shm_pool_destroy(o->pool);
@@ -639,7 +669,8 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     o->data = data;
     o->map_bytes = bytes * 2;
     o->pool = pool; o->buf = buf; o->hbuf = hbuf;
-    o->buf_released = o->hbuf_released = 1;   /* new buffers: never busy */
+    o->buf_pending = o->hbuf_pending = 0;   /* new buffers: never busy */
+    o->attached = HALF_NONE;                /* the old half is retired */
     o->lw = lw; o->lh = lh;
     o->w = lw * scale; o->h = lh * scale; o->scale = scale;
     o->baked_gen = 0;                   /* a fresh texture half holds nothing */
@@ -648,28 +679,31 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
         wl_surface_set_buffer_scale(o->sfc, scale);
 }
 
-/* Attach whichever half master asks for, right now.  The surface stays
- * MAPPED in both cases (see the buffer-state comment). */
+/* Make the surface show the half master asks for, right now.  The surface
+ * stays MAPPED in both cases (see the buffer-state comment).
+ *
+ * A half the compositor still owns may not be handed out again: the
+ * protocol allows reuse only after wl_buffer.release.  The swap therefore
+ * waits for that event, which retries it.  A half that is already attached
+ * is left alone: attaching it again would be a second commit of a buffer
+ * the compositor may still be reading. */
 static void AttachCurrentBuffer(struct OUT *o) {
-    struct wl_buffer *want;
+    int want = g_s.master ? HALF_TEX : HALF_CLEAR;
+    struct wl_buffer *buf;
+    int *pending;
     if (!o->buf || !o->configured) return;
-    want = g_s.master ? o->buf : o->hbuf;
-    o->visible = g_s.master;
-    /* attaching the texture half hands it to the compositor: it is busy
-     * until the release event, exactly like a bake commit */
-    if (g_s.master) o->buf_released = 0;
-    else o->hbuf_released = 0;
-    wl_surface_attach(o->sfc, want, 0, 0);
+    if (o->attached == want) return;          /* already showing it */
+    buf = want == HALF_TEX ? o->buf : o->hbuf;
+    pending = want == HALF_TEX ? &o->buf_pending : &o->hbuf_pending;
+    if (*pending > 0) return;                 /* still owned: retry on release */
+    o->attached = want;
+    (*pending)++;
+    wl_surface_attach(o->sfc, buf, 0, 0);
     if (g_comp_version >= 4)
         wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
     else
         wl_surface_damage(o->sfc, 0, 0, o->lw, o->lh);
     wl_surface_commit(o->sfc);
-}
-
-static void HideSurface(struct OUT *o) {
-    if (!o->buf || !o->configured || !o->visible) return;
-    AttachCurrentBuffer(o);              /* master is 0 here: transparent half */
 }
 
 /* Queue one bake for this output's current buffer geometry (deduped). */
@@ -715,7 +749,7 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
      * out has come back released; if it has not, the compositor may still be
      * scanning it, so the bake waits for the release event.  One frame of
      * latency, never a torn or stolen buffer. */
-    if (!o->buf_released) {
+    if (o->buf_pending > 0) {
         L("output %d: texture half still in use by the compositor - "
           "bake parked until its release arrives", o->idx);
         return;                          /* caller re-queues on release */
@@ -725,8 +759,8 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
     /* Only a commit hands the buffer to the compositor, so only a commit can
      * owe a release.  Clearing the token while hidden would wait forever for
      * an event that never comes and wedge every later bake. */
-    if (o->visible) {
-        o->buf_released = 0;             /* until the compositor returns it */
+    if (o->attached == HALF_TEX) {
+        o->buf_pending++;                /* until the compositor returns it */
         wl_surface_attach(o->sfc, o->buf, 0, 0);
         if (g_comp_version >= 4)
             wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
@@ -778,7 +812,7 @@ static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
      * surface stack on the same wl_output (unless the output itself left) */
     L("output %d: layer surface closed by compositor, rebuilding", o->idx);
     o->configured = 0;
-    o->visible = 0;
+    o->attached = HALF_NONE;
     CancelFrame(o);              /* the destroyed surface never delivers done */
     if (o->wl_gone) return;
     if (o->ls) { zwlr_layer_surface_v1_destroy(o->ls); o->ls = NULL; }
@@ -795,8 +829,7 @@ static void OutputGeometry(void *data, struct wl_output *wl, int32_t x, int32_t 
                            const char *make, const char *model,
                            int32_t transform) {
     struct OUT *o = data;
-    (void)wl; (void)x; (void)y; (void)subpixel; (void)transform;
-    o->out_w = pw; o->out_h = ph;
+    (void)wl; (void)x; (void)y; (void)pw; (void)ph; (void)subpixel; (void)transform;
     snprintf(o->make, sizeof o->make, "%s", make ? make : "?");
     snprintf(o->model, sizeof o->model, "%s", model ? model : "?");
 }
@@ -859,7 +892,7 @@ static void OutTeardown(struct OUT *o) {
      * listener data points here. */
     FlushRetired(o);
     if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-                   o->buf_released, o->hbuf_released)) {
+                   o->buf_pending ? 0 : 1, o->hbuf_pending ? 0 : 1)) {
         if (o->buf) wl_buffer_destroy(o->buf);
         if (o->hbuf) wl_buffer_destroy(o->hbuf);
         if (o->pool) wl_shm_pool_destroy(o->pool);
@@ -869,7 +902,7 @@ static void OutTeardown(struct OUT *o) {
     o->data = NULL;
     o->fd = -1;
     o->configured = 0;
-    o->visible = 0;
+    o->attached = HALF_NONE;
     o->baked_gen = 0;
     pthread_mutex_lock(&g_wlock);
     memset(&g_job[o->idx], 0, sizeof g_job[o->idx]);
@@ -982,8 +1015,7 @@ static void RepaintAll(void) {
     for (i = 0; i < MAX_MON; i++) {
         struct OUT *o = g_ov[i];
         if (!o || !o->configured || !o->buf) continue;
-        if (g_s.master && !o->visible) AttachCurrentBuffer(o);   /* show */
-        else if (!g_s.master && o->visible) HideSurface(o);
+        AttachCurrentBuffer(o);             /* show or hide: the wanted half */
         /* bake regardless of visibility: a hidden output keeps its texture
          * armed so showing it later costs no bake */
         if (o->baked_gen != g_settings_gen) QueueBake(o);
@@ -1007,12 +1039,18 @@ static int RequestMode(int mode) {
 static void ApplySettings(int save) {
     static int last_tex[5];              /* texture fields at the last gen bump */
     int i, dirty;
-    int tex[5] = { g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch };
+    int tex[5];
 
     ClampSettingsOf(&g_s);
     /* refused modes are normalized to paper BEFORE the rest of the function
      * (and before the config write) can observe them */
     RequestMode(g_s.mode);
+
+    /* The comparison is between EFFECTIVE values: a clamped request (say
+     * warmth=150) must not look like a change, or it would buy a re-bake of
+     * a byte-identical texture. */
+    tex[0] = g_s.intensity; tex[1] = g_s.warmth; tex[2] = g_s.grain;
+    tex[3] = g_s.fibre; tex[4] = g_s.blotch;
 
     /* Only texture content invalidates the generation.  A toggle, share or
      * tray change must NOT cost a re-bake (Windows behaves the same way:
@@ -1136,16 +1174,23 @@ static const struct { const char *flag, *proto; int cmd; } CMD_TABLE[] = {
 };
 #define CMD_TABLE_N ((int)(sizeof CMD_TABLE / sizeof CMD_TABLE[0]))
 
+/* One staged key/value pair of an IPC batch.  A key is at most 63 chars and
+ * a value has to fit an int, so a pair never comes near this bound. */
+#define STAGE_MAX 96
+
 /* one connected client: parse lines, mutate state, answer text.  The fd is
  * nonblocking; the client drops the connection after its request and we
- * close ours when the reply is written or the peer goes away. */
+ * close ours when the reply is written or the peer goes away.
+ *
+ * A batch stages the pairs it was given; 'apply' writes exactly those keys
+ * onto the settings as they are at that moment, so a change another client
+ * made in between is not reverted. */
 struct IPC {
     int fd;
     char buf[4096];
     size_t len;
     int sets;
-    SETTINGS pend;
-    int have_pend;
+    char staged[MAX_SETS][STAGE_MAX];
 };
 
 static void IpcSend(struct IPC *c, const char *fmt, ...) {
@@ -1205,21 +1250,39 @@ static void IpcCommand(struct IPC *c, char *line) {
         return;
     }
     if (!strncmp(line, "set ", 4)) {
-        if (!c->have_pend) { c->pend = g_s; c->have_pend = 1; }
-        if (SetKeyValue(&c->pend, line + 4)) c->sets++;
-        else IpcSend(c, "err bad-set %s\n", line + 4);
+        const char *kv = line + 4;
+        SETTINGS probe = g_s;
+        if (c->sets >= MAX_SETS) {
+            IpcSend(c, "err too-many-sets\n");
+            return;
+        }
+        if (strlen(kv) >= STAGE_MAX) {
+            IpcSend(c, "err bad-set %s\n", kv);
+            return;
+        }
+        /* the grammar is the settings core's: an unknown key or a malformed
+         * value is refused here, not silently applied */
+        if (!SetKeyValue(&probe, kv)) {
+            IpcSend(c, "err bad-set %s\n", kv);
+            return;
+        }
+        memcpy(c->staged[c->sets], kv, strlen(kv) + 1);
+        c->sets++;
         return;
     }
     if (!strcmp(line, "apply")) {
-        if (c->have_pend && c->sets) {
-            g_s = c->pend;
+        if (c->sets) {
+            int k;
+            /* only the staged keys are written: every other field keeps the
+             * value it has right now, not the one the batch started from */
+            for (k = 0; k < c->sets; k++)
+                SetKeyValue(&g_s, c->staged[k]);
             ApplySettings(1);           /* normalizes a refused mode=1 */
             IpcSend(c, "ok applied %d\n", c->sets);
         } else {
             IpcSend(c, "ok nothing-to-apply\n");
         }
-        c->have_pend = 0;               /* the batch is consumed, applied or not */
-        c->sets = 0;
+        c->sets = 0;                   /* the batch is consumed, applied or not */
         return;
     }
     IpcSend(c, "err unknown %s\n", line);
@@ -1426,7 +1489,7 @@ static void WorkerResultsReady(void) {
             stale = 0;
             PresentBake(o, r.px);
             L("output %d: baked %dx%d in %.0f ms%s", r.idx, r.w, r.h,
-              r.build_ms, o->visible ? "" : " (hidden, armed)");
+              r.build_ms, o->attached == HALF_TEX ? "" : " (hidden, armed)");
         }
         if (r.idx >= 0 && r.idx < MAX_MON)
             BakeIdle(r.idx, r.gen);
@@ -1469,7 +1532,12 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--log") && i + 1 < argc) {
             g_log = fopen(argv[++i], "a");
             L("=== mnpaper (wayland) start ===");
-        } else if (!strcmp(argv[i], "--dump-tex") && i + 3 < argc) {
+        } else if (!strcmp(argv[i], "--dump-tex")) {
+            if (i + 3 >= argc) {
+                L("--dump-tex needs an output file, a width and a height");
+                Usage();
+                return 2;
+            }
             snprintf(dump_tex, sizeof dump_tex, "%s", argv[++i]);
             dump_w = atoi(argv[++i]);
             dump_h = atoi(argv[++i]);

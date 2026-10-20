@@ -87,6 +87,8 @@ XDG-compliant desktop launch at login. Points worth knowing:
   cannot disable the installed one. Enabling writes this executable's path
   into the single `mnpaper.desktop` slot, replacing any existing entry (the
   Windows Run key behaves the same way).
+- The `Exec=` value is quoted the way the Desktop Entry spec requires, so a
+  path that contains a space still launches at login.
 - Install the binary somewhere stable first (`~/.local/bin/mnpaper`); an
   autostart entry pointing into a build directory breaks the moment you
   `make clean`.
@@ -119,8 +121,10 @@ it diffs cleanly and survives partial edits.
   hide/show cycle free (no re-bake).
 - **Bakes are gated on `wl_buffer.release`.** The compositor owns a buffer's
   pixels from commit until release; writing into a buffer it may still be
-  scanning is a use-after-free in the compositor. A bake that arrives early
-  is parked and re-queued on the release event.
+  scanning is a use-after-free in the compositor. Every commit is counted
+  per half, and a half is neither written nor attached again until its
+  release arrives - a bake that arrives early is parked and re-queued on the
+  release event.
 - **One bake per real change.** A generation counter advances only when
   texture parameters change, so toggling, `share` or `tbmode` never triggers
   a re-bake. In-flight duplicate bakes are suppressed.

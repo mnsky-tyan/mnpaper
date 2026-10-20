@@ -18,6 +18,7 @@
 #ifndef MNPAPER_PAPER_CORE_H
 #define MNPAPER_PAPER_CORE_H
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,7 +76,13 @@ static int SetKeyValue(SETTINGS *s, const char *arg) {
     if (!*p) return 0;
     for (; *p; p++)
         if (*p < '0' || *p > '9') return 0;
-    v = atoi(eq + 1);
+    /* the value must fit an int: atoi's truncation would turn 2^32 into 0
+     * and silently pick the opposite clamp endpoint */
+    {
+        unsigned long n = strtoul(eq + 1, NULL, 10);
+        if (n > (unsigned long)INT_MAX) return 0;
+        v = (int)n;
+    }
     if (!strcasecmp(key, "intensity")) s->intensity = v;
     else if (!strcasecmp(key, "warmth")) s->warmth = v;
     else if (!strcasecmp(key, "grain")) s->grain = v;
@@ -177,7 +184,6 @@ typedef struct {
     int pg, pf, pm, wr, wg_r, wb_r, dr, dg, db, bias, spread;
     int fspread, bspread;      /* fibre/blotch own alpha-modulation gain */
     float wg, wf, wm, wsum;
-    float fs;                  /* coordinate scale: 1 full, step in preview */
 } PAPERPARAMS;
 
 static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
@@ -190,7 +196,6 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
-    p.fs = 1.f;   /* full-res default; the preview build raises it to step */
     p.pg = NextPow2(w / sp->grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
@@ -215,10 +220,7 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
 }
 
 static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
-    /* fs scales ALL noise frequencies at once: the preview grid samples a
-     * coarser paper (same character, larger features) instead of aliasing
-     * fine grain into a flat smear. */
-    float u = (float)x / p->fs, v = (float)y / p->fs;
+    float u = (float)x, v = (float)y;
     float grain = fbm(u / (float)p->s.grain, v / (float)p->s.grain, p->pg);
     float fibre = fbm(u / 2.f, v / 12.f, p->pf);
     float macro = fbm(u / 90.f, v / 70.f, p->pm);

@@ -78,7 +78,18 @@ static void TestSetKeyValueGrammar(void) {
     CHECK(!SetKeyValue(&s, "intensity=3x"), "set: trailing junk refused");
     CHECK(!SetKeyValue(&s, "nokey=5"), "set: unknown key refused");
     CHECK(!SetKeyValue(&s, "intensity"), "set: missing '=' refused");
+    /* a value that does not fit an int is refused: atoi would truncate it
+     * to 0 (or wrap it negative) and the clamp would then silently pick the
+     * opposite endpoint instead of the one that was asked for */
+    CHECK(!SetKeyValue(&s, "intensity=4294967296"), "set: value beyond int refused");
+    CHECK(!SetKeyValue(&s, "warmth=2147483648"), "set: value beyond int refused");
+    CHECK(!SetKeyValue(&s, "grain=99999999999"), "set: value beyond int refused");
     CHECK(s.intensity == 10, "set: refusals never touch the value");
+    {
+        SETTINGS big = PaperDefaultSettings();
+        CHECK(SetKeyValue(&big, "intensity=2147483647"), "set: int max accepted");
+        CHECK(big.intensity == 2147483647, "set: int max applied");
+    }
 }
 
 static void TestBakeDeterminismAndValidity(void) {
