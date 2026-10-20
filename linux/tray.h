@@ -34,7 +34,6 @@ struct TRAYCB {
     int  (*query_intensity)(void);
     int  (*query_warmth)(void);
     int  (*query_autostart)(void);
-    const char *(*config_path)(void);/* for Edit settings file...          */
 };
 
 /* Start the tray.  Returns 0 on success, -1 when the session has no tray

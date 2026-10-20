@@ -1,8 +1,9 @@
 # mnpaper - Linux (Wayland) build.
 #
-# Dependencies: libwayland-client (runtime) and wayland-scanner only when
-# regenerating the vendored protocol code (already committed under
-# protocols/, so a plain build needs just libwayland).
+# Dependencies: libwayland-client and libsystemd (sd-bus, for the tray) at
+# runtime, and wayland-scanner only when regenerating the vendored protocol
+# code (already committed under protocols/, so a plain build needs just the
+# two libraries and their headers).
 #
 #   make            build ./mnpaper
 #   make test       build and run the headless core tests (no display needed)

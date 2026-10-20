@@ -4,10 +4,12 @@
  *
  *   The paper texture is one layer-shell surface per output, placed on the
  *   OVERLAY layer (above panels and fullscreen windows - the closest thing
- *   Wayland has to Windows' WS_EX_TOPMOST), anchored to all four edges with
- *   an exclusive zone of -1 so panels never shrink it.  The input region is
- *   empty, so every click, hover and keystroke falls through to whatever is
- *   underneath - the Wayland equivalent of WS_EX_TRANSPARENT.
+ *   Wayland has to Windows' WS_EX_TOPMOST), anchored to all four edges.  The
+ *   exclusive zone and the bottom margin follow tbmode/panelgap (see
+ *   ApplyExclusiveZone): the default leaves the panel strip unpainted so a
+ *   floating panel and its tray stay clickable above the veil.  The input
+ *   region is empty, so every click, hover and keystroke falls through to
+ *   whatever is underneath - the Wayland equivalent of WS_EX_TRANSPARENT.
  *
  *   The texture itself is plain software rendering into wl_shm buffers.
  *   wl_shm's ARGB8888 is premultiplied BGRA in memory - byte-for-byte the
@@ -20,10 +22,10 @@
  *     neither wlr-screencopy nor ext-image-copy-capture, so the capture
  *     backend would be KDE's PipeWire screencast.  Requests for e-ink are
  *     refused with a log line; mode stays paper.
- *   - settings GUI, tray icon (StatusNotifierItem), global hotkeys
- *     (ext-global-shortcuts-v1), update feed.  Everything they control is
- *     reachable through the CLI below.
- *   Autostart IS implemented (an XDG .desktop file; see ApplyAutostart).
+ *   - settings GUI, global hotkeys (ext-global-shortcuts-v1), update feed.
+ *     Everything they control is reachable through the CLI below.
+ *   Autostart IS implemented (an XDG .desktop file; see ApplyAutostart),
+ *   and so is the tray icon (StatusNotifierItem + DBusMenu, see tray.c).
  *
  * CLI (mirrors the Windows flags where it makes sense):
  *   mnpaper                 start the overlay daemon (foreground)
@@ -1014,7 +1016,6 @@ static void LayerSurfaceInit(struct OUT *o) {
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_exclusive_zone(o->ls, -1);   /* never shrink for panels */
     ApplyExclusiveZone(o);              /* tbmode decides panel coverage */
     zwlr_layer_surface_v1_set_keyboard_interactivity(o->ls,
                                      ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
@@ -1214,13 +1215,11 @@ static int MenuQueryMaster(void)      { return g_s.master; }
 static int MenuQueryIntensity(void)   { return g_s.intensity; }
 static int MenuQueryWarmth(void)      { return g_s.warmth; }
 static int MenuQueryAutostart(void)   { return g_s.autostart; }
-static const char *MenuConfigPath(void) { return ConfigPath(); }
 
 static const struct TRAYCB g_traycb = {
     MenuToggleShow, MenuSetIntensity, MenuSetWarmth, MenuToggleAutostart,
     MenuEditConfig, MenuQuit,
     MenuQueryMaster, MenuQueryIntensity, MenuQueryWarmth, MenuQueryAutostart,
-    MenuConfigPath,
 };
 
 /* --------------------------------------------------------------- ipc ------- */
@@ -1315,6 +1314,8 @@ static const struct { const char *flag, *proto; int cmd; } CMD_TABLE[] = {
  * made in between is not reverted. */
 struct IPC {
     int fd;
+    int pidx;                   /* this client's slot in the poll array, -1
+                                 * when the current poll does not cover it */
     char buf[4096];
     size_t len;
     int sets;
@@ -1469,6 +1470,8 @@ static void SockAccept(void) {
         c = calloc(1, sizeof *c);
         if (!c) { close(fd); continue; }
         c->fd = fd;
+        c->pidx = -1;   /* accepted after the poll array was filled: the next
+                         * poll places it, this wakeup must not read it */
         g_ipc[slot] = c;
     }
 }
@@ -1861,9 +1864,9 @@ int main(int argc, char **argv) {
      * uses the prepare-read/flush dance so a busy queue can never starve
      * the other fds (the pattern wl_client docs recommend for clients). */
     while (!g_quit) {
-        struct pollfd pfd[4 + IPC_MAX];   /* display, pipe, signalfd, socket,
-                                           * plus one slot per client */
-        int n = 0, widx, pipeidx, sigidx, sockidx, cidx;
+        struct pollfd pfd[5 + IPC_MAX];   /* display, pipe, signalfd, socket,
+                                           * tray, plus one slot per client */
+        int n = 0, widx, pipeidx, sigidx, sockidx;
         int pr, rc;
         int i;
 
@@ -1905,12 +1908,12 @@ int main(int argc, char **argv) {
             pfd[n].fd = tray_fd();
             pfd[n].events = tray_events(); pfd[n++].revents = 0;
         }
-        cidx = -1;
+        for (i = 0; i < IPC_MAX; i++)
+            if (g_ipc[i]) g_ipc[i]->pidx = -1;
         for (i = 0; i < IPC_MAX && n < (int)(sizeof pfd / sizeof pfd[0]); i++)
             if (g_ipc[i]) {
-                if (cidx < 0) cidx = n;   /* clients may follow the tray fd,
-                                           * so never derive their index from
-                                           * sockidx */
+                g_ipc[i]->pidx = n;   /* readiness is looked up through this,
+                                       * never by counting positions */
                 pfd[n].fd = g_ipc[i]->fd;
                 pfd[n].events = POLLIN;
                 pfd[n++].revents = 0;
@@ -1944,19 +1947,12 @@ int main(int argc, char **argv) {
         }
         if (sockidx >= 0 && (pfd[sockidx].revents & POLLIN)) SockAccept();
         tray_process();   /* tray fd, dbus timeouts and menu actions */
-        {
-            int k = cidx;   /* index of the first client entry (not sockidx+1:
-                             * the tray fd sits between the socket and the
-                             * clients, and a stale slot must not hide a
-                             * client's POLLIN/POLLHUP) */
-            for (i = 0; i < IPC_MAX; i++) {
-                if (!g_ipc[i]) continue;
-                if (k >= 0 && k < n && (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)))
-                    if (!IpcReadable(g_ipc[i])) {
-                        g_ipc[i] = NULL;   /* freed inside IpcReadable */
-                    }
-                k++;
-            }
+        for (i = 0; i < IPC_MAX; i++) {
+            if (!g_ipc[i] || g_ipc[i]->pidx < 0) continue;
+            if (pfd[g_ipc[i]->pidx].revents & (POLLIN | POLLHUP | POLLERR))
+                if (!IpcReadable(g_ipc[i])) {
+                    g_ipc[i] = NULL;   /* freed inside IpcReadable */
+                }
         }
     }
 

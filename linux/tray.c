@@ -34,7 +34,6 @@ enum {
     ID_EDITCFG = 7,
     ID_SEP3 = 8,
     ID_QUIT = 9,
-    ID_ABOUT = 10,
 };
 
 static const char *STRENGTH_NAMES[4] = { "Subtle (10)", "Soft (20)",
@@ -124,18 +123,10 @@ static int MenuChild(int id, int idx) {
     }
 }
 
-/* One "{sv}" property.  Returns 1 appended, 0 skipped (filtered out or
- * not applicable). */
-static int PropAppend(sd_bus_message *m, int id, const char *key,
-                      char **names, int nnames) {
-    int want = 1, i;
-    if (nnames > 0) {
-        want = 0;
-        for (i = 0; i < nnames; i++)
-            if (!strcmp(names[i], key)) { want = 1; break; }
-    }
-    if (!want) return 0;
-
+/* One "{sv}" property.  Returns 1 appended, 0 skipped (not applicable for
+ * this id).  The DBusMenu spec lets a server return more properties than the
+ * caller asked for, so the propertyNames filters are not implemented. */
+static int PropAppend(sd_bus_message *m, int id, const char *key) {
     if (!strcmp(key, "type")) {
         int sep = (id == ID_SEP1 || id == ID_SEP2 || id == ID_SEP3);
         sd_bus_message_append(m, "{sv}", "type",
@@ -151,7 +142,6 @@ static int PropAppend(sd_bus_message *m, int id, const char *key,
         case ID_AUTOSTART: label = "Start at login"; break;
         case ID_EDITCFG: label = "Edit settings file..."; break;
         case ID_QUIT: label = "Quit"; break;
-        case ID_ABOUT: label = "mnPaper (Wayland)"; break;
         default: {
             int si = id - ID_STRENGTH_BASE - 1;
             int wi = id - ID_WARMTH_BASE - 1;
@@ -224,7 +214,7 @@ static int MenuAppendItem(sd_bus_message *m, int id, int depth, int wrap) {
                                       "toggle-type", "toggle-state",
                                       "children-display" };
         for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++)
-            PropAppend(m, id, keys[i], NULL, 0);
+            PropAppend(m, id, keys[i]);
     }
     sd_bus_message_close_container(m);
 
@@ -251,44 +241,30 @@ static int MenuAppendItem(sd_bus_message *m, int id, int depth, int wrap) {
 
 static int MenuGetLayout(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int parent, depth, r;
-    char **names = NULL;
-    int nnames = 0, i;
     sd_bus_message *reply;
     (void)ud;
 
     r = sd_bus_message_read(msg, "ii", &parent, &depth);
     if (r < 0) return r;
-    r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "s");
+    /* propertyNames (the trailing "as") is deliberately ignored: every item
+     * ships its full property set, which the spec allows. */
+    r = sd_bus_message_skip(msg, "as");
     if (r < 0) return r;
-    for (;;) {
-        const char *s;
-        r = sd_bus_message_read(msg, "s", &s);
-        if (r < 0) break;
-        if (r == 0) break;
-        names = realloc(names, (nnames + 1) * sizeof *names);
-        if (!names) break;
-        names[nnames] = strdup(s);
-        if (!names[nnames]) break;
-        nnames++;
-    }
-    sd_bus_message_exit_container(msg);
 
     r = sd_bus_message_new_method_return(msg, &reply);
-    if (r < 0) { for (i = 0; i < nnames; i++) free(names[i]); free(names); return r; }
+    if (r < 0) return r;
 
     r = sd_bus_message_append(reply, "u", revision);
     if (r >= 0) r = MenuAppendItem(reply, parent, depth, 0);
     if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
     sd_bus_message_unref(reply);
-    for (i = 0; i < nnames; i++) free(names[i]);
-    free(names);
     return r < 0 ? r : 1;
 }
 
 static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
                                   sd_bus_error *err) {
     int32_t *ids = NULL;
-    int nids = 0, r, i;
+    int nids = 0, r, i, oom = 0;
     sd_bus_message *reply;
     (void)ud;
 
@@ -296,13 +272,16 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
     if (r < 0) return r;
     for (;;) {
         int32_t v;
+        int32_t *grown;
         r = sd_bus_message_read(msg, "i", &v);
         if (r <= 0) break;
-        ids = realloc(ids, (nids + 1) * sizeof *ids);
-        if (!ids) break;
+        grown = realloc(ids, (nids + 1) * sizeof *ids);
+        if (!grown) { oom = 1; break; }
+        ids = grown;
         ids[nids++] = v;
     }
     sd_bus_message_exit_container(msg);
+    if (oom) { free(ids); return -ENOMEM; }
     /* property-name filter: we always return everything we have; the spec
      * allows a server to return more properties than asked. */
 
@@ -323,7 +302,7 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
                                               "toggle-state",
                                               "children-display" };
                 for (j = 0; j < (int)(sizeof keys / sizeof keys[0]); j++)
-                    PropAppend(reply, ids[i], keys[j], NULL, 0);
+                    PropAppend(reply, ids[i], keys[j]);
             }
             sd_bus_message_close_container(reply);
             sd_bus_message_close_container(reply);
@@ -352,32 +331,36 @@ static int MenuAboutToShow(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     }
 }
 
+/* One activation, shared by Event and EventGroup: the two entry points must
+ * map exactly the same ids, or a batched click silently does nothing. */
+static void MenuActivate(int32_t id, const char *event) {
+    int si, wi;
+    if (strcmp(event, "clicked") && strcmp(event, "toggled")) return;
+    switch (id) {
+    case ID_SHOW: cb->toggle_show(); break;
+    case ID_AUTOSTART: cb->toggle_autostart(); break;
+    case ID_EDITCFG: cb->edit_settings(); break;
+    case ID_QUIT: cb->quit(); break;
+    default:
+        si = id - ID_STRENGTH_BASE - 1;
+        wi = id - ID_WARMTH_BASE - 1;
+        if (si >= 0 && si < 4) cb->set_intensity(STRENGTH_STEPS[si]);
+        else if (wi >= 0 && wi < 4) cb->set_warmth(WARMTH_STEPS[wi]);
+        break;
+    }
+}
+
 static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int32_t id;
-    int rr;
+    const char *event;
+    int r, rr;
     (void)ud; (void)err;
-    const char *event, *data;
-    uint32_t ts;
-    int r, si, wi;
-    (void)ud;
 
-    r = sd_bus_message_read(msg, "issu", &id, &event, &data, &ts);
+    r = sd_bus_message_read(msg, "is", &id, &event);
     if (r < 0) return r;
-
-    if (!strcmp(event, "clicked") || !strcmp(event, "toggled")) {
-        switch (id) {
-        case ID_SHOW: cb->toggle_show(); break;
-        case ID_AUTOSTART: cb->toggle_autostart(); break;
-        case ID_EDITCFG: cb->edit_settings(); break;
-        case ID_QUIT: cb->quit(); break;
-        default:
-            si = id - ID_STRENGTH_BASE - 1;
-            wi = id - ID_WARMTH_BASE - 1;
-            if (si >= 0 && si < 4) cb->set_intensity(STRENGTH_STEPS[si]);
-            else if (wi >= 0 && wi < 4) cb->set_warmth(WARMTH_STEPS[wi]);
-            break;
-        }
-    }
+    r = sd_bus_message_skip(msg, "vu");   /* data is a variant of any type */
+    if (r < 0) return r;
+    MenuActivate(id, event);
     /* empty result: send the reply ourselves (see SniActivate) */
     rr = sd_bus_reply_method_return(msg, NULL);
     if (rr < 0) return rr;
@@ -386,26 +369,27 @@ static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 
 static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int r;
-    (void)ud;
-    /* Plasma sends batched events only for keyboard activation; drain them. */
+    (void)ud; (void)err;
+    /* Plasma sends batched events only for keyboard activation; every one of
+     * them has to be applied, not just the first. */
     r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "(isvu)");
     while (r > 0) {
         int32_t id;
-        const char *event, *data;
-        uint32_t ts;
-        r = sd_bus_message_read(msg, "(isvu)", &id, &event, &data, &ts);
+        const char *event;
+        r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_STRUCT, "isvu");
         if (r <= 0) break;
-        if (!strcmp(event, "clicked") || !strcmp(event, "toggled")) {
-            if (id == ID_SHOW) cb->toggle_show();
-            else if (id == ID_AUTOSTART) cb->toggle_autostart();
-            else if (id == ID_EDITCFG) cb->edit_settings();
-            else if (id == ID_QUIT) cb->quit();
-        }
+        r = sd_bus_message_read(msg, "is", &id, &event);
+        if (r <= 0) break;
+        r = sd_bus_message_skip(msg, "vu");
+        if (r <= 0) break;
         r = sd_bus_message_exit_container(msg);
+        if (r <= 0) break;
+        MenuActivate(id, event);
     }
     sd_bus_message_exit_container(msg);
-    {   /* empty result: send the reply ourselves (see SniActivate) */
-        int rr = sd_bus_reply_method_return(msg, NULL);
+    {   /* DBusMenu defines the result as the array of ids that could not be
+         * found; every id we were sent is ours, so it is empty. */
+        int rr = sd_bus_reply_method_return(msg, "ai", 0);
         if (rr < 0) return rr;
     }
     return 1;
@@ -423,8 +407,16 @@ static int SniGetStr(sd_bus *b, const char *path, const char *iface,
     else if (!strcmp(prop, "Title")) v = "mnPaper";
     else if (!strcmp(prop, "Status")) v = cb->query_master() ? "Active" : "Passive";
     else if (!strcmp(prop, "IconName")) v = "";
-    else if (!strcmp(prop, "Menu")) v = "/StatusNotifierItem";
     return sd_bus_message_append(m, "s", v);
+}
+
+static int MenuGetStatus(sd_bus *b, const char *path, const char *iface,
+                         const char *prop, sd_bus_message *m, void *ud,
+                         sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    /* DBusMenu's Status is "normal" or "notice"; Active/Passive is the SNI
+     * vocabulary and belongs to the other interface's getter. */
+    return sd_bus_message_append(m, "s", "normal");
 }
 
 static int SniGetMenuPath(sd_bus *b, const char *path, const char *iface,
@@ -568,13 +560,13 @@ static const sd_bus_vtable sni_vtable[] = {
 static const sd_bus_vtable menu_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_PROPERTY("Version", "u", SniGetUint, 0, 0),   /* DBusMenu v3 */
-    SD_BUS_PROPERTY("Status", "s", SniGetStr, 0, 0),
+    SD_BUS_PROPERTY("Status", "s", MenuGetStatus, 0, 0),
     SD_BUS_METHOD("GetLayout", "iias", "u(ia{sv}av)", MenuGetLayout, 0),
     SD_BUS_METHOD("GetGroupProperties", "aias", "a(ia{sv})",
                   MenuGetGroupProperties, 0),
     SD_BUS_METHOD("AboutToShow", "i", "b", MenuAboutToShow, 0),
-    SD_BUS_METHOD("Event", "issu", "", MenuEvent, 0),
-    SD_BUS_METHOD("EventGroup", "a(isvu)", "", MenuEventGroup, 0),
+    SD_BUS_METHOD("Event", "isvu", "", MenuEvent, 0),
+    SD_BUS_METHOD("EventGroup", "a(isvu)", "ai", MenuEventGroup, 0),
     SD_BUS_VTABLE_END,
 };
 
@@ -607,14 +599,7 @@ int tray_start(const struct TRAYCB *c) {
     snprintf(service, sizeof service, "org.kde.StatusNotifierItem-%d-1",
              (int)getpid());
     r = sd_bus_request_name(bus, service, SD_BUS_NAME_REPLACE_EXISTING);
-    if (r < 0) {
-        /* fall back to the unique name, which the watcher accepts too */
-        const char *uniq = NULL;
-        sd_bus_get_unique_name(bus, &uniq);
-        snprintf(service, sizeof service, "%s", uniq ? uniq : "");
-        r = sd_bus_request_name(bus, service, 0);
-        if (r < 0) goto fail;
-    }
+    if (r < 0) goto fail;
 
     r = sd_bus_call_method(bus, "org.kde.StatusNotifierWatcher",
                            "/StatusNotifierWatcher",

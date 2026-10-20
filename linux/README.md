@@ -199,7 +199,9 @@ neither affects correctness.
   Plasma 5.21+), sway, Hyprland, labwc, river, wayfire.
   **GNOME/Mutter does not implement layer-shell**, so the overlay cannot
   exist there; the program says so and exits instead of half-working.
-- libwayland-client at runtime; `wayland-scanner` only to regenerate the
+- libwayland-client and libsystemd (sd-bus) at runtime, plus their development
+  headers to build (`libwayland-dev`/`wayland-devel`,
+  `libsystemd-dev`/`systemd-devel`); `wayland-scanner` only to regenerate the
   vendored protocol code.
 
 ## Building
