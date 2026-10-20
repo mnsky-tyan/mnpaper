@@ -225,24 +225,30 @@ static char *ExePath(void) {
     return path;
 }
 
-/* Is the existing entry ours?  Same ownership rule as RunEntryMatchesExe:
- * only an entry naming THIS executable is ours to remove, so a second copy
- * of the binary at another path cannot disable the installed one's
- * autostart.  Enabling rewrites the one slot unconditionally, like the
- * Windows Run key. */
-static int AutostartEntryIsOurs(const char *file, const char *exe) {
+static void DesktopQuote(const char *s, char *out, size_t outsz);
+
+/* Parse the on-disk entry: *ours is set when it names THIS executable (the
+ * same ownership rule as RunEntryMatchesExe, so a second copy of the binary
+ * at another path cannot touch the installed one's autostart) and *exec
+ * when its Exec line equals the quoting this build writes. */
+static void AutostartEntryState(const char *file, const char *exe,
+                                int *ours, int *exec) {
     FILE *f = fopen(file, "r");
     char line[1024];
-    int ours = 0;
-    if (!f) return 0;
+    char quoted[8300];
+    DesktopQuote(exe, quoted, sizeof quoted);
+    *ours = 0;
+    *exec = 0;
+    if (!f) return;
     while (fgets(line, sizeof line, f)) {
         char *nl = line + strlen(line);
         if (nl > line && nl[-1] == '\n') nl[-1] = 0;
         if (!strncmp(line, "X-Mnpaper-Exe=", 14) && !strcmp(line + 14, exe))
-            ours = 1;
+            *ours = 1;
+        else if (!strncmp(line, "Exec=", 5) && !strcmp(line + 5, quoted))
+            *exec = 1;
     }
     fclose(f);
-    return ours;
 }
 
 /* Quote a path for the Exec value of a desktop entry.  The spec splits the
@@ -276,10 +282,15 @@ static int ApplyAutostart(void) {
         char dir[600], tmp[700];
         char quoted[8300];
         FILE *f;
-        /* already enabled and ours: nothing to write, nothing to log.  This
-         * runs on every settings change, so an unconditional rewrite spammed
-         * one "autostart: enabled" line per --set. */
-        if (AutostartEntryIsOurs(path, exe)) return 1;
+        /* already enabled, ours and written the way this build writes it:
+         * nothing to write, nothing to log.  This runs on every settings
+         * change, so an unconditional rewrite spammed one "autostart:
+         * enabled" line per --set. */
+        {
+            int ours, exec_ok;
+            AutostartEntryState(path, exe, &ours, &exec_ok);
+            if (ours && exec_ok) return 1;
+        }
         snprintf(dir, sizeof dir, "%s", path);
         {
             char *slash = strrchr(dir, '/');
@@ -317,12 +328,16 @@ static int ApplyAutostart(void) {
         return 1;
     }
     /* disabling: remove only an entry that names this executable */
-    if (access(path, F_OK) == 0 && AutostartEntryIsOurs(path, exe)) {
-        if (unlink(path)) {
-            L("autostart: cannot remove %s (errno %d)", path, errno);
-            return 0;
+    {
+        int ours, exec_ok;
+        AutostartEntryState(path, exe, &ours, &exec_ok);
+        if (access(path, F_OK) == 0 && ours) {
+            if (unlink(path)) {
+                L("autostart: cannot remove %s (errno %d)", path, errno);
+                return 0;
+            }
+            L("autostart: disabled (%s removed)", path);
         }
-        L("autostart: disabled (%s removed)", path);
     }
     return 1;
 }
@@ -332,8 +347,10 @@ static int ApplyAutostart(void) {
 static void AutostartSyncFromDisk(void) {
     const char *path = AutostartPath();
     char *exe = ExePath();
+    int ours, exec_quoted;
     if (!path || !exe) return;
-    g_s.autostart = AutostartEntryIsOurs(path, exe);
+    AutostartEntryState(path, exe, &ours, &exec_quoted);
+    g_s.autostart = ours;
 }
 
 /* ----------------------------------------------------------- wayland app --- */
@@ -499,7 +516,9 @@ struct OUT {
     struct wl_surface *sfc;
     struct zwlr_layer_surface_v1 *ls;
     int lw, lh;                         /* logical size from configure */
-    int w, h, scale;                    /* buffer size = logical * scale */
+    int scale;                          /* integer scale the output reports */
+    int bscale;                         /* scale the buffer set was built at */
+    int w, h;                           /* buffer pixels = logical * bscale */
     int configured;
     /* Layer-shell mapping state.  attached = which half the surface
      * currently shows (HALF_NONE until the first attach).  The surface
@@ -590,6 +609,27 @@ static int RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbu
     return 1;
 }
 
+/* Hand the current buffer set to the retired list and empty the slot: the
+ * one move every set replacement (resize, surface rebuild, teardown) uses.
+ * A half the compositor still owns waits for its release before the mapping
+ * can be unmapped; when the set cannot be tracked (retired slots
+ * exhausted), its proxies are destroyed but the mapping is never freed with
+ * the compositor possibly still reading it. */
+static void RetireCurrentSet(struct OUT *o) {
+    FlushRetired(o);
+    if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
+                   o->buf_pending ? 0 : 1, o->hbuf_pending ? 0 : 1)) {
+        if (o->buf) wl_buffer_destroy(o->buf);
+        if (o->hbuf) wl_buffer_destroy(o->hbuf);
+        if (o->pool) wl_shm_pool_destroy(o->pool);
+    }
+    o->buf = o->hbuf = NULL;
+    o->pool = NULL;
+    o->data = NULL;
+    o->fd = -1;
+    o->buf_pending = o->hbuf_pending = 0;
+}
+
 static void QueueBake(struct OUT *o);
 static void BufferRelease(void *data, struct wl_buffer *buf);
 static void CancelFrame(struct OUT *o);
@@ -634,7 +674,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     struct wl_shm_pool *pool;
     struct wl_buffer *buf, *hbuf;
 
-    if (o->buf && o->hbuf && o->lw == lw && o->lh == lh && o->scale == scale) return;
+    if (o->buf && o->hbuf && o->lw == lw && o->lh == lh && o->bscale == scale) return;
 
     bytes = (size_t)lw * scale * lh * scale * 4;
     fd = ShmFdFor(bytes * 2);
@@ -658,13 +698,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     wl_buffer_add_listener(buf, &BufferListener, o);
     wl_buffer_add_listener(hbuf, &BufferListener, o);
     /* the whole old set (both halves share one mapping) is retired together */
-    FlushRetired(o);
-    if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-                   o->buf_pending ? 0 : 1, o->hbuf_pending ? 0 : 1)) {
-        if (o->buf) wl_buffer_destroy(o->buf);
-        if (o->hbuf) wl_buffer_destroy(o->hbuf);
-        if (o->pool) wl_shm_pool_destroy(o->pool);
-    }
+    RetireCurrentSet(o);
     o->fd = fd;
     o->data = data;
     o->map_bytes = bytes * 2;
@@ -672,7 +706,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     o->buf_pending = o->hbuf_pending = 0;   /* new buffers: never busy */
     o->attached = HALF_NONE;                /* the old half is retired */
     o->lw = lw; o->lh = lh;
-    o->w = lw * scale; o->h = lh * scale; o->scale = scale;
+    o->w = lw * scale; o->h = lh * scale; o->bscale = scale;
     o->baked_gen = 0;                   /* a fresh texture half holds nothing */
 
     if (g_comp_version >= 3)
@@ -813,7 +847,10 @@ static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
     L("output %d: layer surface closed by compositor, rebuilding", o->idx);
     o->configured = 0;
     o->attached = HALF_NONE;
+    o->baked_gen = 0;
     CancelFrame(o);              /* the destroyed surface never delivers done */
+    RetireCurrentSet(o);         /* commits on the dead surface are retired
+                                  * like any other set replacement */
     if (o->wl_gone) return;
     if (o->ls) { zwlr_layer_surface_v1_destroy(o->ls); o->ls = NULL; }
     if (o->sfc) { wl_surface_destroy(o->sfc); o->sfc = NULL; }
@@ -844,10 +881,16 @@ static void OutputMode(void *data, struct wl_output *wl, uint32_t flags,
 static void OutputDone(void *data, struct wl_output *wl) {
     struct OUT *o = data;
     (void)wl;
-    /* scale can change under us (display settings); keep the buffer in step */
+    /* scale can change under us (display settings); keep the buffer in step.
+     * The swap leaves the surface with nothing attached, so re-attach the
+     * wanted half right away - a release of the retired old buffer is not
+     * guaranteed to arrive (the surface stops being presented, not replaced). */
     if (o->configured && o->buf) {
         BufferResize(o, o->lw, o->lh, o->scale);
-        if (o->buf) QueueBake(o);
+        if (o->buf) {
+            AttachCurrentBuffer(o);
+            QueueBake(o);
+        }
     }
 }
 
@@ -890,17 +933,7 @@ static void OutTeardown(struct OUT *o) {
      * compositor released both halves (never unmap memory a live compositor
      * reads).  The OUT itself must outlive those releases: the buffers'
      * listener data points here. */
-    FlushRetired(o);
-    if (!RetireSet(o, o->buf, o->hbuf, o->pool, o->fd, o->data, o->map_bytes,
-                   o->buf_pending ? 0 : 1, o->hbuf_pending ? 0 : 1)) {
-        if (o->buf) wl_buffer_destroy(o->buf);
-        if (o->hbuf) wl_buffer_destroy(o->hbuf);
-        if (o->pool) wl_shm_pool_destroy(o->pool);
-    }
-    o->buf = o->hbuf = NULL;
-    o->pool = NULL;
-    o->data = NULL;
-    o->fd = -1;
+    RetireCurrentSet(o);
     o->configured = 0;
     o->attached = HALF_NONE;
     o->baked_gen = 0;
@@ -961,7 +994,7 @@ static void OutCreate(struct wl_output *wl, uint32_t name) {
     o->wl = wl;
     o->global_name = name;
     o->fd = -1;
-    o->scale = 1;
+    o->scale = o->bscale = 1;
     g_ov[slot] = o;
     if (slot >= g_nov) g_nov = slot + 1;
 
@@ -1318,6 +1351,7 @@ bye:
 /* accept loop over the listen socket; each client gets its own IPC struct
  * which the caller polls later */
 static struct IPC *g_ipc[64];
+#define IPC_MAX ((int)(sizeof g_ipc / sizeof g_ipc[0]))
 
 static void SockAccept(void) {
     for (;;) {
@@ -1325,7 +1359,7 @@ static void SockAccept(void) {
         int slot = -1, i;
         int fd = accept4(g_sock_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (fd < 0) return;
-        for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]); i++)
+        for (i = 0; i < IPC_MAX; i++)
             if (!g_ipc[i]) { slot = i; break; }
         if (slot < 0) { close(fd); return; }   /* table full: refuse politely */
         c = calloc(1, sizeof *c);
@@ -1407,8 +1441,16 @@ static int SendToRunning(int argc, char **argv) {
         (void)ignored;
         shutdown(fd, SHUT_WR);
         for (;;) {
+            struct pollfd pf = { fd, POLLIN, 0 };
             char rbuf[512];
-            ssize_t n = read(fd, rbuf, sizeof rbuf);
+            ssize_t n;
+            int pr = poll(&pf, 1, 5000);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) { L("no reply within 5 s from the running instance"); break; }
+            n = read(fd, rbuf, sizeof rbuf);
             if (n <= 0) break;
             fwrite(rbuf, 1, (size_t)n, stdout);
             fflush(stdout);
@@ -1713,7 +1755,8 @@ int main(int argc, char **argv) {
      * uses the prepare-read/flush dance so a busy queue can never starve
      * the other fds (the pattern wl_client docs recommend for clients). */
     while (!g_quit) {
-        struct pollfd pfd[3 + 64];
+        struct pollfd pfd[4 + IPC_MAX];   /* display, pipe, signalfd, socket,
+                                           * plus one slot per client */
         int n = 0, widx, pipeidx, sigidx, sockidx;
         int pr, rc;
         int i;
@@ -1752,7 +1795,7 @@ int main(int argc, char **argv) {
             sockidx = n; pfd[n].fd = g_sock_fd;
             pfd[n].events = POLLIN; pfd[n++].revents = 0;
         }
-        for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]) && n < (int)(sizeof pfd / sizeof pfd[0]); i++)
+        for (i = 0; i < IPC_MAX && n < (int)(sizeof pfd / sizeof pfd[0]); i++)
             if (g_ipc[i]) {
                 pfd[n].fd = g_ipc[i]->fd;
                 pfd[n].events = POLLIN;
@@ -1789,7 +1832,7 @@ int main(int argc, char **argv) {
         {
             int base = sockidx >= 0 ? sockidx + 1 : 3;
             int k = base;
-            for (i = 0; i < (int)(sizeof g_ipc / sizeof g_ipc[0]); i++) {
+            for (i = 0; i < IPC_MAX; i++) {
                 if (!g_ipc[i]) continue;
                 if (k < n && (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)))
                     if (!IpcReadable(g_ipc[i])) {
