@@ -362,6 +362,18 @@ static int g_nresults;
 
 static void WorkerKick(void) { pthread_cond_broadcast(&g_wake); }
 
+/* Return an output's in-flight marker to idle - but only while it still
+ * names the job that just finished: the worker may already be baking a
+ * newer generation for that output, and wiping its marker would let
+ * QueueBake enqueue a duplicate of the bake in flight.  Shared by every
+ * path that ends a bake, so a job that delivers no result cannot strand
+ * the marker either. */
+static void BakeIdle(int idx, int gen) {
+    pthread_mutex_lock(&g_wlock);
+    if (g_baking[idx] == gen) g_baking[idx] = 0;
+    pthread_mutex_unlock(&g_wlock);
+}
+
 static void *WorkerMain(void *unused) {
     (void)unused;
     pthread_mutex_lock(&g_wlock);
@@ -401,12 +413,17 @@ static void *WorkerMain(void *unused) {
                                              * happen at RESULTQ 32 */
                     L("worker: result queue full, dropped bake for output %d", r.idx);
                     free(r.px);
+                    BakeIdle(job.idx, job.gen);
                 } else if (write(g_pipe[1], "r", 1) < 0 && errno != EAGAIN) {
                     /* the loop always drains; a full pipe just means the
                      * main thread is momentarily busy */
                 }
             } else {
+                if (!px)
+                    L("worker: out of memory baking output %d (%dx%d) - bake dropped",
+                      job.idx, job.w, job.h);
                 free(px);
+                BakeIdle(job.idx, job.gen);
             }
         }
         pthread_mutex_lock(&g_wlock);
@@ -1411,11 +1428,8 @@ static void WorkerResultsReady(void) {
             L("output %d: baked %dx%d in %.0f ms%s", r.idx, r.w, r.h,
               r.build_ms, o->visible ? "" : " (hidden, armed)");
         }
-        if (r.idx >= 0 && r.idx < MAX_MON) {
-            pthread_mutex_lock(&g_wlock);
-            g_baking[r.idx] = 0;         /* idle whatever happened above */
-            pthread_mutex_unlock(&g_wlock);
-        }
+        if (r.idx >= 0 && r.idx < MAX_MON)
+            BakeIdle(r.idx, r.gen);
         if (stale) {
             /* A settings change or resize beat this bake.  Never a silent
              * gap: re-queue deduped so the output converges. */
@@ -1517,8 +1531,8 @@ int main(int argc, char **argv) {
     if (cmd || nsets) {
         int rc = SendToRunning(argc, argv);
         if (rc == 0) return 0;
-        if (cmd && !(nsets || cmd == CMD_ON || cmd == CMD_PAPER)) {
-            /* a bare command with nobody to hear it is a dropped command */
+        if (cmd && cmd != CMD_ON && cmd != CMD_PAPER) {
+            /* a command with nobody to hear it is a dropped command */
             L("no running mnpaper instance; start one with: mnpaper");
             return 2;
         }
