@@ -618,6 +618,8 @@ static int RetireSet(struct OUT *o, struct wl_buffer *buf, struct wl_buffer *hbu
     return 1;
 }
 
+static const struct wl_callback_listener CbListener;
+
 /* Hand the current buffer set to the retired list and empty the slot: the
  * one move every set replacement (resize, surface rebuild, teardown) uses.
  * A half the compositor still owns waits for its release before the mapping
@@ -637,6 +639,24 @@ static void RetireCurrentSet(struct OUT *o) {
     o->data = NULL;
     o->fd = -1;
     o->buf_pending = o->hbuf_pending = 0;
+}
+
+/* A retired set is freed only once the compositor proved it no longer scans
+ * it: the release events set rel_buf/rel_hbuf and FlushRetired runs on every
+ * release or frame callback.  PresentBake used to be the only place that
+ * requested a callback, so a resize that never presents (a scale change, a
+ * tbmode margin change, any configure with no bake behind it) parked the old
+ * mapping until an unrelated event called FlushRetired - on an idle desktop,
+ * process exit.  Call this on every LIVE resize path (never during teardown:
+ * the surface proxy may already be destroyed): it frees a set whose halves
+ * came back before the retire and arms one callback for the rest. */
+static void RetireSweep(struct OUT *o) {
+    FlushRetired(o);
+    if (o->nretired > 0 && !o->frame_cb && o->sfc) {
+        o->frame_cb = wl_surface_frame(o->sfc);
+        wl_callback_add_listener(o->frame_cb, &CbListener, o);
+        wl_surface_commit(o->sfc);
+    }
 }
 
 static void QueueBake(struct OUT *o);
@@ -708,6 +728,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     wl_buffer_add_listener(hbuf, &BufferListener, o);
     /* the whole old set (both halves share one mapping) is retired together */
     RetireCurrentSet(o);
+    RetireSweep(o);             /* live surface: free it, or arm a callback */
     o->fd = fd;
     o->data = data;
     o->map_bytes = bytes * 2;
