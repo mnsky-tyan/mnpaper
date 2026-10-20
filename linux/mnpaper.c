@@ -230,24 +230,28 @@ static void DesktopQuote(const char *s, char *out, size_t outsz);
 /* Parse the on-disk entry: *ours is set when it names THIS executable (the
  * same ownership rule as RunEntryMatchesExe, so a second copy of the binary
  * at another path cannot touch the installed one's autostart) and *exec
- * when its Exec line equals the quoting this build writes. */
+ * when its Exec line equals the quoting this build writes.  The lines are
+ * read whole: the Exec line of a long install path is longer than any
+ * fixed buffer would hold. */
 static void AutostartEntryState(const char *file, const char *exe,
                                 int *ours, int *exec) {
     FILE *f = fopen(file, "r");
-    char line[1024];
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
     char quoted[8300];
     DesktopQuote(exe, quoted, sizeof quoted);
     *ours = 0;
     *exec = 0;
     if (!f) return;
-    while (fgets(line, sizeof line, f)) {
-        char *nl = line + strlen(line);
-        if (nl > line && nl[-1] == '\n') nl[-1] = 0;
+    while ((n = getline(&line, &cap, f)) > 0) {
+        if (line[n - 1] == '\n') line[n - 1] = 0;
         if (!strncmp(line, "X-Mnpaper-Exe=", 14) && !strcmp(line + 14, exe))
             *ours = 1;
         else if (!strncmp(line, "Exec=", 5) && !strcmp(line + 5, quoted))
             *exec = 1;
     }
+    free(line);
     fclose(f);
 }
 
@@ -1322,9 +1326,17 @@ static void IpcCommand(struct IPC *c, char *line) {
 }
 
 static int IpcReadable(struct IPC *c) {   /* returns 0 when closed */
-    if (c->len >= sizeof c->buf - 1) { IpcSend(c, "err overflow\n"); goto bye; }
     for (;;) {
-        ssize_t n = read(c->fd, c->buf + c->len, sizeof c->buf - 1 - c->len);
+        ssize_t n;
+        /* a line must fit the buffer: a client that sends more than that
+         * without ending the line is told, not dropped without a word */
+        if (c->len >= sizeof c->buf - 1) {
+            IpcSend(c, "err overflow\n");
+            L("ipc: client line longer than the %d-byte buffer - dropped",
+              (int)sizeof c->buf - 1);
+            goto bye;
+        }
+        n = read(c->fd, c->buf + c->len, sizeof c->buf - 1 - c->len);
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
             goto bye;
