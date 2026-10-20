@@ -10,7 +10,7 @@
 CC      ?= cc
 CFLAGS  ?= -O2
 WARN     = -Wall -Wextra -Wno-unused-parameter
-LDLIBS   = -lwayland-client -lpthread -lm
+LDLIBS   = -lwayland-client -lpthread -lm -lsystemd
 
 BIN = mnpaper
 PROT = protocols/wlr-layer-shell-unstable-v1
@@ -18,8 +18,8 @@ XDG = protocols/xdg-shell
 
 all: $(BIN)
 
-$(BIN): mnpaper.c paper_core.h $(PROT).h $(PROT).c ../version.h
-	$(CC) $(CFLAGS) $(WARN) mnpaper.c $(PROT).c $(XDG).c -o $@ $(LDLIBS)
+$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c ../version.h
+	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c -o $@ $(LDLIBS)
 
 # regenerate the vendored protocol code only when the XML changes
 $(PROT).h: $(PROT).xml

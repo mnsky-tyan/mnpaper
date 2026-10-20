@@ -20,6 +20,8 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -29,6 +31,14 @@
 
 #define TB_NOT_COVER 0  /* raise the bar above the veil: do not cover the taskbar */
 #define TB_COVER     1  /* leave the bar under the veil: the paper covers the taskbar */
+
+/* ------------------------------------------------------------ log -------- */
+
+/* Shared logger for the app and the tray module: stderr always, plus the
+ * log file once the app has opened one (it assigns paper_log_file).
+ * Defined in mnpaper.c (the app); test_core.c does not log. */
+extern FILE *paper_log_file;
+void PAPERLOG(const char *fmt, ...);
 
 typedef struct {
     int master;
@@ -46,6 +56,11 @@ typedef struct {
     int tbmode;    /* how the veil meets a revealed taskbar (see TB_* above;
                     * meaningful on Windows; other desktops ignore it) */
     int autoupd;   /* 1 = look for a new version about once a day */
+    int panelgap;  /* Wayland: logical pixels left uncovered at the bottom for
+                    * a floating panel/tray (0 = cover everything).  A
+                    * client cannot be stacked between an overlay layer
+                    * surface and the panel, so "do not cover the taskbar"
+                    * means "do not paint that strip". */
 } SETTINGS;
 
 /* Same defaults as mnPaper.c's g_s initialiser. Keep the two in step until
@@ -57,7 +72,7 @@ static SETTINGS PaperDefaultSettings(void) {
     s.warmth = 45; s.grain = 4; s.fibre = 40; s.blotch = 30;
     s.shades = 4; s.contrast = 50; s.dither = 75;
     s.autostart = 0; s.share = 0; s.tbmode = TB_NOT_COVER;
-    s.autoupd = 1;
+    s.autoupd = 1; s.panelgap = 96;
     return s;
 }
 
@@ -96,6 +111,7 @@ static int SetKeyValue(SETTINGS *s, const char *arg) {
     else if (!strcasecmp(key, "autostart")) s->autostart = v ? 1 : 0;
     else if (!strcasecmp(key, "share")) s->share = v ? 1 : 0;
     else if (!strcasecmp(key, "tbmode")) s->tbmode = v ? TB_COVER : TB_NOT_COVER;
+    else if (!strcasecmp(key, "panelgap")) s->panelgap = v;
     else if (!strcasecmp(key, "autoupd")) s->autoupd = v ? 1 : 0;
     else if (!strcasecmp(key, "master")) s->master = v ? 1 : 0;
     else return 0;
@@ -114,6 +130,7 @@ static void ClampSettingsOf(SETTINGS *s) {
         { &s->contrast,  0, 100 }, { &s->dither,    0, 100 },
         { &s->autostart, 0,   1 }, { &s->share,     0,   1 },
         { &s->tbmode,    0,   TB_COVER }, { &s->autoupd,   0,   1 },
+        { &s->panelgap,  0,        512 },
     };
     int i;
     for (i = 0; i < (int)(sizeof(f) / sizeof(f[0])); i++) {

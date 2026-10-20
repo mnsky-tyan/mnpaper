@@ -72,6 +72,7 @@
 
 #include "protocols/wlr-layer-shell-unstable-v1.h"
 #include "paper_core.h"
+#include "tray.h"
 #include "../version.h"
 
 #define APP_VERSION MNVER_STR "-wayland"
@@ -92,19 +93,23 @@
 
 /* ------------------------------------------------------------------ log --- */
 
-static FILE *g_log;
-static void L(const char *fmt, ...) {
+/* The logger the core declares: stderr plus the log file.  The tray module
+ * and the CLI paths both funnel through this one implementation. */
+FILE *paper_log_file;
+void PAPERLOG(const char *fmt, ...) {
     va_list ap;
     char buf[512];
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     fprintf(stderr, "%s\n", buf);
-    if (g_log) {
-        fprintf(g_log, "%s\n", buf);
-        fflush(g_log);
+    if (paper_log_file) {
+        fprintf(paper_log_file, "%s\n", buf);
+        fflush(paper_log_file);
     }
 }
+#define g_log paper_log_file
+#define L PAPERLOG
 
 static double NowMs(void) {
     struct timespec ts;
@@ -155,10 +160,10 @@ static int ConfigWrite(const SETTINGS *s) {
         "# truth, exactly as the Windows Run key is)\n"
         "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
         "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
-        "share=%d\ntbmode=%d\nautoupd=%d\n",
+        "share=%d\ntbmode=%d\nautoupd=%d\npanelgap=%d\n",
         s->master, s->mode, s->intensity, s->warmth, s->grain,
         s->fibre, s->blotch, s->shades, s->contrast, s->dither,
-        s->share, s->tbmode, s->autoupd);
+        s->share, s->tbmode, s->autoupd, s->panelgap);
     if (fclose(f)) { unlink(tmp); return 0; }
     if (rename(tmp, path)) { unlink(tmp); return 0; }
     return 1;
@@ -824,6 +829,29 @@ static void ApplyClickThrough(struct OUT *o) {
     wl_region_destroy(r);
 }
 
+/* tbmode=TB_NOT_COVER (the default) asks the compositor to keep the surface
+ * clear of panels: a layer surface with exclusive zone 0 is *moved* out of
+ * the way of every surface that claims space, so KDE's panel (and the tray
+ * icon in it) stays visible and clickable above the paper.  tbmode=TB_COVER
+ * uses -1, which asks the compositor to ignore panels and extend the veil to
+ * the screen edges - the paper covers the taskbar, exactly like the Windows
+ * mode of the same name.  The compositor decides the panel size for us; we
+ * never guess it. */
+static void ApplyExclusiveZone(struct OUT *o) {
+    if (!o->ls) return;
+    zwlr_layer_surface_v1_set_exclusive_zone(o->ls,
+        g_s.tbmode == TB_COVER ? -1 : 0);
+    /* The paper is an overlay layer surface, and KWin stacks every overlay
+     * above the panel (DockLayer) - no client can be placed between them.
+     * "Do not cover the taskbar" therefore has to mean "do not paint that
+     * strip": a bottom margin shrinks the surface to end above the panel so
+     * the floating panel and its tray stay visible and clickable. */
+    if (g_s.tbmode == TB_NOT_COVER && g_s.panelgap > 0)
+        zwlr_layer_surface_v1_set_margin(o->ls, 0, 0, (int32_t)g_s.panelgap, 0);
+    else
+        zwlr_layer_surface_v1_set_margin(o->ls, 0, 0, 0, 0);
+}
+
 static void LayerSurfaceInit(struct OUT *o);
 
 static void LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls,
@@ -966,6 +994,7 @@ static void LayerSurfaceInit(struct OUT *o) {
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
     zwlr_layer_surface_v1_set_exclusive_zone(o->ls, -1);   /* never shrink for panels */
+    ApplyExclusiveZone(o);              /* tbmode decides panel coverage */
     zwlr_layer_surface_v1_set_keyboard_interactivity(o->ls,
                                      ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
     zwlr_layer_surface_v1_add_listener(o->ls, &LayerListener, o);
@@ -1052,6 +1081,13 @@ static void RepaintAll(void) {
     for (i = 0; i < MAX_MON; i++) {
         struct OUT *o = g_ov[i];
         if (!o || !o->configured || !o->buf) continue;
+        /* tbmode may have moved the surface off (or onto) the panel; the
+         * zone only takes effect in a commit, and AttachCurrentBuffer alone
+         * would return early when the wanted half is already showing. */
+        if (o->ls) {
+            ApplyExclusiveZone(o);
+            wl_surface_commit(o->sfc);
+        }
         AttachCurrentBuffer(o);             /* show or hide: the wanted half */
         /* bake regardless of visibility: a hidden output keeps its texture
          * armed so showing it later costs no bake */
@@ -1111,6 +1147,7 @@ static void ApplySettings(int save) {
     RepaintAll();
     if (save && !ConfigWrite(&g_s))
         L("warning: could not write settings to %s", ConfigPath() ? ConfigPath() : "(unset)");
+    tray_state_changed();   /* keep the menu checkmarks in step (no-op if off) */
 }
 
 /* --------------------------------------------------------------- commands -- */
@@ -1131,6 +1168,39 @@ static void SetMode(int mode) {
     g_s.master = 1;
     ApplySettings(1);
 }
+
+/* --------------------------------------------------------------- tray ----- */
+
+/* The tray mirrors the same state the CLI drives; every menu action lands in
+ * the SetMaster/ApplySettings paths, so one choke point keeps the screen,
+ * the config and the menu checkmarks in agreement. */
+static void MenuToggleShow(void)      { SetMaster(!g_s.master); }
+static void MenuSetIntensity(int v)   { g_s.intensity = v; ApplySettings(1); }
+static void MenuSetWarmth(int v)      { g_s.warmth = v; ApplySettings(1); }
+static void MenuToggleAutostart(void) { g_s.autostart = !g_s.autostart; ApplySettings(1); }
+static void MenuQuit(void)            { g_quit = 1; }
+static void MenuEditConfig(void) {
+    const char *path = ConfigPath();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execlp("xdg-open", "xdg-open", path ? path : "", (char *)NULL);
+        _exit(127);
+    }
+    /* fire and forget: SIGCHLD is ignored while the tray runs, no zombie */
+}
+static int MenuQueryMaster(void)      { return g_s.master; }
+static int MenuQueryIntensity(void)   { return g_s.intensity; }
+static int MenuQueryWarmth(void)      { return g_s.warmth; }
+static int MenuQueryAutostart(void)   { return g_s.autostart; }
+static const char *MenuConfigPath(void) { return ConfigPath(); }
+
+static const struct TRAYCB g_traycb = {
+    MenuToggleShow, MenuSetIntensity, MenuSetWarmth, MenuToggleAutostart,
+    MenuEditConfig, MenuQuit,
+    MenuQueryMaster, MenuQueryIntensity, MenuQueryWarmth, MenuQueryAutostart,
+    MenuConfigPath,
+};
 
 /* --------------------------------------------------------------- ipc ------- */
 
@@ -1258,6 +1328,7 @@ static void StatusLine(struct IPC *c) {
             g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre, g_s.blotch);
     IpcSend(c, "share %d\ntbmode %d\nautostart %d\nautoupd %d\n",
             g_s.share, g_s.tbmode, g_s.autostart, g_s.autoupd);
+    IpcSend(c, "panelgap %d\n", g_s.panelgap);
     for (i = 0; i < MAX_MON; i++) {
         struct OUT *o = g_ov[i];
         if (!o) continue;
@@ -1762,6 +1833,8 @@ int main(int argc, char **argv) {
     L("mnpaper %s ready: master=%d mode=%s outputs=%d", APP_VERSION,
       g_s.master, g_s.mode == MODE_PAPER ? "paper" : "eink", g_nov);
 
+    tray_start(&g_traycb);   /* optional; fails soft on sessions without a tray */
+
     /* ---- main loop: one poll over the display, the worker pipe, the
      * command socket and its clients, and the signalfd.  The display side
      * uses the prepare-read/flush dance so a busy queue can never starve
@@ -1769,7 +1842,7 @@ int main(int argc, char **argv) {
     while (!g_quit) {
         struct pollfd pfd[4 + IPC_MAX];   /* display, pipe, signalfd, socket,
                                            * plus one slot per client */
-        int n = 0, widx, pipeidx, sigidx, sockidx;
+        int n = 0, widx, pipeidx, sigidx, sockidx, cidx;
         int pr, rc;
         int i;
 
@@ -1807,14 +1880,22 @@ int main(int argc, char **argv) {
             sockidx = n; pfd[n].fd = g_sock_fd;
             pfd[n].events = POLLIN; pfd[n++].revents = 0;
         }
+        if (tray_fd() >= 0) {
+            pfd[n].fd = tray_fd();
+            pfd[n].events = tray_events(); pfd[n++].revents = 0;
+        }
+        cidx = -1;
         for (i = 0; i < IPC_MAX && n < (int)(sizeof pfd / sizeof pfd[0]); i++)
             if (g_ipc[i]) {
+                if (cidx < 0) cidx = n;   /* clients may follow the tray fd,
+                                           * so never derive their index from
+                                           * sockidx */
                 pfd[n].fd = g_ipc[i]->fd;
                 pfd[n].events = POLLIN;
                 pfd[n++].revents = 0;
             }
 
-        rc = poll(pfd, (nfds_t)n, -1);
+        rc = poll(pfd, (nfds_t)n, tray_timeout_ms());
         if (rc < 0 && errno != EINTR) {
             wl_display_cancel_read(g_dpy);
             L("poll failed (errno %d) - exiting", errno);
@@ -1841,12 +1922,15 @@ int main(int argc, char **argv) {
             g_quit = 1;
         }
         if (sockidx >= 0 && (pfd[sockidx].revents & POLLIN)) SockAccept();
+        tray_process();   /* tray fd, dbus timeouts and menu actions */
         {
-            int base = sockidx >= 0 ? sockidx + 1 : 3;
-            int k = base;
+            int k = cidx;   /* index of the first client entry (not sockidx+1:
+                             * the tray fd sits between the socket and the
+                             * clients, and a stale slot must not hide a
+                             * client's POLLIN/POLLHUP) */
             for (i = 0; i < IPC_MAX; i++) {
                 if (!g_ipc[i]) continue;
-                if (k < n && (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)))
+                if (k >= 0 && k < n && (pfd[k].revents & (POLLIN | POLLHUP | POLLERR)))
                     if (!IpcReadable(g_ipc[i])) {
                         g_ipc[i] = NULL;   /* freed inside IpcReadable */
                     }
