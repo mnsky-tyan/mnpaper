@@ -61,8 +61,9 @@ static SETTINGS PaperDefaultSettings(void) {
     return s;
 }
 
-/* Same keys and value grammar as the Windows SetKeyValue: digits only,
- * unknown or malformed entries are refused, never silently zero. */
+/* Same keys as the Windows SetKeyValue, with a stricter value grammar:
+ * digits only, and the value must fit an int.  Unknown, malformed or
+ * out-of-range entries are refused, never silently zero. */
 static int SetKeyValue(SETTINGS *s, const char *arg) {
     const char *eq = strchr(arg, '=');
     char key[64];

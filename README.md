@@ -1,7 +1,9 @@
 # mnPaper
 
 A soft, generated paper texture that settles over your whole screen.
-Currently Windows only. Local, lightweight and free. Download `mnPaper.exe` from the
+The release builds are Windows; a Linux Wayland port (paper mode only for
+now) lives in [linux/](linux/README.md). Local, lightweight and free.
+Download `mnPaper.exe` from the
 [Releases page](https://github.com/mnsky-tyan/mnpaper/releases) and run it.
 
 ![Paper texture over a YouTube page](assets/screenshot-youtube.png)

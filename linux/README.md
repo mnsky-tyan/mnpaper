@@ -59,8 +59,8 @@ values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 `share`, `tbmode`, `autostart`, `autoupd`.
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
-Values are digits only; unknown keys and malformed values are refused and
-logged, never silently zeroed.
+Values are digits only and must fit an int; unknown keys, malformed and
+out-of-range values are refused and logged, never silently zeroed.
 
 ```bash
 ./mnpaper --set warmth=80 --set intensity=40   # warmer, stronger
