@@ -1,8 +1,8 @@
 # mnPaper for Linux (Wayland)
 
 The same warm paper texture over your whole screen, as a native Wayland
-client. One binary, no runtime dependencies beyond libwayland, no GPU, no
-telemetry.
+client. One binary, no runtime dependencies beyond libwayland and
+libsystemd, no GPU, no telemetry.
 
 ```
 make          # builds ./mnpaper
@@ -101,16 +101,18 @@ that strip". Two settings control it:
 
 `panelgap` (0-512, default 96) is how tall that uncovered strip is. Set it to
 your panel height: KDE's default floating panel is 72-96 logical pixels, GNOME's
-is about 48. Setting `panelgap=0` covers the screen edge to edge.
+is about 48. With `panelgap=0` no strip of its own is reserved.
 
 ```bash
 ./mnpaper --set panelgap=48      # a 48px strip for a GNOME-style panel
-./mnpaper --set panelgap=0       # cover everything, panels included
+./mnpaper --set panelgap=0       # no extra strip; the compositor still keeps a docked panel clear
 ```
 
-Note that a *docked* panel reserves its own space via a positive exclusive
-zone and is handled by the compositor without any gap; the gap only matters
-for floating panels.
+The daemon cannot tell a docked panel from a floating one: with `tbmode=0`
+the `panelgap` strip is always reserved, on top of whatever the compositor
+already reserves for a panel. `panelgap=0` lets a docked panel rely on the
+compositor's own avoidance, where the compositor provides one; where it does
+not, the veil reaches the screen edge.
 
 ## Autostart (start with the session)
 
@@ -151,7 +153,9 @@ it diffs cleanly and survives partial edits.
 ## How it works
 
 - **`zwlr_layer_shell_v1`** puts a surface on the `overlay` layer, anchored to
-  all four edges with exclusive zone `-1` (so panels never shrink it). This is
+  all four edges, with a tbmode-dependent exclusive zone (`0` by default, `-1`
+  with `tbmode=1`); in the default tbmode the bottom `panelgap` margin, not
+  the zone, is what keeps a floating panel and the tray clickable. This is
   the Wayland equivalent of `WS_EX_TOPMOST` + a fullscreen borderless window.
 - **Autostart** is an XDG `.desktop` file, applied on every settings change
   (idempotent), and read back at load as the source of truth.

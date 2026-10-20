@@ -19,7 +19,7 @@ XDG = protocols/xdg-shell
 
 all: $(BIN)
 
-$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c ../version.h
+$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c $(XDG).c ../version.h
 	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c -o $@ $(LDLIBS)
 
 # regenerate the vendored protocol code only when the XML changes
@@ -27,6 +27,9 @@ $(PROT).h: $(PROT).xml
 	wayland-scanner client-header $< $@
 
 $(PROT).c: $(PROT).xml
+	wayland-scanner private-code $< $@
+
+$(XDG).c: $(XDG).xml
 	wayland-scanner private-code $< $@
 
 test: tests/test_core

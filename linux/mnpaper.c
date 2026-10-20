@@ -1205,6 +1205,11 @@ static void MenuEditConfig(void) {
     const char *path = ConfigPath();
     pid_t pid = fork();
     if (pid == 0) {
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
         setsid();
         execlp("xdg-open", "xdg-open", path ? path : "", (char *)NULL);
         _exit(127);
@@ -1679,7 +1684,11 @@ int main(int argc, char **argv) {
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--log") && i + 1 < argc) {
-            g_log = fopen(argv[++i], "a");
+            int fd = open(argv[++i], O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+            if (fd >= 0) {
+                g_log = fdopen(fd, "a");
+                if (!g_log) close(fd);
+            }
             L("=== mnpaper (wayland) start ===");
         } else if (!strcmp(argv[i], "--dump-tex")) {
             if (i + 3 >= argc) {

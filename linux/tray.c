@@ -36,6 +36,10 @@ enum {
     ID_QUIT = 9,
 };
 
+/* The menu model holds 18 items; one D-Bus call is served for at most this
+ * many ids or events, and anything beyond is dropped. */
+#define MENU_BATCH_MAX 64
+
 static const char *STRENGTH_NAMES[4] = { "Subtle (10)", "Soft (20)",
                                          "Medium (30)", "Strong (40)" };
 static const int STRENGTH_STEPS[4] = { 10, 20, 30, 40 };
@@ -178,8 +182,15 @@ static int PropAppend(sd_bus_message *m, int id, const char *key) {
         else {
             int si = id - ID_STRENGTH_BASE - 1;
             int wi = id - ID_WARMTH_BASE - 1;
-            if (si >= 0 && si < 4) on = (StrengthIndex() == si);
-            else if (wi >= 0 && wi < 4) on = (WarmthIndex() == wi);
+            if (si >= 0 && si < 4) {
+                int cur = StrengthIndex();
+                if (cur < 0) return 0;
+                on = (cur == si);
+            } else if (wi >= 0 && wi < 4) {
+                int cur = WarmthIndex();
+                if (cur < 0) return 0;
+                on = (cur == wi);
+            }
         }
         sd_bus_message_append(m, "{sv}", "toggle-state", "i", on);
         return 1;
@@ -275,6 +286,7 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
         int32_t *grown;
         r = sd_bus_message_read(msg, "i", &v);
         if (r <= 0) break;
+        if (nids >= MENU_BATCH_MAX) break;
         grown = realloc(ids, (nids + 1) * sizeof *ids);
         if (!grown) { oom = 1; break; }
         ids = grown;
@@ -335,7 +347,7 @@ static int MenuAboutToShow(sd_bus_message *msg, void *ud, sd_bus_error *err) {
  * map exactly the same ids, or a batched click silently does nothing. */
 static void MenuActivate(int32_t id, const char *event) {
     int si, wi;
-    if (strcmp(event, "clicked") && strcmp(event, "toggled")) return;
+    if (strcmp(event, "clicked")) return;
     switch (id) {
     case ID_SHOW: cb->toggle_show(); break;
     case ID_AUTOSTART: cb->toggle_autostart(); break;
@@ -368,7 +380,7 @@ static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 }
 
 static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
-    int r;
+    int r, applied = 0;
     (void)ud; (void)err;
     /* Plasma sends batched events only for keyboard activation; every one of
      * them has to be applied, not just the first. */
@@ -385,6 +397,7 @@ static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
         r = sd_bus_message_exit_container(msg);
         if (r <= 0) break;
         MenuActivate(id, event);
+        if (++applied >= MENU_BATCH_MAX) break;
     }
     sd_bus_message_exit_container(msg);
     {   /* DBusMenu defines the result as the array of ids that could not be
@@ -666,7 +679,7 @@ void tray_state_changed(void) {
         }
         sd_bus_message_close_container(sig);
     }
-    r = sd_bus_message_open_container(sig, SD_BUS_TYPE_ARRAY, "(ias)");
+    r = sd_bus_message_open_container(sig, SD_BUS_TYPE_ARRAY, "s");
     if (r >= 0) sd_bus_message_close_container(sig);
     r = sd_bus_send(NULL, sig, NULL);
     sd_bus_message_unref(sig);
