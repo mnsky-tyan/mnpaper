@@ -17,8 +17,9 @@
  *
  * The app drives everything through callbacks; the tray never touches the
  * Wayland state itself.  If the session has no StatusNotifierWatcher (plain
- * GNOME, bare wlroots), tray_start fails with a log line and the CLI keeps
- * working - the tray is an enhancement, never a dependency.
+ * GNOME, bare wlroots), the tray logs that and waits for one: the CLI keeps
+ * working and the icon appears when a watcher shows up - the tray is an
+ * enhancement, never a dependency.
  */
 #ifndef MNPAPER_TRAY_H
 #define MNPAPER_TRAY_H
@@ -36,8 +37,10 @@ struct TRAYCB {
     int  (*query_autostart)(void);
 };
 
-/* Start the tray.  Returns 0 on success, -1 when the session has no tray
- * watcher (the reason is logged).  Never fatal for the daemon. */
+/* Start the tray.  Returns 0 when the tray is up, -1 when the session bus
+ * itself is unusable (the reason is logged).  A session without a tray
+ * watcher is not a failure: the daemon keeps watching for one and registers
+ * the item when it appears.  Never fatal for the daemon. */
 int tray_start(const struct TRAYCB *cb);
 
 /* Call after any state the menu reflects has changed: re-emits item

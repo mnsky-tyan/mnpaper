@@ -36,18 +36,13 @@ enum {
     ID_QUIT = 9,
 };
 
-/* Reported in the DBusMenu idErrors array when a call was cut short at the
- * work bound.  It is not an id the menu model can produce, so a host that
- * sees it knows the reply does not cover everything it sent. */
-#define MENU_ERRS_TRUNCATED (-1)
-
 /* Work bound for one D-Bus call.  This menu has 18 items and a real host
  * sends a few dozen ids or events at most, so this is far above any genuine
  * batch while still stopping a hostile flood from stalling the poll loop.
  * The bound is on the WORK, not just on what is answered: reading stops at
  * it, so a caller sending a million ids costs the same as one sending a
- * hundred.  A truncated call is never left looking like a success - see
- * MenuEventGroup's sentinel and MenuGetGroupProperties' refusal. */
+ * hundred.  A truncated call is never left looking like a success - both
+ * MenuGetGroupProperties and MenuEventGroup refuse it with a D-Bus error. */
 #define MENU_BATCH_MAX 256
 
 /* Bound for every method call this connection makes.  Without one, sd-bus'
@@ -303,7 +298,9 @@ static int MenuGetLayout(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     (void)ud;
 
     r = sd_bus_message_read(msg, "ii", &parent, &depth);
-    if (r < 0) return r;
+    if (r <= 0)
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed GetLayout body");
     /* The trailing propertyNames ("as") is deliberately ignored: every item
      * ships its full property set, which the spec allows.  It is not read at
      * all - a caller could put a million names there, and reading them would
@@ -325,7 +322,7 @@ static int MenuGetLayout(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
                                   sd_bus_error *err) {
     sd_bus_message *reply = NULL;
-    int r, n = 0;
+    int r, n = 0, in_array = 0;
     (void)ud;
     /* Ids are streamed straight into the reply, so the request never has to
      * be buffered.  The property-name filter is ignored on purpose: we always
@@ -334,8 +331,9 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
      * sending a hundred. */
     r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "i");
     if (r < 0) return r;
+    in_array = r > 0;    /* 0 means an empty array: no container was entered */
     r = sd_bus_message_new_method_return(msg, &reply);
-    if (r < 0) { sd_bus_message_exit_container(msg); return r; }
+    if (r < 0) { if (in_array) sd_bus_message_exit_container(msg); return r; }
     r = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "(ia{sv})");
     for (; r >= 0 && n <= MENU_BATCH_MAX;) {
         int32_t id;
@@ -355,7 +353,7 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
         r = sd_bus_message_close_container(reply);
         if (r < 0) break;
     }
-    sd_bus_message_exit_container(msg);
+    if (in_array) sd_bus_message_exit_container(msg);
     /* The caller sent more ids than the bound allows: the loop stopped
      * reading, so refuse the whole call rather than answering a prefix as if
      * it were everything. */
@@ -376,9 +374,11 @@ static int MenuAboutToShow(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int32_t id;
     sd_bus_message *reply;
     int r;
-    (void)ud; (void)err;
+    (void)ud;
     r = sd_bus_message_read(msg, "i", &id);
-    if (r < 0) return r;
+    if (r <= 0)
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed AboutToShow body");
     r = sd_bus_message_new_method_return(msg, &reply);
     if (r < 0) return r;
     /* We push layout changes with LayoutUpdated, so nothing to flush here.
@@ -415,12 +415,16 @@ static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int32_t id;
     const char *event;
     int r, rr;
-    (void)ud; (void)err;
+    (void)ud;
 
     r = sd_bus_message_read(msg, "is", &id, &event);
-    if (r < 0) return r;
+    if (r <= 0)
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed Event body");
     r = sd_bus_message_skip(msg, "vu");   /* data is a variant of any type */
-    if (r < 0) return r;
+    if (r < 0)
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed Event body");
     MenuActivate(id, event);
     /* empty result: send the reply ourselves (see SniActivate) */
     rr = sd_bus_reply_method_return(msg, NULL);
@@ -430,60 +434,76 @@ static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 
 static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     sd_bus_message *reply = NULL;
-    int r, seen = 0, overflow = 0;
-    (void)ud; (void)err;
+    int r, seen = 0, overflow = 0, malformed = 0;
+    (void)ud;
     /* Plasma sends batched events only for keyboard activation; every one of
      * them has to be applied, not just the first.  The work one call can
      * cause is bounded by MENU_BATCH_MAX: the loop stops reading there, so a
      * hostile peer cannot hold the poll loop.  An id the model does not have
-     * is reported in idErrors; when the caller sent more than the bound, the
-     * tail was never read, and the array then ends with a sentinel that no
-     * menu id can equal, so the reply cannot be mistaken for "everything
-     * else was applied". */
+     * is reported in idErrors.  A call that carried more than the bound is
+     * refused with a D-Bus error once the events already read took effect:
+     * the tail was never read, and no value of the idErrors array could say
+     * so - that array holds exactly the ids the host itself sent. */
     r = sd_bus_message_new_method_return(msg, &reply);
     if (r < 0) return r;
     r = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "i");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
     r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "(isvu)");
-    for (;;) {
-        int32_t id;
-        const char *event;
-        r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_STRUCT, "isvu");
-        if (r <= 0) break;       /* the array ends here, or is malformed */
-        r = sd_bus_message_read(msg, "is", &id, &event);
-        if (r <= 0) break;
-        r = sd_bus_message_skip(msg, "vu");
-        if (r < 0) break;
-        r = sd_bus_message_exit_container(msg);
-        if (r <= 0) break;
-        if (seen == MENU_BATCH_MAX) {
-            /* one event past the bound: it is the last one read, and the
-             * rest of the array is left unread */
-            overflow = 1;
-            break;
+    if (r < 0)
+        malformed = 1;
+    else if (r > 0) {
+        for (;;) {
+            int32_t id;
+            const char *event;
+            int bad = 0;
+            r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_STRUCT, "isvu");
+            if (r < 0) { malformed = 1; break; }
+            if (r == 0) break;       /* the array ends here */
+            r = sd_bus_message_read(msg, "is", &id, &event);
+            if (r <= 0)
+                bad = 1;
+            else {
+                r = sd_bus_message_skip(msg, "vu");
+                if (r < 0) bad = 1;
+            }
+            r = sd_bus_message_exit_container(msg);
+            if (r < 0) bad = 1;
+            if (bad) { malformed = 1; break; }
+            if (seen == MENU_BATCH_MAX) {
+                /* one event past the bound: it is the last one read, and
+                 * the rest of the array is left unread */
+                overflow = 1;
+                break;
+            }
+            seen++;
+            if (!MenuActivate(id, event)) {
+                /* unapplied: an id the model does not have */
+                int ar = sd_bus_message_append(reply, "i", id);
+                if (ar < 0) { sd_bus_message_unref(reply); return ar; }
+            }
         }
-        seen++;
-        /* unapplied: an id the model does not have */
-        if (!MenuActivate(id, event)) {
-            r = sd_bus_message_append(reply, "i", id);
-            if (r < 0) break;
-        }
+        sd_bus_message_exit_container(msg);
     }
-    sd_bus_message_exit_container(msg);
+
+    if (malformed) {
+        sd_bus_message_unref(reply);
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed EventGroup body");
+    }
     if (overflow) {
-        /* The caller's events past the bound were never read, so say so
-         * rather than letting the host assume they were applied: the
-         * sentinel is not an id the menu model can produce. */
-        r = sd_bus_message_append(reply, "i", MENU_ERRS_TRUNCATED);
-        if (r < 0) { sd_bus_message_unref(reply); return r; }
-    }
-    if (r >= 0) r = sd_bus_message_close_container(reply);
-    if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
-    sd_bus_message_unref(reply);
-    if (overflow)
+        /* The caller's events past the bound were never read, so the call is
+         * refused instead of answered: a host must never read a truncated
+         * batch as "everything else was applied". */
+        sd_bus_message_unref(reply);
         L("tray: EventGroup truncated at %d events - the rest never read",
           MENU_BATCH_MAX);
+        return sd_bus_error_setf(err, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                 "more than %d events in one call", MENU_BATCH_MAX);
+    }
+    r = sd_bus_message_close_container(reply);
+    if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
+    sd_bus_message_unref(reply);
     return r < 0 ? r : 1;
 }
 
@@ -613,8 +633,12 @@ static int SniActivate(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 static int SniScroll(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int32_t delta;
     const char *orient;
-    (void)ud; (void)err;
-    if (sd_bus_message_read(msg, "is", &delta, &orient) < 0) return -EINVAL;
+    int r;
+    (void)ud;
+    r = sd_bus_message_read(msg, "is", &delta, &orient);
+    if (r <= 0)
+        return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+                                 "malformed Scroll body");
     /* Scroll up/down steps through the strength presets, like a volume icon. */
     {
         int i = StrengthIndex(), v;
@@ -667,18 +691,28 @@ static const sd_bus_vtable menu_vtable[] = {
 
 /* -------------------------------------------------------------- lifecycle -- */
 
+/* Whether the watcher knows us.  The registration is attempted once at
+ * startup and again whenever the watcher's owner changes; until one of those
+ * attempts goes through the icon is simply not there. */
+static int registered;
+
 /* Register with the watcher without waiting for the reply: a wedged watcher
  * must never hold the poll loop, and the reply is only reported. */
 static int TrayRegisterCb(sd_bus_message *m, void *ud, sd_bus_error *ret_error) {
     const sd_bus_error *e;
     (void)ud; (void)ret_error;
     e = sd_bus_message_get_error(m);
-    if (e)
-        L("tray: re-register did not go through (%s) - the icon stays hidden "
+    if (e) {
+        L("tray: registration did not go through (%s) - the icon stays hidden "
           "until a watcher answers",
           e->message ? e->message : e->name);
-    else
+        return 0;
+    }
+    if (registered)
         L("tray: re-registered as %s", service);
+    else
+        L("tray: registered as %s", service);
+    registered = 1;
     return 0;
 }
 
@@ -696,9 +730,11 @@ static void TrayRegisterAsync(void) {
 /* org.freedesktop.DBus.NameOwnerChanged for the watcher name.  A panel
  * restart or a plasmashell crash replaces the watcher with one holding an
  * empty item list, and the icon is only recovered by registering again - what
- * KDE's own KStatusNotifierItem does on a watcher owner change.  The match
- * rule pins arg0 to the watcher name, so only the owner pair is of interest:
- * a vanishing owner needs no action, a new one is a watcher to join. */
+ * KDE's own KStatusNotifierItem does on a watcher owner change.  A watcher
+ * that only shows up after the daemon started (at login plasmashell often
+ * comes up later) is joined the same way.  The match rule pins arg0 to the
+ * watcher name, so only the owner pair is of interest: a vanishing owner
+ * needs no action, a new one is a watcher to join. */
 static int TrayWatcherChanged(sd_bus_message *m, void *ud, sd_bus_error *ret_error) {
     const char *name, *old_owner, *new_owner;
     int r;
@@ -766,10 +802,13 @@ int tray_start(const struct TRAYCB *c) {
     r = sd_bus_request_name(bus, service, SD_BUS_NAME_REPLACE_EXISTING);
     if (r < 0) goto fail;
 
-    /* Watch the watcher: the registration below happens exactly once, so a
-     * panel restart that replaces org.kde.StatusNotifierWatcher would
-     * otherwise leave the icon gone until mnpaper itself is restarted.  Async
-     * on purpose - the synchronous sd_bus_add_match sends its own AddMatch
+    signal(SIGCHLD, SIG_IGN);   /* the Edit-config child is fire and forget */
+
+    /* Watch the watcher: the registration below is tried once at startup,
+     * and this signal is what picks up a watcher that appears later or
+     * replaces the one we registered with - a panel restart would otherwise
+     * leave the icon gone until mnpaper itself is restarted.  Async on
+     * purpose - the synchronous sd_bus_add_match sends its own AddMatch
      * call and waits on sd-bus' built-in 25 s, which no connection setting
      * shortens (measured: 25.03 s against a wedged bus), and a match that
      * cannot be installed is a lost restart recovery, not a reason to drop
@@ -786,17 +825,20 @@ int tray_start(const struct TRAYCB *c) {
                            "RegisterStatusNotifierItem", &err, &reply, "s",
                            service);
     if (r < 0) {
-        L("tray: no tray watcher on this session (%s) - tray disabled, "
+        /* No watcher on this session yet - or one that is wedged.  The bus,
+         * the name, the vtables and the match stay up on purpose: a watcher
+         * that shows up later is joined through the NameOwnerChanged signal,
+         * so the icon appears whenever the panel gets there.  The CLI works
+         * either way - the tray is an enhancement, never a dependency. */
+        L("tray: no tray watcher answered (%s) - waiting for one to appear, "
           "CLI still works", err.message ? err.message : strerror(-r));
         sd_bus_error_free(&err);
-        sd_bus_unref(bus);
-        bus = NULL;
-        return -1;
+        return 0;
     }
     sd_bus_message_unref(reply);
     sd_bus_error_free(&err);
+    registered = 1;
 
-    signal(SIGCHLD, SIG_IGN);   /* the Edit-config child is fire and forget */
     L("tray: registered as %s", service);
     return 0;
 
