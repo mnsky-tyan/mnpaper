@@ -47,9 +47,11 @@ static void TestDefaultsAndClamp(void) {
     CHECK(s.intensity == 30 && s.warmth == 45, "defaults: intensity/warmth");
     CHECK(s.grain == 4 && s.fibre == 40 && s.blotch == 30, "defaults: texture");
     CHECK(s.tbmode == TB_NOT_COVER, "defaults: tbmode");
+    CHECK(s.panelgap == 96, "defaults: panelgap 96");
 
     s.intensity = 999; s.warmth = -5; s.grain = 1; s.blotch = 1000;
     s.shades = 0; s.dither = -1; s.master = 7; s.mode = 9;
+    s.tbmode = TB_COVER + 7; s.panelgap = 5000;
     ClampSettingsOf(&s);
     CHECK(s.intensity == 40, "clamp: intensity hi 40");
     CHECK(s.warmth == 0, "clamp: warmth lo 0");
@@ -59,6 +61,16 @@ static void TestDefaultsAndClamp(void) {
     CHECK(s.dither == 0, "clamp: dither lo 0");
     CHECK(s.master == 1, "clamp: master to 1");
     CHECK(s.mode == 1, "clamp: mode to 1");
+    /* the bottom strip the veil leaves for a floating panel: its upper bound
+     * is what keeps a bad value from reserving a dead band across the screen,
+     * and tbmode's bound is what keeps ApplyExclusiveZone choosing a zone */
+    CHECK(s.panelgap == 512, "clamp: panelgap hi 512");
+    CHECK(s.tbmode == TB_COVER, "clamp: tbmode to TB_COVER");
+
+    s = PaperDefaultSettings();
+    s.panelgap = -1;
+    ClampSettingsOf(&s);
+    CHECK(s.panelgap == 0, "clamp: panelgap lo 0");
 }
 
 static void TestSetKeyValueGrammar(void) {
@@ -72,6 +84,17 @@ static void TestSetKeyValueGrammar(void) {
     CHECK(s.mode == MODE_EINK, "set: mode eink");
     CHECK(SetKeyValue(&s, "tbmode=1"), "set: tbmode accepted");
     CHECK(s.tbmode == TB_COVER, "set: tbmode mapped");
+    CHECK(SetKeyValue(&s, "panelgap=48"), "set: panelgap accepted");
+    CHECK(s.panelgap == 48, "set: panelgap applied");
+    /* an out-of-range panelgap is a clamp case, not a refusal: the grammar
+     * accepts it and ClampSettingsOf brings it to the nearest bound */
+    CHECK(SetKeyValue(&s, "panelgap=5000"), "set: oversized panelgap accepted");
+    ClampSettingsOf(&s);
+    CHECK(s.panelgap == 512, "set: oversized panelgap clamps to 512");
+    CHECK(SetKeyValue(&s, "tbmode=9"), "set: oversized tbmode accepted");
+    CHECK(s.tbmode == TB_COVER, "set: any nonzero tbmode maps to cover");
+    ClampSettingsOf(&s);
+    CHECK(s.tbmode == TB_COVER, "set: oversized tbmode stays in range");
 
     CHECK(!SetKeyValue(&s, "intensity="), "set: empty value refused");
     CHECK(!SetKeyValue(&s, "intensity=x"), "set: non-numeric refused");

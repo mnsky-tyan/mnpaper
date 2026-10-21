@@ -87,8 +87,10 @@ static SETTINGS PaperDefaultSettings(void) {
 }
 
 /* Same keys as the Windows SetKeyValue, with a stricter value grammar:
- * digits only, and the value must fit an int.  Unknown, malformed or
- * out-of-range entries are refused, never silently zero. */
+ * digits only, and the value must fit an int.  Unknown keys and malformed
+ * values are refused, never silently zero.  A well-formed value outside a
+ * key's bounds is accepted here and clamped to the nearest bound by
+ * ClampSettingsOf, exactly as on Windows. */
 static int SetKeyValue(SETTINGS *s, const char *arg) {
     const char *eq = strchr(arg, '=');
     char key[64];

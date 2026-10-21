@@ -61,8 +61,11 @@ values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 `share`, `tbmode`, `autostart`, `autoupd`, `panelgap` (0-512).
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
-Values are digits only and must fit an int; unknown keys, malformed and
-out-of-range values are refused and logged, never silently zeroed.
+Values are digits only and must fit an int.  Unknown keys and malformed
+values are refused and logged.  An in-range-shaped value that is outside a
+key's bounds is not refused: it is accepted and silently clamped to the
+nearest bound, so `--set intensity=999` answers `ok applied 1` and leaves
+`intensity` at 40.  `--status` prints the values actually in effect.
 
 ```bash
 ./mnpaper --set warmth=80 --set intensity=40   # warmer, stronger

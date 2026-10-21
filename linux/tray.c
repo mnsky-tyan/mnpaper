@@ -925,7 +925,11 @@ int tray_timeout_ms(void) {
     now = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000u;
     if (t <= now) return 0;
     if ((t - now) / 1000ull > 1000000ull) return -1;
-    return (int)((t - now) / 1000ull);
+    /* Round UP: sd_bus_get_timeout(3) requires it, and a truncating divide
+     * turns any remaining fraction of a millisecond into 0, which makes the
+     * poll loop spin poll(...,0) -> tray_process() until the deadline
+     * actually passes. */
+    return (int)((t - now + 999ull) / 1000ull);
 }
 
 void tray_process(void) {
