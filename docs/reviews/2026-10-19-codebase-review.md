@@ -30,7 +30,12 @@ Note: findings 1-9 are within-scope; finding 10 is the boundary issue. No duplic
 ## Clean Areas
 
 - `linux/tests/test_core.c` - assertions are behavioural (determinism, premultiplied-alpha validity, clamp bounds, `--set` grammar refusals, cancellation). The one weak spot is the preview test, which exercises code finding 8 says is unused; that is recorded under finding 8 rather than as a separate test-quality finding.
-- `linux/Makefile` - correct dependency graph, vendored protocol regeneration is gated on the XML, no unstated build requirements. `make clean` and a from-scratch `make` both verified.
+- `linux/Makefile` - the vendored protocol code is committed and the scanner
+  rules are order-only on the XML, so a plain `make` never invokes
+  `wayland-scanner` and needs only the two libraries and their headers;
+  `make regen` is the explicit path for a changed XML. `make clean` and a
+  from-scratch `make` both verified, the latter with `wayland-scanner` absent
+  from `PATH`.
 - The buffer-retirement discipline in `RetireSet`/`BufferRelease`/`FlushRetired` is otherwise sound: the `wl_shm` release contract is honoured, and the deliberate "leak rather than unmap live memory" choice on slot exhaustion is correct and documented.
 - The single-instance socket probe, stale-socket reclaim, and exit codes (`0`/`1`/`2`) were read and match the documented contract and the Windows behaviour.
 

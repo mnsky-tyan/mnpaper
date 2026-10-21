@@ -7,6 +7,7 @@
 #
 #   make            build ./mnpaper
 #   make test       build and run the headless core tests (no display needed)
+#   make regen      re-run wayland-scanner after editing a protocol .xml
 
 CC      ?= cc
 CFLAGS  ?= -O2
@@ -22,15 +23,23 @@ all: $(BIN)
 $(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c $(XDG).c ../version.h
 	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c -o $@ $(LDLIBS)
 
-# regenerate the vendored protocol code only when the XML changes
-$(PROT).h: $(PROT).xml
-	wayland-scanner client-header $< $@
+# regenerate the vendored protocol code only when the XML changes; the XML is
+# an ORDER-ONLY prerequisite, so the committed generated files are treated as
+# sources and a plain build never runs wayland-scanner.
+$(PROT).h: | $(PROT).xml
+	wayland-scanner client-header $(PROT).xml $@
 
-$(PROT).c: $(PROT).xml
-	wayland-scanner private-code $< $@
+$(PROT).c: | $(PROT).xml
+	wayland-scanner private-code $(PROT).xml $@
 
-$(XDG).c: $(XDG).xml
-	wayland-scanner private-code $< $@
+$(XDG).c: | $(XDG).xml
+	wayland-scanner private-code $(XDG).xml $@
+
+# explicit regeneration for when the XML really changes
+regen:
+	wayland-scanner client-header $(PROT).xml $(PROT).h
+	wayland-scanner private-code $(PROT).xml $(PROT).c
+	wayland-scanner private-code $(XDG).xml $(XDG).c
 
 test: tests/test_core
 	./tests/test_core
@@ -41,4 +50,4 @@ tests/test_core: tests/test_core.c paper_core.h
 clean:
 	rm -f $(BIN) tests/test_core
 
-.PHONY: all test clean
+.PHONY: all test clean regen

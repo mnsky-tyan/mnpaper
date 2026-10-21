@@ -94,25 +94,25 @@ placed between them), so "do not cover the taskbar" has to mean "do not paint
 that strip". Two settings control it:
 
 - `tbmode=0` (the default, matching Windows' TB_NOT_COVER): the bottom
-  `panelgap` logical pixels are left uncovered, so a floating panel - and the
-  tray icon in it - stays visible and clickable.
+  `panelgap` logical pixels are left uncovered, so a panel there - floating or
+  docked - and the tray icon in it stay visible and clickable. The strip is
+  reserved whether the panel is floating or docked, so a docked panel gets
+  this strip **in addition to** the space the compositor already reserves for
+  it; see `panelgap` below.
 - `tbmode=1` (TB_COVER): the veil covers the whole screen including that
   strip, like the Windows mode of the same name.
 
-`panelgap` (0-512, default 96) is how tall that uncovered strip is. Set it to
-your panel height: KDE's default floating panel is 72-96 logical pixels, GNOME's
-is about 48. With `panelgap=0` no strip of its own is reserved.
+`panelgap` (0-512, default 96) is how tall that uncovered strip is. The daemon
+cannot tell a docked panel from a floating one, so the strip is always
+reserved: set it to your floating panel's height (KDE's default floating panel
+is 72-96 logical pixels, GNOME's is about 48) and set `panelgap=0` when your
+panel is docked, letting the compositor's own avoidance keep it clear. Where
+the compositor provides no such avoidance, the veil reaches the screen edge.
 
 ```bash
-./mnpaper --set panelgap=48      # a 48px strip for a GNOME-style panel
+./mnpaper --set panelgap=48      # a 48px strip for a floating GNOME-style panel
 ./mnpaper --set panelgap=0       # no extra strip; the compositor still keeps a docked panel clear
 ```
-
-The daemon cannot tell a docked panel from a floating one: with `tbmode=0`
-the `panelgap` strip is always reserved, on top of whatever the compositor
-already reserves for a panel. `panelgap=0` lets a docked panel rely on the
-compositor's own avoidance, where the compositor provides one; where it does
-not, the veil reaches the screen edge.
 
 ## Autostart (start with the session)
 
@@ -155,8 +155,9 @@ it diffs cleanly and survives partial edits.
 - **`zwlr_layer_shell_v1`** puts a surface on the `overlay` layer, anchored to
   all four edges, with a tbmode-dependent exclusive zone (`0` by default, `-1`
   with `tbmode=1`); in the default tbmode the bottom `panelgap` margin, not
-  the zone, is what keeps a floating panel and the tray clickable. This is
-  the Wayland equivalent of `WS_EX_TOPMOST` + a fullscreen borderless window.
+  the zone, is what keeps the bottom panel strip (and the tray in it)
+  clickable. This is the Wayland equivalent of `WS_EX_TOPMOST` + a fullscreen
+  borderless window.
 - **Autostart** is an XDG `.desktop` file, applied on every settings change
   (idempotent), and read back at load as the source of truth.
 - **`wl_shm` + ARGB8888** is premultiplied BGRA in memory: byte-for-byte the
@@ -217,8 +218,9 @@ make clean
 ```
 
 The vendored protocol code (`protocols/`) is committed, so a normal build
-needs no wayland-protocols package. `xdg-shell` is linked because
-`wlr-layer-shell` references its `xdg_popup` symbols.
+needs neither a wayland-protocols package nor `wayland-scanner`. `xdg-shell` is
+linked because `wlr-layer-shell` references its `xdg_popup` symbols. After
+editing a protocol `.xml`, run `make regen` to re-scan it.
 
 ## Testing
 
