@@ -36,11 +36,18 @@ enum {
     ID_QUIT = 9,
 };
 
+/* Reported in the DBusMenu idErrors array when a call was cut short at the
+ * work bound.  It is not an id the menu model can produce, so a host that
+ * sees it knows the reply does not cover everything it sent. */
+#define MENU_ERRS_TRUNCATED (-1)
+
 /* Work bound for one D-Bus call.  This menu has 18 items and a real host
  * sends a few dozen ids or events at most, so this is far above any genuine
  * batch while still stopping a hostile flood from stalling the poll loop.
- * Anything a call cannot apply is reported back to the caller, never dropped
- * silently. */
+ * The bound is on the WORK, not just on what is answered: reading stops at
+ * it, so a caller sending a million ids costs the same as one sending a
+ * hundred.  A truncated call is never left looking like a success - see
+ * MenuEventGroup's sentinel and MenuGetGroupProperties' refusal. */
 #define MENU_BATCH_MAX 256
 
 static const char *STRENGTH_NAMES[4] = { "Subtle (10)", "Soft (20)",
@@ -280,10 +287,10 @@ static int MenuGetLayout(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 
     r = sd_bus_message_read(msg, "ii", &parent, &depth);
     if (r < 0) return r;
-    /* propertyNames (the trailing "as") is deliberately ignored: every item
-     * ships its full property set, which the spec allows. */
-    r = sd_bus_message_skip(msg, "as");
-    if (r < 0) return r;
+    /* The trailing propertyNames ("as") is deliberately ignored: every item
+     * ships its full property set, which the spec allows.  It is not read at
+     * all - a caller could put a million names there, and reading them would
+     * cost the poll loop time for nothing. */
     if (!MenuIdValid(parent))
         return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
                                  "unknown menu id %d", parent);
@@ -305,17 +312,22 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
     (void)ud;
     /* Ids are streamed straight into the reply, so the request never has to
      * be buffered.  The property-name filter is ignored on purpose: we always
-     * return everything we have, which the spec allows. */
+     * return everything we have, which the spec allows.  Reading stops at the
+     * bound, so a caller sending a million ids costs the same work as one
+     * sending a hundred. */
     r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "i");
     if (r < 0) return r;
     r = sd_bus_message_new_method_return(msg, &reply);
     if (r < 0) { sd_bus_message_exit_container(msg); return r; }
     r = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "(ia{sv})");
-    for (; r >= 0;) {
+    for (; r >= 0 && n <= MENU_BATCH_MAX;) {
         int32_t id;
         r = sd_bus_message_read(msg, "i", &id);
         if (r <= 0) break;
-        if (++n > MENU_BATCH_MAX) continue;   /* drained, but not answered */
+        n++;
+        /* one id past the bound is enough to know the call is over the
+         * bound; reading the rest of the array is what must not happen */
+        if (n > MENU_BATCH_MAX) break;
         if (!MenuIdValid(id)) continue;       /* never publish an unknown id */
         r = sd_bus_message_open_container(reply, SD_BUS_TYPE_STRUCT, "ia{sv}");
         if (r < 0) break;
@@ -327,6 +339,9 @@ static int MenuGetGroupProperties(sd_bus_message *msg, void *ud,
         if (r < 0) break;
     }
     sd_bus_message_exit_container(msg);
+    /* The caller sent more ids than the bound allows: the loop stopped
+     * reading, so refuse the whole call rather than answering a prefix as if
+     * it were everything. */
     if (n > MENU_BATCH_MAX) {
         L("tray: GetGroupProperties asked for more than %d ids - refusing",
           MENU_BATCH_MAX);
@@ -401,39 +416,56 @@ static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     int r, seen = 0, overflow = 0;
     (void)ud; (void)err;
     /* Plasma sends batched events only for keyboard activation; every one of
-     * them has to be applied, not just the first.  The work is bounded, and
-     * every id past the bound goes into the reply's idErrors array so the
-     * host knows it was not applied and can retry. */
+     * them has to be applied, not just the first.  The work one call can
+     * cause is bounded by MENU_BATCH_MAX: the loop stops reading there, so a
+     * hostile peer cannot hold the poll loop.  An id the model does not have
+     * is reported in idErrors; when the caller sent more than the bound, the
+     * tail was never read, and the array then ends with a sentinel that no
+     * menu id can equal, so the reply cannot be mistaken for "everything
+     * else was applied". */
     r = sd_bus_message_new_method_return(msg, &reply);
     if (r < 0) return r;
     r = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "i");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
     r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_ARRAY, "(isvu)");
-    while (r > 0) {
+    for (;;) {
         int32_t id;
         const char *event;
         r = sd_bus_message_enter_container(msg, SD_BUS_TYPE_STRUCT, "isvu");
-        if (r <= 0) break;
+        if (r <= 0) break;       /* the array ends here, or is malformed */
         r = sd_bus_message_read(msg, "is", &id, &event);
         if (r <= 0) break;
         r = sd_bus_message_skip(msg, "vu");
         if (r < 0) break;
         r = sd_bus_message_exit_container(msg);
         if (r <= 0) break;
-        if (++seen > MENU_BATCH_MAX) overflow = 1;
-        /* unapplied: over the bound, or an id the model does not have */
-        if (overflow || !MenuActivate(id, event)) {
+        if (seen == MENU_BATCH_MAX) {
+            /* one event past the bound: it is the last one read, and the
+             * rest of the array is left unread */
+            overflow = 1;
+            break;
+        }
+        seen++;
+        /* unapplied: an id the model does not have */
+        if (!MenuActivate(id, event)) {
             r = sd_bus_message_append(reply, "i", id);
             if (r < 0) break;
         }
     }
     sd_bus_message_exit_container(msg);
+    if (overflow) {
+        /* The caller's events past the bound were never read, so say so
+         * rather than letting the host assume they were applied: the
+         * sentinel is not an id the menu model can produce. */
+        r = sd_bus_message_append(reply, "i", MENU_ERRS_TRUNCATED);
+        if (r < 0) { sd_bus_message_unref(reply); return r; }
+    }
     if (r >= 0) r = sd_bus_message_close_container(reply);
     if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
     sd_bus_message_unref(reply);
     if (overflow)
-        L("tray: EventGroup over %d events - the rest reported as unapplied",
+        L("tray: EventGroup truncated at %d events - the rest never read",
           MENU_BATCH_MAX);
     return r < 0 ? r : 1;
 }
