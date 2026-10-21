@@ -53,8 +53,18 @@ typedef struct {
     int dither;
     int autostart;
     int share;     /* 1 = the texture is visible in screenshots / screen shares */
-    int tbmode;    /* how the veil meets a revealed taskbar (see TB_* above;
-                    * meaningful on Windows; other desktops ignore it) */
+    int tbmode;    /* how the veil meets the bottom bar (see TB_* above).
+                    * Windows: 0 raises the taskbar above the veil, 1 leaves
+                    * it under the paper.  Wayland: an overlay layer surface is
+                    * always stacked above the panel, so the modes choose
+                    * between the two by way of `panelgap` - 0 keeps the bottom
+                    * `panelgap` strip unpainted and asks the compositor for
+                    * exclusive zone 0, so a floating panel and its tray stay
+                    * visible and clickable; 1 covers the whole screen with
+                    * exclusive zone -1.  A docked panel gets its own space
+                    * reserved by the compositor on top of that strip, so
+                    * docked-panel users set `panelgap=0`.  Both platforms obey
+                    * it (mnpaper.c's ApplyExclusiveZone). */
     int autoupd;   /* 1 = look for a new version about once a day */
     int panelgap;  /* Wayland: logical pixels left uncovered at the bottom for
                     * a floating panel/tray (0 = cover everything).  A
