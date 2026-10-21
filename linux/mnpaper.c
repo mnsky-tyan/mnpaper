@@ -1677,6 +1677,7 @@ static void Usage(void) {
 int main(int argc, char **argv) {
     int i;
     int cmd = 0;
+    int set_seen = 0;
     char *sets[MAX_SETS];
     int nsets = 0;
     char dump_tex[512] = "";
@@ -1700,7 +1701,8 @@ int main(int argc, char **argv) {
             dump_w = atoi(argv[++i]);
             dump_h = atoi(argv[++i]);
             if (i + 1 < argc && argv[i + 1][0] != '-') dump_bg = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "--set")) {
+            set_seen = 1;
             while (i + 1 < argc && strchr(argv[i + 1], '=') && nsets < MAX_SETS)
                 sets[nsets++] = argv[++i];
             while (i + 1 < argc && strchr(argv[i + 1], '=')) {
@@ -1719,6 +1721,18 @@ int main(int argc, char **argv) {
                     break;
                 }
             if (!mapped) L("ignoring unknown argument: %s", argv[i]);
+        }
+    }
+
+    if (set_seen && !cmd) {
+        SETTINGS probe = PaperDefaultSettings();
+        int ok = 0, k;
+        for (k = 0; k < nsets; k++)
+            if (SetKeyValue(&probe, sets[k])) ok++;
+        if (!ok) {
+            L("--set needs at least one valid key=value pair (for example "
+              "--set warmth=45)");
+            return 2;
         }
     }
 

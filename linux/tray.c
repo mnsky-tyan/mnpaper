@@ -671,7 +671,6 @@ static const sd_bus_vtable sni_vtable[] = {
     SD_BUS_PROPERTY("Menu", "o", SniGetMenuPath, 0, 0),
     SD_BUS_PROPERTY("ItemIsMenu", "b", SniGetBool, 0, 0),
     SD_BUS_METHOD("Activate", "ii", "", SniActivate, 0),
-    SD_BUS_METHOD("SecondaryActivate", "ii", "", SniActivate, 0),
     SD_BUS_METHOD("Scroll", "is", "", SniScroll, 0),
     SD_BUS_VTABLE_END,
 };
