@@ -84,7 +84,10 @@ in the system tray as a small procedurally-drawn paper swatch.
 Everything funnels through the same `SetMaster`/`ApplySettings` path the CLI
 uses, so the menu checkmarks, `--status` and the screen can never disagree.
 If the session has no StatusNotifierWatcher (bare wlroots, some GNOME
-setups), the tray fails soft with a log line and the CLI keeps working.
+setups), the tray fails soft with a log line and the CLI keeps working. A
+watcher that is replaced later - a `plasmashell` restart or crash - is picked
+up automatically and the item registers again, so the icon comes back without
+restarting the daemon.
 
 ### Keeping the panel and tray clickable
 

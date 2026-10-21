@@ -50,6 +50,23 @@ enum {
  * MenuEventGroup's sentinel and MenuGetGroupProperties' refusal. */
 #define MENU_BATCH_MAX 256
 
+/* Bound for every method call this connection makes.  Without one, sd-bus'
+ * default is 25 s, and the register call at startup would keep the daemon out
+ * of its poll loop for that long whenever the watcher owns the name but is
+ * wedged (a login still bringing up plasmashell, a frozen panel).  5 s is
+ * generous for a healthy watcher (measured 1-2 ms to register against a live
+ * one) and short enough that the overlay reaches its loop, the CLI and the
+ * signal handling promptly. */
+#define TRAY_CALL_TIMEOUT_US (5u * 1000000u)
+
+/* The watcher name is what we re-register against: plasmashell hosts it, and
+ * a panel restart or crash replaces it with an empty list. */
+#define WATCHER_NAME "org.kde.StatusNotifierWatcher"
+#define WATCHER_MATCH \
+    "type='signal',sender='org.freedesktop.DBus'," \
+    "interface='org.freedesktop.DBus',member='NameOwnerChanged'," \
+    "path='/org/freedesktop/DBus',arg0='" WATCHER_NAME "'"
+
 static const char *STRENGTH_NAMES[4] = { "Subtle (10)", "Soft (20)",
                                          "Medium (30)", "Strong (40)" };
 static const int STRENGTH_STEPS[4] = { 10, 20, 30, 40 };
@@ -650,6 +667,68 @@ static const sd_bus_vtable menu_vtable[] = {
 
 /* -------------------------------------------------------------- lifecycle -- */
 
+/* Register with the watcher without waiting for the reply: a wedged watcher
+ * must never hold the poll loop, and the reply is only reported. */
+static int TrayRegisterCb(sd_bus_message *m, void *ud, sd_bus_error *ret_error) {
+    const sd_bus_error *e;
+    (void)ud; (void)ret_error;
+    e = sd_bus_message_get_error(m);
+    if (e)
+        L("tray: re-register did not go through (%s) - the icon stays hidden "
+          "until a watcher answers",
+          e->message ? e->message : e->name);
+    else
+        L("tray: re-registered as %s", service);
+    return 0;
+}
+
+static void TrayRegisterAsync(void) {
+    int r;
+    if (!bus) return;
+    r = sd_bus_call_method_async(bus, NULL, WATCHER_NAME,
+                                 "/StatusNotifierWatcher", WATCHER_NAME,
+                                 "RegisterStatusNotifierItem", TrayRegisterCb,
+                                 NULL, "s", service);
+    if (r < 0)
+        L("tray: re-register send failed (%s)", strerror(-r));
+}
+
+/* org.freedesktop.DBus.NameOwnerChanged for the watcher name.  A panel
+ * restart or a plasmashell crash replaces the watcher with one holding an
+ * empty item list, and the icon is only recovered by registering again - what
+ * KDE's own KStatusNotifierItem does on a watcher owner change.  The match
+ * rule pins arg0 to the watcher name, so only the owner pair is of interest:
+ * a vanishing owner needs no action, a new one is a watcher to join. */
+static int TrayWatcherChanged(sd_bus_message *m, void *ud, sd_bus_error *ret_error) {
+    const char *name, *old_owner, *new_owner;
+    int r;
+    (void)ud; (void)ret_error;
+    r = sd_bus_message_read(m, "sss", &name, &old_owner, &new_owner);
+    if (r < 0) {
+        L("tray: unreadable NameOwnerChanged (%s) - ignoring", strerror(-r));
+        return 0;
+    }
+    if (!new_owner || !*new_owner) return 0;
+    TrayRegisterAsync();
+    return 0;
+}
+
+/* Reported when the NameOwnerChanged rule could not be installed: the tray
+ * works, but a later watcher restart will not be picked up.  A callback here
+ * is not optional - with NULL, sd-bus' own default terminates the whole bus
+ * connection when installing the match fails, which would take the tray down
+ * instead of only losing the restart recovery. */
+static int TrayMatchFailed(sd_bus_message *m, void *ud, sd_bus_error *ret_error) {
+    const sd_bus_error *e;
+    (void)ud; (void)ret_error;
+    e = sd_bus_message_get_error(m);
+    if (e)
+        L("tray: cannot watch %s for restarts (%s) - the icon will not come "
+          "back on its own if the panel is restarted, CLI still works",
+          WATCHER_NAME, e->message ? e->message : e->name);
+    return 0;
+}
+
 int tray_start(const struct TRAYCB *c) {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message *reply = NULL;
@@ -665,6 +744,14 @@ int tray_start(const struct TRAYCB *c) {
         return -1;
     }
 
+    /* Bound every method call this connection makes, in particular the
+     * registration below: sd-bus' 25 s default would keep the daemon out of
+     * its poll loop for that long whenever the watcher owns the name but is
+     * wedged, leaving the CLI unanswered and a stop or logout sitting in the
+     * blocked signalfd. */
+    r = sd_bus_set_method_call_timeout(bus, TRAY_CALL_TIMEOUT_US);
+    if (r < 0) goto fail;
+
     r = sd_bus_add_object_vtable(bus, NULL, "/StatusNotifierItem",
                                  "org.kde.StatusNotifierItem",
                                  sni_vtable, NULL);
@@ -679,9 +766,23 @@ int tray_start(const struct TRAYCB *c) {
     r = sd_bus_request_name(bus, service, SD_BUS_NAME_REPLACE_EXISTING);
     if (r < 0) goto fail;
 
-    r = sd_bus_call_method(bus, "org.kde.StatusNotifierWatcher",
+    /* Watch the watcher: the registration below happens exactly once, so a
+     * panel restart that replaces org.kde.StatusNotifierWatcher would
+     * otherwise leave the icon gone until mnpaper itself is restarted.  Async
+     * on purpose - the synchronous sd_bus_add_match sends its own AddMatch
+     * call and waits on sd-bus' built-in 25 s, which no connection setting
+     * shortens (measured: 25.03 s against a wedged bus), and a match that
+     * cannot be installed is a lost restart recovery, not a reason to drop
+     * the tray the user already has. */
+    r = sd_bus_add_match_async(bus, NULL, WATCHER_MATCH, TrayWatcherChanged,
+                               TrayMatchFailed, NULL);
+    if (r < 0)
+        L("tray: cannot watch %s for restarts (%s) - tray still works",
+          WATCHER_NAME, strerror(-r));
+
+    r = sd_bus_call_method(bus, WATCHER_NAME,
                            "/StatusNotifierWatcher",
-                           "org.kde.StatusNotifierWatcher",
+                           WATCHER_NAME,
                            "RegisterStatusNotifierItem", &err, &reply, "s",
                            service);
     if (r < 0) {
