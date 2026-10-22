@@ -580,6 +580,7 @@ static void FlushRetired(struct OUT *o) {
             wl_buffer_destroy(r->buf);
             wl_buffer_destroy(r->hbuf);
             wl_shm_pool_destroy(r->pool);
+            /* our own fd: libwayland closed the dup it forwarded, not this one */
             if (r->fd >= 0) close(r->fd);
             if (r->data && r->data != MAP_FAILED) munmap(r->data, r->bytes);
         } else {
@@ -697,7 +698,12 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
 /* (Re)create this output's buffer set for logical size lw x lh at scale.
  * No-op when nothing changed.  The fd stays open: libwayland forwards it to
  * the compositor on the next flush, so it is only closed when the pool dies
- * (see RetireSet/OutTeardown). */
+ * (see RetireSet/OutTeardown).
+ *
+ * The fd stays ours: wl_shm_create_pool does not adopt it.  libwayland dups
+ * the descriptor it is handed (wl_closure_marshal) and closes that copy once
+ * the request has been sent, so the number recorded here is still the one
+ * this process opened - and still the one to close when the set is retired. */
 static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     size_t bytes;
     int fd = -1;
