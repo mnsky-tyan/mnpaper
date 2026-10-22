@@ -10,10 +10,7 @@ __pycache__/
 samples/
 AGENTS.md
 probes/
-# review reports land here: the committed one is tracked on purpose, and a
-# NEW report has to show up in git status instead of being silently skipped
-docs/reviews/*
-!docs/reviews/*.md
+docs/reviews/
 # linux/ (Wayland port) build output
 linux/mnpaper
 linux/tests/test_core

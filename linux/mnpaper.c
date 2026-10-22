@@ -753,7 +753,11 @@ static void BufferGeometry(struct OUT *o, int lw, int lh, int scale,
 static void ApplySurfaceScale(struct OUT *o) {
     if (!o->buf) return;
     if (UseFractionalScale(o)) {
-        if (!o->vp) return;         /* integer-sized set: buffer scale stays */
+        if (!o->vp) {              /* surviving integer set: state its scale */
+            if (g_comp_version >= 3)
+                wl_surface_set_buffer_scale(o->sfc, o->bscale);
+            return;
+        }
         wp_viewport_set_source(o->vp, 0, 0,
                                wl_fixed_from_int(o->w), wl_fixed_from_int(o->h));
         wp_viewport_set_destination(o->vp, o->lw, o->lh);
@@ -875,6 +879,18 @@ static void QueueBake(struct OUT *o) {
     WorkerKick();
 }
 
+/* Resize this output's set for the given surface-local size, then present
+ * the wanted half and queue a bake.  Every listener that rebuilds a set
+ * shares this tail: a rebuilt set must never be left unattached, because an
+ * unmapped layer surface gets no further configure.  When the allocation
+ * fails nothing changes - the surviving set (or none) stays as it was. */
+static void RescaleAndPresent(struct OUT *o, int lw, int lh) {
+    BufferResize(o, lw, lh, o->scale);
+    if (!o->buf) return;
+    AttachCurrentBuffer(o);
+    QueueBake(o);
+}
+
 /* Frame callback: the frame that used the previous buffer set is on screen,
  * which (with both release events) is the earliest safe moment to free. */
 static void FrameDone(void *data, struct wl_callback *cb, uint32_t t) {
@@ -970,10 +986,7 @@ static void FracPreferred(void *data, struct wp_fractional_scale_v1 *fs,
     L("output %d: fractional scale %u/120 (%u%%) - paper at device pixels",
       o->idx, scale, scale * 100 / 120);
     if (!o->configured || !o->buf) return;
-    BufferResize(o, o->lw, o->lh, o->scale);
-    if (!o->buf) return;
-    AttachCurrentBuffer(o);      /* the new buffer and viewport need a commit */
-    QueueBake(o);
+    RescaleAndPresent(o, o->lw, o->lh);
 }
 
 static const struct wp_fractional_scale_v1_listener FracListener = {
@@ -1004,15 +1017,7 @@ static void LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls,
     (void)ls;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
     o->configured = 1;
-    if ((int)w != o->lw || (int)h != o->lh || !o->buf) {
-        BufferResize(o, (int)w, (int)h, o->scale);
-        if (!o->buf) return;              /* allocation failed: stay bare */
-    }
-    /* Always leave the surface with SOMETHING attached: an unmapped layer
-     * surface gets no further configure from KWin and could never show
-     * again.  master decides which half; a missing bake is queued. */
-    AttachCurrentBuffer(o);
-    if (o->baked_gen != g_settings_gen) QueueBake(o);
+    RescaleAndPresent(o, (int)w, (int)h);
 }
 
 static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
@@ -1062,13 +1067,8 @@ static void OutputDone(void *data, struct wl_output *wl) {
      * The swap leaves the surface with nothing attached, so re-attach the
      * wanted half right away - a release of the retired old buffer is not
      * guaranteed to arrive (the surface stops being presented, not replaced). */
-    if (o->configured && o->buf) {
-        BufferResize(o, o->lw, o->lh, o->scale);
-        if (o->buf) {
-            AttachCurrentBuffer(o);
-            QueueBake(o);
-        }
-    }
+    if (o->configured && o->buf)
+        RescaleAndPresent(o, o->lw, o->lh);
 }
 
 static void OutputScale(void *data, struct wl_output *wl, int32_t scale) {
