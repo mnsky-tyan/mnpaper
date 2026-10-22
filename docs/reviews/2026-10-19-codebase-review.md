@@ -3,7 +3,7 @@
 Scope: `linux/` (the Wayland port) | Review units: 1 (`linux/` - 4 source files, ~2100 lines; `protocols/` is generated and excluded)
 Summary: 9 findings (0 Critical, 1 High, 4 Medium, 4 Low)
 
-Files read in full: `linux/mnpaper.c` (1574), `linux/paper_core.h` (305), `linux/tests/test_core.c` (185), `linux/Makefile` (40), `linux/README.md`, `linux/AGENTS.md`.
+Files read in full: `linux/mnpaper.c` (1997), `linux/paper_core.h` (298), `linux/tests/test_core.c` (215), `linux/Makefile` (53), `linux/README.md`, `linux/AGENTS.md`. (Counts are the current tree's; the port has grown since this pass.)
 
 ## Findings by Severity
 
@@ -16,7 +16,7 @@ Files read in full: `linux/mnpaper.c` (1574), `linux/paper_core.h` (305), `linux
 | 5 | Simplicity & Efficiency | Medium | `linux/mnpaper.c:783-795` | Double-`munmap` path in `OutTeardown`: `RetireSet` parks the current set (with its `data` pointer) in `o->retired[]`, then `FlushRetired` may free and unmap it, and the following `if (o->data ...) { for (...) if (retired[i].data == o->data) still = 1; if (!still) munmap(...); }` unmaps `o->data` a second time whenever the set was freed inside `FlushRetired` (the loop then finds nothing, `still` stays 0). A double `munmap` on a large region is undefined behaviour. | Inline |
 | 6 | DRY | Low | `linux/mnpaper.c:1169-1185` | The client-side flag-to-protocol mapping table (`SendToRunning`) duplicates the server-side command dispatch in `IpcCommand` (lines 1140-1160) and duplicates the CLI flag list in `main` (lines 1394-1408). Three places must agree on `--toggle/--on/--off/--paper/--eink/--settings/--quit/--status`; adding a command means editing all three, and `main`'s `--settings` maps to the magic literal `99` while the IPC layer has no matching constant (unlike `CMD_*` for everything else). | Inline |
 | 7 | Consistency | Low | `linux/mnpaper.c:1-50` vs `linux/AGENTS.md`, `linux/README.md` | The file header still lists "autostart wiring" under "Not ported yet", but autostart is now implemented (`ApplyAutostart`, lines 196-290). The header is the first thing a reader sees and is now actively misleading about shipped functionality. | Inline |
-| 8 | YAGNI | Low | `linux/paper_core.h:245-300` | `BuildPaperPreview`, `ExpandPaperRow`, `PAPER_PREVIEW_SHIFT`/`PAPER_PREVIEW_STEP` are unused by the app; the only reference is `(void)BuildPaperPreview;` at `mnpaper.c:1465` to silence `-Wunused-function`. This is speculative code for a settings GUI that does not exist, and it carries its own test (`test_core.c` preview-character test) that inflates apparent coverage of untested functionality. Either delete until the GUI lands or mark it clearly as unused scaffolding. | Inline |
+| 8 | YAGNI | Low | `linux/paper_core.h:245-300` | `BuildPaperPreview`, `ExpandPaperRow`, `PAPER_PREVIEW_SHIFT`/`PAPER_PREVIEW_STEP` are unused by the app; the only reference is `(void)BuildPaperPreview;` at `mnpaper.c:1465` to silence `-Wunused-function`. This is speculative code for a settings GUI that does not exist, and it carried its own test (`test_core.c` preview-character test) that inflated apparent coverage of untested functionality. Both the code and that test were later deleted rather than shipped unused; `paper_core.h` records the deletion and the commit to restore it from. Either restore both when the GUI lands or leave them out. | Inline |
 | 9 | Consistency | Low | `linux/mnpaper.c:62-71` | Include ordering is not grouped or sorted (`sys/signalfd.h` sits between `pthread.h` and `stdarg.h`; `sys/mman.h` and `sys/socket.h` follow `string.h`). Minor, but this file has no other style debt and `make` with `-Wall -Wextra` is otherwise clean. | Inline |
 
 ## Cross-Scope Findings
@@ -29,7 +29,7 @@ Note: findings 1-9 are within-scope; finding 10 is the boundary issue. No duplic
 
 ## Clean Areas
 
-- `linux/tests/test_core.c` - assertions are behavioural (determinism, premultiplied-alpha validity, clamp bounds, `--set` grammar refusals, cancellation). The one weak spot is the preview test, which exercises code finding 8 says is unused; that is recorded under finding 8 rather than as a separate test-quality finding.
+- `linux/tests/test_core.c` - assertions are behavioural (determinism, premultiplied-alpha validity, clamp bounds, `--set` grammar refusals, cancellation). The preview-character test finding 8 mentioned was removed together with the code it covered, so no test now exercises dead scaffolding.
 - `linux/Makefile` - the vendored protocol code is committed and the scanner
   rules are order-only on the XML, so a plain `make` never invokes
   `wayland-scanner` and needs only the two libraries and their headers;

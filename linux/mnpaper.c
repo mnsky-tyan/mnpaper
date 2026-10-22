@@ -1501,32 +1501,24 @@ static int SendToRunning(int argc, char **argv) {
         return 2;                            /* nobody is running */
     }
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--set") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--set")) {
             int sent = 0;
-            for (;;) {
-                if (i + 1 < argc && !strcmp(argv[i + 1], "--set")) {
-                    i++;
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                int n;
+                i++;
+                /* 8 bytes stay reserved so the trailing apply always fits */
+                if (sets >= MAX_SETS || len + 8 >= sizeof req) {
+                    dropped++;
                     continue;
                 }
-                if (i + 1 < argc && strchr(argv[i + 1], '=')) {
-                    int n;
-                    i++;
-                    /* 8 bytes stay reserved so the trailing apply always fits */
-                    if (sets >= MAX_SETS || len + 8 >= sizeof req) {
-                        dropped++;
-                        continue;
-                    }
-                    n = snprintf(req + len, sizeof req - len - 8, "set %s\n", argv[i]);
-                    if (n < 0 || (size_t)n >= sizeof req - len - 8) {
-                        dropped++;
-                        continue;
-                    }
-                    len += (size_t)n;
-                    sets++;
-                    sent++;
+                n = snprintf(req + len, sizeof req - len - 8, "set %s\n", argv[i]);
+                if (n < 0 || (size_t)n >= sizeof req - len - 8) {
+                    dropped++;
                     continue;
                 }
-                break;
+                len += (size_t)n;
+                sets++;
+                sent++;
             }
             if (sent) {                    /* the reservation above guarantees room */
                 memcpy(req + len, "apply\n", 6);
@@ -1703,9 +1695,9 @@ int main(int argc, char **argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') dump_bg = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--set")) {
             set_seen = 1;
-            while (i + 1 < argc && strchr(argv[i + 1], '=') && nsets < MAX_SETS)
+            while (i + 1 < argc && argv[i + 1][0] != '-' && nsets < MAX_SETS)
                 sets[nsets++] = argv[++i];
-            while (i + 1 < argc && strchr(argv[i + 1], '=')) {
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
                 L("--set batch full (max %d): ignoring %s", MAX_SETS, argv[i + 1]);
                 i++;
             }
@@ -1724,16 +1716,19 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (set_seen && !cmd) {
+    if (set_seen && !cmd && !dump_tex[0]) {
         SETTINGS probe = PaperDefaultSettings();
-        int ok = 0, k;
-        for (k = 0; k < nsets; k++)
-            if (SetKeyValue(&probe, sets[k])) ok++;
-        if (!ok) {
-            L("--set needs at least one valid key=value pair (for example "
+        int k;
+        if (!nsets) {
+            L("--set needs at least one key=value pair (for example "
               "--set warmth=45)");
             return 2;
         }
+        for (k = 0; k < nsets; k++)
+            if (!SetKeyValue(&probe, sets[k])) {
+                L("--set refused: %s is not a key=value pair", sets[k]);
+                return 2;
+            }
     }
 
     /* ---- headless texture dump: no display, no compositor ---- */

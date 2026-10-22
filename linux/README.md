@@ -61,6 +61,10 @@ values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 `share`, `tbmode`, `autostart`, `autoupd`, `panelgap` (0-512).
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
+The keys that change the Linux image are `grain`, `fibre`, `blotch`,
+`warmth`, `intensity`, `master`, `mode`, `tbmode` and `panelgap`.  `shades`,
+`contrast` and `dither` are e-ink parameters and, like `share`, are stored
+but change nothing until e-ink mode is ported (see Known limitations).
 Values are digits only and must fit an int.  Unknown keys and malformed
 values are refused and logged.  An in-range-shaped value that is outside a
 key's bounds is not refused: it is accepted and silently clamped to the
