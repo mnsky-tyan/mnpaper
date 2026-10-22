@@ -1482,18 +1482,21 @@ static void SockAccept(void) {
 }
 
 /* client side: connect, send the command line as protocol lines, print the
- * reply; returns 0 delivered, 2 nobody home.
+ * reply; returns 0 delivered, 2 nobody home, 3 request refused.
  *
- * The --set pairs arrive parsed and validated (main owns that grammar), so
- * the request carries them as one batch: every pair is staged and a single
- * apply commits them, exactly like the fresh-start path does.  The command
- * flags follow the batch, so a --set pair is never applied after the
- * command it was given with. */
+ * The --set pairs arrive parsed and validated (main owns that grammar and
+ * the staging bounds), so the request carries them as one batch: every pair
+ * is staged and a single apply commits them, exactly like the fresh-start
+ * path does.  The command flags follow the batch, so a --set pair is never
+ * applied after the command it was given with. */
 static int SendToRunning(int argc, char **argv, char **sets, int nsets) {
     struct sockaddr_un addr;
     const char *path = SockPath();
     int fd, i, k;
-    char req[4096];
+    /* one request line is "set " + the pair + '\n', and a pair is staged
+     * only when it is shorter than STAGE_MAX, so a full batch plus the
+     * trailing apply always fits */
+    char req[MAX_SETS * (STAGE_MAX + sizeof("set ")) + 8];
     size_t len = 0;
     int dropped = 0;
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
@@ -1506,15 +1509,9 @@ static int SendToRunning(int argc, char **argv, char **sets, int nsets) {
         close(fd);
         return 2;                            /* nobody is running */
     }
-    for (k = 0; k < nsets; k++) {
-        int n;
-        /* 8 bytes stay reserved so the trailing apply always fits */
-        if (len + 8 >= sizeof req) { dropped++; continue; }
-        n = snprintf(req + len, sizeof req - len - 8, "set %s\n", sets[k]);
-        if (n < 0 || (size_t)n >= sizeof req - len - 8) { dropped++; continue; }
-        len += (size_t)n;
-    }
-    if (nsets) {                            /* the reservation above guarantees room */
+    for (k = 0; k < nsets; k++)
+        len += (size_t)snprintf(req + len, sizeof req - len, "set %s\n", sets[k]);
+    if (nsets) {
         memcpy(req + len, "apply\n", 6);
         len += 6;
     }
@@ -1530,9 +1527,12 @@ static int SendToRunning(int argc, char **argv, char **sets, int nsets) {
                 break;
             }
     }
-    if (dropped)
-        L("--request truncated: %d item(s) dropped (%zu-byte buffer)",
-          dropped, sizeof req);
+    if (dropped) {
+        L("--request refused: %d item(s) do not fit the %zu-byte request "
+          "buffer", dropped, sizeof req);
+        close(fd);
+        return 3;
+    }
     if (len) {
         ssize_t ignored = write(fd, req, len);
         (void)ignored;
@@ -1663,6 +1663,9 @@ int main(int argc, char **argv) {
     int i;
     int cmd = 0;
     int set_seen = 0;
+    int bare_set = 0;
+    int set_extra = 0;
+    const char *set_extra_first = NULL;
     char *sets[MAX_SETS];
     int nsets = 0;
     char dump_tex[512] = "";
@@ -1688,9 +1691,12 @@ int main(int argc, char **argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') dump_bg = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--set")) {
             set_seen = 1;
+            if (i + 1 >= argc || argv[i + 1][0] == '-') bare_set = 1;
             while (i + 1 < argc && argv[i + 1][0] != '-' && nsets < MAX_SETS)
                 sets[nsets++] = argv[++i];
             while (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (!set_extra) set_extra_first = argv[i + 1];
+                set_extra++;
                 L("--set batch full (max %d): ignoring %s", MAX_SETS, argv[i + 1]);
                 i++;
             }
@@ -1711,11 +1717,12 @@ int main(int argc, char **argv) {
 
     /* ---- --set grammar, checked once at the boundary every path shares ----
      * A malformed operand - no '=', an unknown key, a value that is not
-     * digits - is refused by name and nothing is applied, so the same command
-     * line behaves the same whether an instance is already running or not
-     * (see MAX_SETS).  --dump-tex is the documented exception: it logs the
-     * bad entry and still renders, inside its own branch below. */
-    if (set_seen && !nsets) {
+     * digits, one longer than the staging bound - and a batch beyond
+     * MAX_SETS are refused by name and nothing is applied, so the same
+     * command line behaves the same whether an instance is already running
+     * or not (see MAX_SETS).  --dump-tex is the documented exception: it
+     * logs the bad entry and still renders, inside its own branch below. */
+    if (set_seen && (!nsets || bare_set)) {
         L("--set needs at least one key=value pair (for example "
           "--set warmth=45)");
         return 2;
@@ -1723,11 +1730,22 @@ int main(int argc, char **argv) {
     if (!dump_tex[0]) {
         SETTINGS probe = PaperDefaultSettings();
         int k;
-        for (k = 0; k < nsets; k++)
+        for (k = 0; k < nsets; k++) {
+            if (strlen(sets[k]) >= STAGE_MAX) {
+                L("--set refused: %s is %d characters (the maximum is %d)",
+                  sets[k], (int)strlen(sets[k]), STAGE_MAX - 1);
+                return 2;
+            }
             if (!SetKeyValue(&probe, sets[k])) {
                 L("--set refused: %s is not a key=value pair", sets[k]);
                 return 2;
             }
+        }
+        if (set_extra) {
+            L("--set refused: more than %d key=value pairs (first ignored: %s)",
+              MAX_SETS, set_extra_first);
+            return 2;
+        }
     }
 
     /* ---- headless texture dump: no display, no compositor ---- */
@@ -1765,6 +1783,7 @@ int main(int argc, char **argv) {
     if (cmd || nsets) {
         int rc = SendToRunning(argc, argv, sets, nsets);
         if (rc == 0) return 0;
+        if (rc == 3) return 2;      /* refused before anything was sent */
         if (cmd && cmd != CMD_ON && cmd != CMD_PAPER) {
             /* a command with nobody to hear it is a dropped command */
             L("no running mnpaper instance; start one with: mnpaper");

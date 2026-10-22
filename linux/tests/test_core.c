@@ -9,9 +9,14 @@
  *   make test   (from linux/)
  */
 
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <sys/wait.h>
 
 #include "../paper_core.h"
 
@@ -203,13 +208,128 @@ static void TestEinkNotRepresentable(void) {
     CHECK(s.mode == MODE_PAPER, "paper mode stays paper");
 }
 
-int main(void) {
+/* Run one CLI invocation through the shell, capturing stdout and stderr;
+ * returns the raw wait status (WIFEXITED/WEXITSTATUS apply). */
+static int RunCli(const char *cmd, char *out, size_t outsz) {
+    FILE *p = popen(cmd, "r");
+    size_t got = 0;
+    if (!p) return -1;
+    while (got + 1 < outsz) {
+        size_t n = fread(out + got, 1, outsz - 1 - got, p);
+        if (!n) break;
+        got += n;
+    }
+    out[got] = 0;
+    return pclose(p);
+}
+
+/* The CLI refusal rules live in mnpaper.c's main(), a translation unit this
+ * suite cannot link (it is the daemon and needs a compositor), so they are
+ * pinned through the real binary: a refused operand names itself on stderr
+ * and exits 2.  Every child gets a private XDG_RUNTIME_DIR, a private
+ * XDG_CONFIG_HOME and a compositor that is not there, so a refusal that
+ * somehow falls through fails on its own instead of reaching the live
+ * session or the user's settings. */
+static void TestCliRefusals(const char *argv0) {
+    char dir[512], bin[600], cmd[4096], out[2048];
+    char rt[] = "/tmp/mn-test-rt-XXXXXX", cf[] = "/tmp/mn-test-cf-XXXXXX";
+    const char *slash = strrchr(argv0, '/');
+    size_t n;
+    int st;
+
+    if (slash) {
+        n = (size_t)(slash - argv0);
+        if (n >= sizeof dir) n = sizeof dir - 1;
+        memcpy(dir, argv0, n);
+        dir[n] = 0;
+    } else {
+        strcpy(dir, ".");
+    }
+    snprintf(bin, sizeof bin, "%s/../mnpaper", dir);
+    if (access(bin, X_OK) != 0) {
+        CHECK(0, "cli: mnpaper binary not found next to the test tree");
+        return;
+    }
+    if (!mkdtemp(rt) || !mkdtemp(cf)) {
+        CHECK(0, "cli: private temp dirs");
+        return;
+    }
+    setenv("XDG_RUNTIME_DIR", rt, 1);
+    setenv("XDG_CONFIG_HOME", cf, 1);
+    setenv("WAYLAND_DISPLAY", "mn-test-suite-none", 1);
+    unsetenv("WAYLAND_SOCKET");
+
+    /* no '=': the operand is refused by name, nothing is applied */
+    snprintf(cmd, sizeof cmd, "\"%s\" --set warmth 2>&1", bin);
+    st = RunCli(cmd, out, sizeof out);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2, "cli: missing '=' exits 2");
+    CHECK(strstr(out, "refused") && strstr(out, "warmth"),
+          "cli: missing '=' names the operand");
+
+    /* unknown key */
+    snprintf(cmd, sizeof cmd, "\"%s\" --set bogus=1 2>&1", bin);
+    st = RunCli(cmd, out, sizeof out);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2, "cli: unknown key exits 2");
+    CHECK(strstr(out, "refused") && strstr(out, "bogus"),
+          "cli: unknown key is named");
+
+    /* --set with no pair at all */
+    snprintf(cmd, sizeof cmd, "\"%s\" --set 2>&1", bin);
+    st = RunCli(cmd, out, sizeof out);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2, "cli: bare --set exits 2");
+    CHECK(strstr(out, "key=value"), "cli: bare --set says what is missing");
+
+    /* an operand longer than the staging bound: grammar-valid (all digits)
+     * and must still be refused before anything is sent */
+    {
+        char kv[160];
+        strcpy(kv, "intensity=");
+        for (n = 0; n < 90; n++) strcat(kv, "0");
+        snprintf(cmd, sizeof cmd, "\"%s\" --set %s 2>&1", bin, kv);
+        st = RunCli(cmd, out, sizeof out);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2,
+              "cli: overlong operand exits 2");
+        CHECK(strstr(out, "intensity") && strstr(out, "maximum is 95"),
+              "cli: overlong operand names itself and the bound");
+    }
+
+    /* a batch beyond MAX_SETS is refused by name, not silently trimmed */
+    {
+        size_t used = 0;
+        int k;
+        used += (size_t)snprintf(cmd, sizeof cmd, "\"%s\"", bin);
+        for (k = 1; k <= 65; k++) {
+            used += (size_t)snprintf(cmd + used, sizeof cmd - used,
+                                     " --set warmth=%d", k);
+            if (used >= sizeof cmd - 8) break;
+        }
+        strcat(cmd, " 2>&1");
+        st = RunCli(cmd, out, sizeof out);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2,
+              "cli: oversized batch exits 2");
+        CHECK(strstr(out, "more than 64") && strstr(out, "warmth=65"),
+              "cli: oversized batch names the bound and the first ignored pair");
+    }
+
+    /* a --set that got no operand is refused even when other pairs follow */
+    snprintf(cmd, sizeof cmd, "\"%s\" --set warmth=45 --set 2>&1", bin);
+    st = RunCli(cmd, out, sizeof out);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2, "cli: dangling --set exits 2");
+    CHECK(strstr(out, "key=value"), "cli: dangling --set says what is missing");
+
+    rmdir(rt);
+    rmdir(cf);
+}
+
+int main(int argc, char **argv) {
+    (void)argc;
     TestEinkNotRepresentable();
     TestDefaultsAndClamp();
     TestSetKeyValueGrammar();
     TestBakeDeterminismAndValidity();
     TestSettingsActuallyChangePixels();
     TestCancellation();
+    TestCliRefusals(argc >= 1 && argv[0] ? argv[0] : "test_core");
     printf("%s: %d failure(s)\n", failures ? "RESULT" : "RESULT 0", failures);
     return failures ? 1 : 0;
 }

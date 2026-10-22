@@ -41,7 +41,7 @@ regen:
 	wayland-scanner private-code $(PROT).xml $(PROT).c
 	wayland-scanner private-code $(XDG).xml $(XDG).c
 
-test: tests/test_core
+test: $(BIN) tests/test_core
 	./tests/test_core
 
 tests/test_core: tests/test_core.c paper_core.h
