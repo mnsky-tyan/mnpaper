@@ -675,13 +675,12 @@ int main(void) {
     bus_pid = start_private_bus(addr, sizeof addr);
     if (bus_pid < 0) {
         printf("SKIP: no private session bus (dbus-daemon unavailable)\n");
+        private_xdg_cleanup();
         return 0;
     }
     if (tray_start(&g_cb) < 0) {
         CHECK(0, "tray: tray_start failed on the private bus");
-        kill(bus_pid, SIGTERM);
-        waitpid(bus_pid, NULL, 0);
-        return 1;
+        goto done;
     }
     /* the tray ignores SIGCHLD for its fire-and-forget child; the test
      * waits for its own children, so the default comes back */
@@ -720,9 +719,7 @@ int main(void) {
      * the signals the tray pushes */
     if (sd_bus_open_user(&subbus) < 0) {
         CHECK(0, "subscriber: no second connection to the private bus");
-        kill(bus_pid, SIGTERM);
-        waitpid(bus_pid, NULL, 0);
-        return 1;
+        goto done;
     }
     sd_bus_add_match(subbus, NULL, MATCH_PROPS, on_props_changed, NULL);
     sd_bus_add_match(subbus, NULL, MATCH_ITEMS, on_items_updated, NULL);
@@ -795,6 +792,7 @@ int main(void) {
     CHECK(strcmp(layout_sig, "ui") == 0,
           "signals: LayoutUpdated carries the body the spec declares");
 
+done:
     kill(bus_pid, SIGTERM);
     waitpid(bus_pid, NULL, 0);
     if (subbus) { sd_bus_unref(subbus); subbus = NULL; }
