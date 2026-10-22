@@ -709,8 +709,8 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
  * the screen area it covers is device pixels (2880x1646.4).  With only the
  * integer wl_output.scale (2) the buffer would hold 3600x2058 px - 1.25x
  * more than the panel has - and the compositor would have to resample that
- * oversized buffer down onto the surface: softer paper and a 36% more
- * expensive bake.
+ * oversized buffer down onto the surface: softer paper and 56% more pixels
+ * to bake.
  *
  * The fractional-scale protocol fixes that: the compositor states the scale
  * it wants (in 120ths), the buffer then holds one pixel per screen pixel,

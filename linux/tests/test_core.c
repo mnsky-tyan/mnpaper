@@ -188,10 +188,9 @@ static void TestCancellation(void) {
     free(px);
 }
 
-/* Regression for the 2026-10-19 codebase review (finding 1): e-ink is not
- * implemented on Wayland, so a requested mode=1 must never survive as state.
- * The app normalizes it at its single settings choke point; this pins the
- * contract that a refused mode is not representable. */
+/* e-ink is not implemented on Wayland, so a requested mode=1 must never
+ * survive as state.  The app normalizes it at its single settings choke
+ * point; this pins the contract that a refused mode is not representable. */
 static void TestEinkNotRepresentable(void) {
     SETTINGS s = PaperDefaultSettings();
     /* the raw parser accepts the value (it is platform-neutral) ... */

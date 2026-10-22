@@ -22,7 +22,9 @@ make          # builds ./mnpaper
   identical defaults. `--dump-tex` produces the same paper the overlay shows.
 - HiDPI: renders at the compositor's preferred fractional scale
   (`wp_fractional_scale_v1` + `wp_viewport`), so a 160% panel gets a buffer
-  of exactly its device pixels instead of a rounded-up integer scale.
+  of exactly its device pixels instead of a rounded-up integer scale. The
+  fractional path needs both protocols; a compositor offering only one, or
+  neither, gets the integer `wl_output.scale`.
 - Hotplug: monitors appearing, disappearing or changing scale are picked up
   live.
 - **Tray icon** (StatusNotifierItem + DBusMenu, no toolkit): left-click
@@ -257,7 +259,12 @@ editing a protocol `.xml`, run `make regen` to re-scan it.
 The first is the core suite: defaults, clamping, `--set` grammar,
 determinism, premultiplied-alpha validity, odd sizes, cancellation, and
 e-ink normalization. It mirrors the spirit of the Windows hidden
-suites for the parts this port ships.
+suites for the parts this port ships. It also spawns the real `mnpaper`
+binary to pin the CLI refusals (a malformed or over-long `--set` operand,
+a batch past 64 pairs, a dangling `--set`): each child gets a private
+`XDG_RUNTIME_DIR`, a private `XDG_CONFIG_HOME` and a nonexistent
+compositor, so a regression fails on its own instead of touching the
+running session. That is why `make test` builds the daemon as well.
 
 The second is the tray case. It starts a private `dbus-daemon`, runs the
 real tray code on it and drives it with the messages a panel sends, so it
