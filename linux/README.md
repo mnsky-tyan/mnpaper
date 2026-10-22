@@ -224,6 +224,9 @@ neither affects correctness.
   headers to build (`libwayland-dev`/`wayland-devel`,
   `libsystemd-dev`/`systemd-devel`); `wayland-scanner` only to regenerate the
   vendored protocol code.
+- `dbus-daemon` only to run the test suite: the tray case starts a private
+  session bus of its own. It is a test-time dependency, not a runtime one -
+  the daemon talks to whatever session bus the desktop provides.
 
 ## Building
 
@@ -240,10 +243,25 @@ editing a protocol `.xml`, run `make regen` to re-scan it.
 
 ## Testing
 
-`make test` runs the headless suite: defaults, clamping, `--set` grammar,
+`make test` runs two binaries, both headless.
+
+The first is the core suite: defaults, clamping, `--set` grammar,
 determinism, premultiplied-alpha validity, odd sizes, cancellation, and
 e-ink normalization. It mirrors the spirit of the Windows hidden
 suites for the parts this port ships.
+
+The second is the tray case. It starts a private `dbus-daemon`, runs the
+real tray code on it and drives it with the messages a panel sends, so it
+never touches the session bus, the live daemon or the desktop. It checks
+that the bounds on batched events and property queries hold, that
+`Activate`, `Event` and `GetLayout` do what they claim, and it watches the
+bus the way a host does: it asserts that a `PropertiesChanged` really
+carries the `Status` property, and that `ItemsPropertiesUpdated` arrives
+with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`). Those two
+fail silently - a typed consumer such as dbusmenu-qt5 drops a signal with
+the wrong element type, and a property change that never leaves the process
+leaves a stale icon - so only the wire can catch them. The case skips
+itself when `dbus-daemon` is not installed.
 
 Live checks that found real bugs during the port (worth re-running after
 touching the buffer or layer-surface code):
