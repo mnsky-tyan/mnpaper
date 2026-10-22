@@ -1482,14 +1482,20 @@ static void SockAccept(void) {
 }
 
 /* client side: connect, send the command line as protocol lines, print the
- * reply; returns 0 delivered, 2 nobody home */
-static int SendToRunning(int argc, char **argv) {
+ * reply; returns 0 delivered, 2 nobody home.
+ *
+ * The --set pairs arrive parsed and validated (main owns that grammar), so
+ * the request carries them as one batch: every pair is staged and a single
+ * apply commits them, exactly like the fresh-start path does.  The command
+ * flags follow the batch, so a --set pair is never applied after the
+ * command it was given with. */
+static int SendToRunning(int argc, char **argv, char **sets, int nsets) {
     struct sockaddr_un addr;
     const char *path = SockPath();
     int fd, i, k;
     char req[4096];
     size_t len = 0;
-    int sets = 0, dropped = 0;
+    int dropped = 0;
     if (!path) { L("XDG_RUNTIME_DIR is not set; cannot find the command socket"); return 2; }
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return 2;
@@ -1500,46 +1506,33 @@ static int SendToRunning(int argc, char **argv) {
         close(fd);
         return 2;                            /* nobody is running */
     }
+    for (k = 0; k < nsets; k++) {
+        int n;
+        /* 8 bytes stay reserved so the trailing apply always fits */
+        if (len + 8 >= sizeof req) { dropped++; continue; }
+        n = snprintf(req + len, sizeof req - len - 8, "set %s\n", sets[k]);
+        if (n < 0 || (size_t)n >= sizeof req - len - 8) { dropped++; continue; }
+        len += (size_t)n;
+    }
+    if (nsets) {                            /* the reservation above guarantees room */
+        memcpy(req + len, "apply\n", 6);
+        len += 6;
+    }
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--set")) {
-            int sent = 0;
-            while (i + 1 < argc && argv[i + 1][0] != '-') {
-                int n;
-                i++;
-                /* 8 bytes stay reserved so the trailing apply always fits */
-                if (sets >= MAX_SETS || len + 8 >= sizeof req) {
-                    dropped++;
-                    continue;
-                }
-                n = snprintf(req + len, sizeof req - len - 8, "set %s\n", argv[i]);
-                if (n < 0 || (size_t)n >= sizeof req - len - 8) {
-                    dropped++;
-                    continue;
-                }
-                len += (size_t)n;
-                sets++;
-                sent++;
-            }
-            if (sent) {                    /* the reservation above guarantees room */
-                memcpy(req + len, "apply\n", 6);
-                len += 6;
-            }
-            continue;
-        }
         for (k = 0; k < CMD_TABLE_N; k++)
             if (!strcmp(argv[i], CMD_TABLE[k].flag)) {
                 int n;
-                if (len + 8 >= sizeof req) { dropped++; break; }
-                n = snprintf(req + len, sizeof req - len - 8, "%s\n",
+                if (len + 1 >= sizeof req) { dropped++; break; }
+                n = snprintf(req + len, sizeof req - len, "%s\n",
                              CMD_TABLE[k].proto);
-                if (n > 0 && (size_t)n < sizeof req - len - 8) len += (size_t)n;
+                if (n > 0 && (size_t)n < sizeof req - len) len += (size_t)n;
                 else dropped++;
                 break;
             }
     }
     if (dropped)
-        L("--request truncated: %d item(s) dropped (max %d sets, %zu-byte buffer)",
-          dropped, MAX_SETS, sizeof req);
+        L("--request truncated: %d item(s) dropped (%zu-byte buffer)",
+          dropped, sizeof req);
     if (len) {
         ssize_t ignored = write(fd, req, len);
         (void)ignored;
@@ -1716,14 +1709,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (set_seen && !cmd && !dump_tex[0]) {
+    /* ---- --set grammar, checked once at the boundary every path shares ----
+     * A malformed operand - no '=', an unknown key, a value that is not
+     * digits - is refused by name and nothing is applied, so the same command
+     * line behaves the same whether an instance is already running or not
+     * (see MAX_SETS).  --dump-tex is the documented exception: it logs the
+     * bad entry and still renders, inside its own branch below. */
+    if (set_seen && !nsets) {
+        L("--set needs at least one key=value pair (for example "
+          "--set warmth=45)");
+        return 2;
+    }
+    if (!dump_tex[0]) {
         SETTINGS probe = PaperDefaultSettings();
         int k;
-        if (!nsets) {
-            L("--set needs at least one key=value pair (for example "
-              "--set warmth=45)");
-            return 2;
-        }
         for (k = 0; k < nsets; k++)
             if (!SetKeyValue(&probe, sets[k])) {
                 L("--set refused: %s is not a key=value pair", sets[k]);
@@ -1764,7 +1763,7 @@ int main(int argc, char **argv) {
 
     /* ---- command a running instance, or fall through and start ---- */
     if (cmd || nsets) {
-        int rc = SendToRunning(argc, argv);
+        int rc = SendToRunning(argc, argv, sets, nsets);
         if (rc == 0) return 0;
         if (cmd && cmd != CMD_ON && cmd != CMD_PAPER) {
             /* a command with nobody to hear it is a dropped command */
@@ -1774,11 +1773,9 @@ int main(int argc, char **argv) {
     }
 
     LoadSettings();
-    if (nsets) {
+    if (nsets) {       /* validated above: none of these can fail */
         int k;
-        for (k = 0; k < nsets; k++)
-            if (!SetKeyValue(&g_s, sets[k]))
-                L("ignoring unknown or malformed --set entry: %s", sets[k]);
+        for (k = 0; k < nsets; k++) SetKeyValue(&g_s, sets[k]);
         ClampSettingsOf(&g_s);
     }
     /* a visibility command on the fresh path means what it means against a

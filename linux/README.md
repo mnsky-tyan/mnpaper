@@ -66,8 +66,12 @@ The keys that change the Linux image are `grain`, `fibre`, `blotch`,
 `contrast` and `dither` are e-ink parameters and, like `share`, are stored
 but change nothing until e-ink mode is ported (see Known limitations).
 Values are digits only and must fit an int.  Unknown keys and malformed
-values are refused and logged.  An in-range-shaped value that is outside a
-key's bounds is not refused: it is accepted and silently clamped to the
+values are refused and logged.  A refused operand names itself, applies
+nothing and exits 2, whether or not an instance is already running;
+`--dump-tex` is the exception, logging the bad entry and still writing the
+BMP.  Every `--set` on one command line is applied as a single batch, so no
+pair is visible before the last one.  An in-range-shaped value that is outside
+a key's bounds is not refused: it is accepted and silently clamped to the
 nearest bound, so `--set intensity=999` answers `ok applied 1` and leaves
 `intensity` at 40.  `--status` prints the values actually in effect.
 

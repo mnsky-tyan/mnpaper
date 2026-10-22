@@ -289,10 +289,11 @@ static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
     return 1;
 }
 
-/* The 8px preview sampler (BuildPaperPreview/ExpandPaperRow) lived here for
- * the settings GUI's live slider feedback.  The GUI is not built, so it was
- * dead code carrying its own test and a `(void)` reference to silence
- * -Wunused-function.  Deleted rather than shipped unused; restore it from git
- * history (commit "fix: codebase review findings") when the GUI lands. */
+/* The 8px preview sampler (BuildPaperPreview/ExpandPaperRow) is Windows-only
+ * today: mnPaper.c defines it for the settings GUI's live slider feedback and
+ * the Windows tests/ tree covers it.  It was never carried into this port, so
+ * there is nothing unused here to delete and nothing to restore.  When the
+ * settings GUI lands, port the sampler and its tests together, or leave both
+ * out - never ship the code without the test that covers it. */
 
 #endif /* MNPAPER_PAPER_CORE_H */
