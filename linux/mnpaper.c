@@ -533,11 +533,10 @@ struct OUT {
     struct wp_fractional_scale_v1 *fs;   /* fractional scale for this surface */
     struct wp_viewport *vp;               /* buffer px <-> surface-local px */
     int fs120;                            /* preferred scale in 120ths, 0 = none */
-    int bfs120;                           /* fs120 the buffer set was built at */
     int lw, lh;                         /* logical size from configure */
     int scale;                          /* integer scale the output reports */
-    int bscale;                         /* scale the buffer set was built at */
-    int w, h;                           /* buffer pixels = logical * bscale */
+    int bscale;                         /* buffer scale the set was built for */
+    int w, h;                           /* buffer pixels = BufferGeometry result */
     int configured;
     /* Layer-shell mapping state.  attached = which half the surface
      * currently shows (HALF_NONE until the first attach).  The surface
@@ -752,11 +751,16 @@ static void BufferGeometry(struct OUT *o, int lw, int lh, int scale,
  * nothing about the paper's geometry then depends on state left over from an
  * earlier commit. */
 static void ApplySurfaceScale(struct OUT *o) {
-    if (!UseFractionalScale(o) || !o->buf || !o->vp) return;
-    wp_viewport_set_source(o->vp, 0, 0,
-                           wl_fixed_from_int(o->w), wl_fixed_from_int(o->h));
-    wp_viewport_set_destination(o->vp, o->lw, o->lh);
-    wl_surface_set_buffer_scale(o->sfc, 1);
+    if (!o->buf) return;
+    if (UseFractionalScale(o)) {
+        if (!o->vp) return;         /* integer-sized set: buffer scale stays */
+        wp_viewport_set_source(o->vp, 0, 0,
+                               wl_fixed_from_int(o->w), wl_fixed_from_int(o->h));
+        wp_viewport_set_destination(o->vp, o->lw, o->lh);
+        wl_surface_set_buffer_scale(o->sfc, 1);
+    } else if (g_comp_version >= 3) {
+        wl_surface_set_buffer_scale(o->sfc, o->bscale);
+    }
 }
 
 /* (Re)create this output's buffer set for logical size lw x lh at scale.
@@ -779,7 +783,7 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     BufferGeometry(o, lw, lh, scale, &bscale, &bw, &bh);
 
     if (o->buf && o->hbuf && o->lw == lw && o->lh == lh &&
-        o->bscale == bscale && o->bfs120 == o->fs120) return;
+        o->bscale == bscale && o->w == bw && o->h == bh) return;
 
     bytes = (size_t)bw * bh * 4;
     fd = ShmFdFor(bytes * 2);
@@ -812,16 +816,12 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     o->buf_pending = o->hbuf_pending = 0;   /* new buffers: never busy */
     o->attached = HALF_NONE;                /* the old half is retired */
     o->lw = lw; o->lh = lh;
-    o->w = bw; o->h = bh; o->bscale = bscale; o->bfs120 = o->fs120;
+    o->w = bw; o->h = bh; o->bscale = bscale;
     o->baked_gen = 0;                   /* a fresh texture half holds nothing */
 
-    if (UseFractionalScale(o)) {
-        /* The viewport carries the scale: the buffer is device pixels, the
-         * destination is the surface-local size the compositor configured. */
-        if (!o->vp) o->vp = wp_viewporter_get_viewport(g_vp, o->sfc);
-        ApplySurfaceScale(o);
-    } else if (g_comp_version >= 3)
-        wl_surface_set_buffer_scale(o->sfc, scale);
+    if (UseFractionalScale(o) && !o->vp)
+        o->vp = wp_viewporter_get_viewport(g_vp, o->sfc);
+    ApplySurfaceScale(o);
 }
 
 /* Make the surface show the half master asks for, right now.  The surface
@@ -907,6 +907,7 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
      * an event that never comes and wedge every later bake. */
     if (o->attached == HALF_TEX) {
         o->buf_pending++;                /* until the compositor returns it */
+        ApplySurfaceScale(o);          /* the mapping travels with the buffer */
         wl_surface_attach(o->sfc, o->buf, 0, 0);
         if (g_comp_version >= 4)
             wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
