@@ -858,14 +858,14 @@ static void ApplyClickThrough(struct OUT *o) {
     wl_region_destroy(r);
 }
 
-/* tbmode=TB_NOT_COVER (the default) asks the compositor to keep the surface
- * clear of panels: a layer surface with exclusive zone 0 is *moved* out of
- * the way of every surface that claims space, so KDE's panel (and the tray
- * icon in it) stays visible and clickable above the paper.  tbmode=TB_COVER
- * uses -1, which asks the compositor to ignore panels and extend the veil to
- * the screen edges - the paper covers the taskbar, exactly like the Windows
- * mode of the same name.  The compositor decides the panel size for us; we
- * never guess it. */
+/* tbmode picks the exclusive zone; the panelgap margin below picks the strip
+ * the veil leaves unpainted.  tbmode=TB_NOT_COVER (the default) sets zone 0:
+ * the surface claims no exclusive space of its own and asks the compositor
+ * to move it away from surfaces that do reserve space (a docked panel).
+ * tbmode=TB_COVER sets -1: the veil ignores every other surface's exclusive
+ * zone and reaches the screen edges - the paper covers the taskbar, exactly
+ * like the Windows mode of the same name.  The size of a floating panel, the
+ * one case the compositor cannot know, is the user's `panelgap`. */
 static void ApplyExclusiveZone(struct OUT *o) {
     if (!o->ls) return;
     zwlr_layer_surface_v1_set_exclusive_zone(o->ls,

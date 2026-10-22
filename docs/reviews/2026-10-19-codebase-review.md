@@ -3,7 +3,7 @@
 Scope: `linux/` (the Wayland port) | Review units: 1 (`linux/` - 4 source files, ~2100 lines; `protocols/` is generated and excluded)
 Summary: 9 findings (0 Critical, 1 High, 4 Medium, 4 Low)
 
-Files read in full: `linux/mnpaper.c` (1989), `linux/paper_core.h` (298), `linux/tests/test_core.c` (215), `linux/Makefile` (53), `linux/README.md`, `linux/AGENTS.md`. (Counts are the current tree's; the port has grown since this pass.)
+Files read in full: `linux/mnpaper.c` (2014), `linux/paper_core.h` (299), `linux/tests/test_core.c` (335), `linux/Makefile` (58), `linux/README.md`, `linux/AGENTS.md`. (Counts are the current tree's; the port has grown since this pass.)
 
 ## Findings by Severity
 

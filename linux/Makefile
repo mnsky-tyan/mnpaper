@@ -6,7 +6,8 @@
 # two libraries and their headers).
 #
 #   make            build ./mnpaper
-#   make test       build and run the headless core tests (no display needed)
+#   make test       build and run the headless tests (core + tray; the tray
+#                   case starts its own dbus-daemon, no display needed)
 #   make regen      re-run wayland-scanner after editing a protocol .xml
 
 CC      ?= cc

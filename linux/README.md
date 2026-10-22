@@ -64,16 +64,22 @@ config, and is read back from it.
 The keys that change the Linux image are `grain`, `fibre`, `blotch`,
 `warmth`, `intensity`, `master`, `mode`, `tbmode` and `panelgap`.  `shades`,
 `contrast` and `dither` are e-ink parameters and, like `share`, are stored
-but change nothing until e-ink mode is ported (see Known limitations).
+but change nothing until e-ink mode is ported (see Known limitations);
+`autoupd` is likewise stored but inert, because self-update is not ported
+(see What is not ported yet).
 Values are digits only and must fit an int.  Unknown keys and malformed
 values are refused and logged.  A refused operand names itself, applies
 nothing and exits 2, whether or not an instance is already running;
-`--dump-tex` is the exception, logging the bad entry and still writing the
-BMP.  Every `--set` on one command line is applied as a single batch, so no
-pair is visible before the last one.  An in-range-shaped value that is outside
-a key's bounds is not refused: it is accepted and silently clamped to the
-nearest bound, so `--set intensity=999` answers `ok applied 1` and leaves
-`intensity` at 40.  `--status` prints the values actually in effect.
+`--dump-tex` is the exception: an unknown or malformed entry there is
+logged and the BMP is still written, while a `--set` with no pair at all is
+refused on every path, `--dump-tex` included.  Every `--set` on one command
+line is applied as a single batch, so no pair is visible before the last
+one; a batch beyond 64 pairs is refused, and on the `--dump-tex` path the
+excess pairs are ignored like any other bad entry.  An in-range-shaped value
+that is outside a key's bounds is not refused: it is accepted and silently
+clamped to the nearest bound, so `--set intensity=999` answers
+`ok applied 1` and leaves `intensity` at 40.  `--status` prints the values
+actually in effect.
 
 ```bash
 ./mnpaper --set warmth=80 --set intensity=40   # warmer, stronger
@@ -189,7 +195,8 @@ it diffs cleanly and survives partial edits.
   scanning is a use-after-free in the compositor. Every commit is counted
   per half, and a half is neither written nor attached again until its
   release arrives - a bake that arrives early is parked and re-queued on the
-  release event.
+  release event. A live resize retires the whole old buffer set and frees
+  its mapping once the compositor has released both halves.
 - **One bake per real change.** A generation counter advances only when
   texture parameters change, so toggling, `share` or `tbmode` never triggers
   a re-bake. In-flight duplicate bakes are suppressed.
@@ -232,7 +239,7 @@ neither affects correctness.
 
 ```bash
 make            # ./mnpaper
-make test       # headless core tests, no display needed
+make test       # headless tests (core + tray), no display needed
 make clean
 ```
 
