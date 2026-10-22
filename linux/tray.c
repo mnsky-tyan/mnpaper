@@ -41,8 +41,10 @@ enum {
  * batch while still stopping a hostile flood from stalling the poll loop.
  * The bound is on the WORK, not just on what is answered: reading stops at
  * it, so a caller sending a million ids costs the same as one sending a
- * hundred.  A truncated call is never left looking like a success - both
- * MenuGetGroupProperties and MenuEventGroup refuse it with a D-Bus error. */
+ * hundred.  A call over the bound is refused with a D-Bus error and changes
+ * nothing: MenuGetGroupProperties sends no reply at all and
+ * MenuEventGroup applies no event, so a refused call never leaves a
+ * half-done state behind. */
 #define MENU_BATCH_MAX 256
 
 /* Bound for every method call this connection makes.  Without one, sd-bus'
@@ -433,17 +435,20 @@ static int MenuEvent(sd_bus_message *msg, void *ud, sd_bus_error *err) {
 }
 
 static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
+    /* The events are collected before any of them is applied: a refused call
+     * must not have changed anything, and whether the call is over the bound
+     * is only known once the array has been read.  The buffer is fixed size,
+     * so the work stays bounded - at most MENU_BATCH_MAX+1 events are read,
+     * and one past the bound is enough to refuse the call. */
+    struct { int32_t id; const char *event; } ev[MENU_BATCH_MAX + 1];
     sd_bus_message *reply = NULL;
-    int r, seen = 0, overflow = 0, malformed = 0;
+    int r, seen = 0, overflow = 0, malformed = 0, i;
     (void)ud;
     /* Plasma sends batched events only for keyboard activation; every one of
-     * them has to be applied, not just the first.  The work one call can
-     * cause is bounded by MENU_BATCH_MAX: the loop stops reading there, so a
-     * hostile peer cannot hold the poll loop.  An id the model does not have
-     * is reported in idErrors.  A call that carried more than the bound is
-     * refused with a D-Bus error once the events already read took effect:
-     * the tail was never read, and no value of the idErrors array could say
-     * so - that array holds exactly the ids the host itself sent. */
+     * them has to be applied, not just the first.  An id the model does not
+     * have is reported in idErrors.  A call that carried more than the bound
+     * is refused with a D-Bus error, and none of the events it carried are
+     * applied. */
     r = sd_bus_message_new_method_return(msg, &reply);
     if (r < 0) return r;
     r = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "i");
@@ -470,17 +475,14 @@ static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
             r = sd_bus_message_exit_container(msg);
             if (r < 0) bad = 1;
             if (bad) { malformed = 1; break; }
-            if (seen == MENU_BATCH_MAX) {
-                /* one event past the bound: it is the last one read, and
-                 * the rest of the array is left unread */
+            ev[seen].id = id;
+            ev[seen].event = event;
+            seen++;
+            if (seen > MENU_BATCH_MAX) {
+                /* one event past the bound: the call is refused below and
+                 * none of the events are applied */
                 overflow = 1;
                 break;
-            }
-            seen++;
-            if (!MenuActivate(id, event)) {
-                /* unapplied: an id the model does not have */
-                int ar = sd_bus_message_append(reply, "i", id);
-                if (ar < 0) { sd_bus_message_unref(reply); return ar; }
             }
         }
         sd_bus_message_exit_container(msg);
@@ -494,12 +496,20 @@ static int MenuEventGroup(sd_bus_message *msg, void *ud, sd_bus_error *err) {
     if (overflow) {
         /* The caller's events past the bound were never read, so the call is
          * refused instead of answered: a host must never read a truncated
-         * batch as "everything else was applied". */
+         * batch as "everything else was applied".  Nothing is applied - the
+         * events were collected, not run. */
         sd_bus_message_unref(reply);
-        L("tray: EventGroup truncated at %d events - the rest never read",
-          MENU_BATCH_MAX);
+        L("tray: EventGroup refused - more than %d events in one call, "
+          "nothing applied", MENU_BATCH_MAX);
         return sd_bus_error_setf(err, SD_BUS_ERROR_LIMITS_EXCEEDED,
                                  "more than %d events in one call", MENU_BATCH_MAX);
+    }
+    for (i = 0; i < seen; i++) {
+        if (!MenuActivate(ev[i].id, ev[i].event)) {
+            /* unapplied: an id the model does not have */
+            int ar = sd_bus_message_append(reply, "i", ev[i].id);
+            if (ar < 0) { sd_bus_message_unref(reply); return ar; }
+        }
     }
     r = sd_bus_message_close_container(reply);
     if (r >= 0) r = sd_bus_send(NULL, reply, NULL);

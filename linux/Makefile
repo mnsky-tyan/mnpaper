@@ -41,13 +41,18 @@ regen:
 	wayland-scanner private-code $(PROT).xml $(PROT).c
 	wayland-scanner private-code $(XDG).xml $(XDG).c
 
-test: $(BIN) tests/test_core
+test: $(BIN) tests/test_core tests/test_tray
 	./tests/test_core
+	./tests/test_tray
 
 tests/test_core: tests/test_core.c paper_core.h
 	$(CC) $(CFLAGS) $(WARN) tests/test_core.c -o $@ $(LDLIBS)
 
+# the tray test drives the real tray code over a private session bus
+tests/test_tray: tests/test_tray.c tray.c tray.h
+	$(CC) $(CFLAGS) $(WARN) tests/test_tray.c tray.c -o $@ $(LDLIBS)
+
 clean:
-	rm -f $(BIN) tests/test_core
+	rm -f $(BIN) tests/test_core tests/test_tray
 
 .PHONY: all test clean regen
