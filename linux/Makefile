@@ -18,11 +18,13 @@ LDLIBS   = -lwayland-client -lpthread -lm -lsystemd
 BIN = mnpaper
 PROT = protocols/wlr-layer-shell-unstable-v1
 XDG = protocols/xdg-shell
+FRAC = protocols/fractional-scale-v1
+VPOR = protocols/viewporter
 
 all: $(BIN)
 
-$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c $(XDG).c ../version.h
-	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c -o $@ $(LDLIBS)
+$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c $(XDG).c $(FRAC).h $(FRAC).c $(VPOR).h $(VPOR).c ../version.h
+	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c $(FRAC).c $(VPOR).c -o $@ $(LDLIBS)
 
 # regenerate the vendored protocol code only when the XML changes; the XML is
 # an ORDER-ONLY prerequisite, so the committed generated files are treated as
@@ -36,11 +38,27 @@ $(PROT).c: | $(PROT).xml
 $(XDG).c: | $(XDG).xml
 	wayland-scanner private-code $(XDG).xml $@
 
+$(FRAC).h: | $(FRAC).xml
+	wayland-scanner client-header $(FRAC).xml $@
+
+$(FRAC).c: | $(FRAC).xml
+	wayland-scanner private-code $(FRAC).xml $@
+
+$(VPOR).h: | $(VPOR).xml
+	wayland-scanner client-header $(VPOR).xml $@
+
+$(VPOR).c: | $(VPOR).xml
+	wayland-scanner private-code $(VPOR).xml $@
+
 # explicit regeneration for when the XML really changes
 regen:
 	wayland-scanner client-header $(PROT).xml $(PROT).h
 	wayland-scanner private-code $(PROT).xml $(PROT).c
 	wayland-scanner private-code $(XDG).xml $(XDG).c
+	wayland-scanner client-header $(FRAC).xml $(FRAC).h
+	wayland-scanner private-code $(FRAC).xml $(FRAC).c
+	wayland-scanner client-header $(VPOR).xml $(VPOR).h
+	wayland-scanner private-code $(VPOR).xml $(VPOR).c
 
 test: $(BIN) tests/test_core tests/test_tray
 	./tests/test_core

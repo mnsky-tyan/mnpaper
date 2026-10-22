@@ -20,8 +20,9 @@ make          # builds ./mnpaper
   changes, status.
 - Same texture engine as Windows: identical noise, identical parameters,
   identical defaults. `--dump-tex` produces the same paper the overlay shows.
-- HiDPI: renders at the compositor's integer scale (a scale-2 output gets a
-  scale-2 buffer).
+- HiDPI: renders at the compositor's preferred fractional scale
+  (`wp_fractional_scale_v1` + `wp_viewport`), so a 160% panel gets a buffer
+  of exactly its device pixels instead of a rounded-up integer scale.
 - Hotplug: monitors appearing, disappearing or changing scale are picked up
   live.
 - **Tray icon** (StatusNotifierItem + DBusMenu, no toolkit): left-click
@@ -206,20 +207,21 @@ it diffs cleanly and survives partial edits.
 
 ## Resource cost (measured on this machine)
 
-A 2880x1800 desktop at scale 2 (3600x2250 buffer):
+A 2880x1800 desktop at 160% (a 2880x1646 buffer with a 96 px bottom panel
+strip left clear):
 
 | | |
 |---|---|
 | Idle CPU | **0 ticks per 10 s** (no repaints when nothing changes) |
-| One full bake | **1.7 s** single-threaded, off the UI thread |
-| RAM, steady | **~95 MB** = 62 MB shm (two buffers at 3600x2250) + ~31 MB process |
+| One full bake | **~1.0 s** single-threaded, off the UI thread |
+| RAM, steady | **~40 MB** process (idle), **~58 MB** peak during a bake |
+| shm | **36 MiB** = two 2880x1646 buffers |
 | Threads | 2 (UI + one bake worker) |
 
-The 62 MB is double what Windows needs because of the transparent half that
-keeps the surface mappable, and because KWin reports integer scale 2 for this
-fractional-scale (1.6) panel, so the buffer is larger than the physical panel.
-Both are fixable later (fractional-scale protocol, smaller transparent half);
-neither affects correctness.
+The shm is double what the paper alone needs because of the transparent half
+that keeps the surface mappable. The buffer is the physical device size: this
+panel is 1.6 fractional, and the viewport carries the scale (an earlier build
+rounded up to integer scale 2, a 3600x2250 buffer, and cost ~1.7 s per bake).
 
 ## Requirements
 

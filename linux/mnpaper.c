@@ -73,6 +73,8 @@
 #include <wayland-client.h>
 
 #include "protocols/wlr-layer-shell-unstable-v1.h"
+#include "protocols/fractional-scale-v1.h"
+#include "protocols/viewporter.h"
 #include "paper_core.h"
 #include "tray.h"
 #include "../version.h"
@@ -374,6 +376,8 @@ static struct wl_compositor *g_comp;
 static int g_comp_version;
 static struct wl_shm *g_shm;
 static struct zwlr_layer_shell_v1 *g_shell;
+static struct wp_fractional_scale_manager_v1 *g_fsm;
+static struct wp_viewporter *g_vp;
 static int g_sock_fd = -1;         /* command socket listen fd */
 static int g_sig_fd = -1;          /* signalfd for SIGINT/SIGTERM */
 
@@ -526,6 +530,10 @@ struct OUT {
     int wl_gone;                        /* output global removed: never reuse */
     struct wl_surface *sfc;
     struct zwlr_layer_surface_v1 *ls;
+    struct wp_fractional_scale_v1 *fs;   /* fractional scale for this surface */
+    struct wp_viewport *vp;               /* buffer px <-> surface-local px */
+    int fs120;                            /* preferred scale in 120ths, 0 = none */
+    int bfs120;                           /* fs120 the buffer set was built at */
     int lw, lh;                         /* logical size from configure */
     int scale;                          /* integer scale the output reports */
     int bscale;                         /* scale the buffer set was built at */
@@ -695,6 +703,62 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
     if (o->teardown) FlushRetired(o);
 }
 
+/* ---- buffer geometry ----------------------------------------------------
+ *
+ * A fractional-scaled output (KWin offers 160% here) is the interesting
+ * case.  The compositor's surface-local size stays logical (1800x1029) but
+ * the screen area it covers is device pixels (2880x1646.4).  With only the
+ * integer wl_output.scale (2) the buffer would hold 3600x2058 px - 1.25x
+ * more than the panel has - and the compositor would have to resample that
+ * oversized buffer down onto the surface: softer paper and a 36% more
+ * expensive bake.
+ *
+ * The fractional-scale protocol fixes that: the compositor states the scale
+ * it wants (in 120ths), the buffer then holds one pixel per screen pixel,
+ * and a viewport maps that buffer onto the surface-local size.  The paper is
+ * rendered 1:1.
+ *
+ * This is a sharpness and cost fix, NOT a fix for the black frame: the frame
+ * was the ShapeCorners effect stroking our surface as if it were a normal
+ * window, and it was cured by the layer-surface scope (see
+ * LayerSurfaceInit).  A 1648 px buffer framed and a 1646 px one did not, but
+ * that was coincidence - the frame tracked a buffer swap, not the height. */
+static int UseFractionalScale(struct OUT *o) {
+    /* The viewport that maps the buffer onto the surface-local size is the
+     * viewporter extension; without it the fractional path cannot be
+     * expressed, so the integer path stays. */
+    return o->fs120 > 0 && g_vp != NULL;
+}
+
+/* Buffer pixels and buffer scale for a surface of lw x lh surface-local px. */
+static void BufferGeometry(struct OUT *o, int lw, int lh, int scale,
+                            int *bscale, int *bw, int *bh) {
+    if (UseFractionalScale(o)) {
+        *bscale = 1;                      /* the viewport carries the scale */
+        /* the protocol asks for "rounded halfway away from zero" */
+        *bw = (int)(((long long)lw * o->fs120 + 60) / 120);
+        *bh = (int)(((long long)lh * o->fs120 + 60) / 120);
+    } else {
+        *bscale = scale;
+        *bw = lw * scale;
+        *bh = lh * scale;
+    }
+}
+
+/* The viewport and the buffer scale are double-buffered surface state: the
+ * compositor applies them with the next commit.  They are re-sent with every
+ * attach, not only when the buffer is rebuilt, so the mapping a buffer is
+ * presented with is always stated by the same commit that presents it -
+ * nothing about the paper's geometry then depends on state left over from an
+ * earlier commit. */
+static void ApplySurfaceScale(struct OUT *o) {
+    if (!UseFractionalScale(o) || !o->buf || !o->vp) return;
+    wp_viewport_set_source(o->vp, 0, 0,
+                           wl_fixed_from_int(o->w), wl_fixed_from_int(o->h));
+    wp_viewport_set_destination(o->vp, o->lw, o->lh);
+    wl_surface_set_buffer_scale(o->sfc, 1);
+}
+
 /* (Re)create this output's buffer set for logical size lw x lh at scale.
  * No-op when nothing changed.  The fd stays open: libwayland forwards it to
  * the compositor on the next flush, so it is only closed when the pool dies
@@ -707,17 +771,21 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
 static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     size_t bytes;
     int fd = -1;
+    int bscale, bw, bh;
     void *data;
     struct wl_shm_pool *pool;
     struct wl_buffer *buf, *hbuf;
 
-    if (o->buf && o->hbuf && o->lw == lw && o->lh == lh && o->bscale == scale) return;
+    BufferGeometry(o, lw, lh, scale, &bscale, &bw, &bh);
 
-    bytes = (size_t)lw * scale * lh * scale * 4;
+    if (o->buf && o->hbuf && o->lw == lw && o->lh == lh &&
+        o->bscale == bscale && o->bfs120 == o->fs120) return;
+
+    bytes = (size_t)bw * bh * 4;
     fd = ShmFdFor(bytes * 2);
     if (fd < 0) {
         L("output %d: shm allocation for %dx%d failed - output left untextured",
-          o->idx, lw * scale, lh * scale);
+          o->idx, bw, bh);
         return;
     }
     data = mmap(NULL, bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -728,10 +796,10 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     }
     memset((char *)data + bytes, 0, bytes);   /* the transparent half */
     pool = wl_shm_create_pool(g_shm, fd, (int32_t)(bytes * 2));
-    buf  = wl_shm_pool_create_buffer(pool, 0, lw * scale, lh * scale,
-                                     lw * scale * 4, WL_SHM_FORMAT_ARGB8888);
-    hbuf = wl_shm_pool_create_buffer(pool, (int32_t)bytes, lw * scale, lh * scale,
-                                     lw * scale * 4, WL_SHM_FORMAT_ARGB8888);
+    buf  = wl_shm_pool_create_buffer(pool, 0, bw, bh,
+                                     bw * 4, WL_SHM_FORMAT_ARGB8888);
+    hbuf = wl_shm_pool_create_buffer(pool, (int32_t)bytes, bw, bh,
+                                     bw * 4, WL_SHM_FORMAT_ARGB8888);
     wl_buffer_add_listener(buf, &BufferListener, o);
     wl_buffer_add_listener(hbuf, &BufferListener, o);
     /* the whole old set (both halves share one mapping) is retired together */
@@ -744,10 +812,15 @@ static void BufferResize(struct OUT *o, int lw, int lh, int scale) {
     o->buf_pending = o->hbuf_pending = 0;   /* new buffers: never busy */
     o->attached = HALF_NONE;                /* the old half is retired */
     o->lw = lw; o->lh = lh;
-    o->w = lw * scale; o->h = lh * scale; o->bscale = scale;
+    o->w = bw; o->h = bh; o->bscale = bscale; o->bfs120 = o->fs120;
     o->baked_gen = 0;                   /* a fresh texture half holds nothing */
 
-    if (g_comp_version >= 3)
+    if (UseFractionalScale(o)) {
+        /* The viewport carries the scale: the buffer is device pixels, the
+         * destination is the surface-local size the compositor configured. */
+        if (!o->vp) o->vp = wp_viewporter_get_viewport(g_vp, o->sfc);
+        ApplySurfaceScale(o);
+    } else if (g_comp_version >= 3)
         wl_surface_set_buffer_scale(o->sfc, scale);
 }
 
@@ -770,6 +843,7 @@ static void AttachCurrentBuffer(struct OUT *o) {
     if (*pending > 0) return;                 /* still owned: retry on release */
     o->attached = want;
     (*pending)++;
+    ApplySurfaceScale(o);          /* the mapping travels with the buffer */
     wl_surface_attach(o->sfc, buf, 0, 0);
     if (g_comp_version >= 4)
         wl_surface_damage_buffer(o->sfc, 0, 0, o->w, o->h);
@@ -883,6 +957,46 @@ static void ApplyExclusiveZone(struct OUT *o) {
 
 static void LayerSurfaceInit(struct OUT *o);
 
+/* The compositor states the scale it wants for this surface, in 120ths
+ * (160% = 192).  A change re-shapes the buffer and re-bakes the paper at
+ * the new size. */
+static void FracPreferred(void *data, struct wp_fractional_scale_v1 *fs,
+                          uint32_t scale) {
+    struct OUT *o = data;
+    (void)fs;
+    if ((int)scale == o->fs120) return;
+    o->fs120 = (int)scale;
+    L("output %d: fractional scale %u/120 (%u%%) - paper at device pixels",
+      o->idx, scale, scale * 100 / 120);
+    if (!o->configured || !o->buf) return;
+    BufferResize(o, o->lw, o->lh, o->scale);
+    if (!o->buf) return;
+    AttachCurrentBuffer(o);      /* the new buffer and viewport need a commit */
+    QueueBake(o);
+}
+
+static const struct wp_fractional_scale_v1_listener FracListener = {
+    FracPreferred
+};
+
+/* Ask the compositor for this surface's preferred scale.  One object per
+ * surface, so it is only created once - but the manager global may arrive
+ * after the surface does, so this is called from both places. */
+static void OutAttachFractionalScale(struct OUT *o) {
+    if (!g_fsm || !o->sfc || o->fs) return;
+    o->fs = wp_fractional_scale_manager_v1_get_fractional_scale(g_fsm, o->sfc);
+    if (!o->fs) return;
+    wp_fractional_scale_v1_add_listener(o->fs, &FracListener, o);
+}
+
+/* Drop the per-surface scale object and the viewport with the surface they
+ * belong to. */
+static void OutDropSurfaceExtras(struct OUT *o) {
+    if (o->fs) { wp_fractional_scale_v1_destroy(o->fs); o->fs = NULL; }
+    if (o->vp) { wp_viewport_destroy(o->vp); o->vp = NULL; }
+    o->fs120 = 0;
+}
+
 static void LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls,
                            uint32_t serial, uint32_t w, uint32_t h) {
     struct OUT *o = data;
@@ -914,6 +1028,7 @@ static void LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls) {
                                   * like any other set replacement */
     if (o->wl_gone) return;
     if (o->ls) { zwlr_layer_surface_v1_destroy(o->ls); o->ls = NULL; }
+    OutDropSurfaceExtras(o);
     if (o->sfc) { wl_surface_destroy(o->sfc); o->sfc = NULL; }
     LayerSurfaceInit(o);
 }
@@ -987,6 +1102,7 @@ static void CancelFrame(struct OUT *o) {
 static void OutTeardown(struct OUT *o) {
     if (!o) return;
     if (o->ls) zwlr_layer_surface_v1_destroy(o->ls);
+    OutDropSurfaceExtras(o);
     if (o->sfc) wl_surface_destroy(o->sfc);
     CancelFrame(o);
     if (o->wl) wl_output_destroy(o->wl);
@@ -1014,10 +1130,23 @@ static void OutTeardown(struct OUT *o) {
 static void LayerSurfaceInit(struct OUT *o) {
     if (!g_comp || !g_shm || !g_shell || o->ls || o->wl_gone) return;
     o->sfc = wl_compositor_create_surface(g_comp);
+    OutAttachFractionalScale(o);
     ApplyClickThrough(o);
+    /* The scope is not cosmetic: KWin maps it to a WindowType and defaults
+     * an unknown scope to WindowType::Normal (see scopeToType in KWin's
+     * layershellv1window.cpp).  A Normal window is what desktop effects
+     * manage, and a popular corner-rounding effect
+     * (kwin4_effect_shapecorners, InactiveOutlineThickness=1,
+     * InactiveOutlineColor=#000000) then strokes its one pixel black
+     * inactive outline around this surface: the paper came back framed by a
+     * black rounded-rect border after every hide/show buffer swap.  The
+     * paper is not a user window - it is a persistent screen overlay - so it
+     * must not present itself as Normal.  Measured on KWin 6.6.6: with the
+     * Normal default the frame appeared after each toggle and survived a
+     * re-bake; with this scope four consecutive toggles stayed clean. */
     o->ls = zwlr_layer_shell_v1_get_layer_surface(g_shell, o->sfc, o->wl,
                                                   ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-                                                  "mnpaper");
+                                                  "on-screen-display");
     zwlr_layer_surface_v1_set_anchor(o->ls, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
@@ -1077,6 +1206,14 @@ static void RegistryGlobal(void *data, struct wl_registry *reg, uint32_t name,
     } else if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
         g_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
                                    version < 5 ? version : 5);
+    } else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
+        g_fsm = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+        /* the manager may arrive after the outputs did: give the surfaces
+         * that already exist their scale object now */
+        for (int i = 0; i < MAX_MON; i++)
+            if (g_ov[i]) OutAttachFractionalScale(g_ov[i]);
+    } else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
+        g_vp = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (strcmp(iface, wl_output_interface.name) == 0) {
         struct wl_output *wl = wl_registry_bind(reg, name, &wl_output_interface,
                                                 version < 4 ? version : 4);
