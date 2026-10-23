@@ -131,27 +131,30 @@ that strip". Two settings control it:
 
 - `tbmode=0` (the default, matching Windows' TB_NOT_COVER): the bottom
   `panelgap` logical pixels are left uncovered. With the default `panelgap=0`
-  that is no strip at all - the paper reaches the bottom edge, and the
-  compositor still keeps a docked panel clear because exclusive zone 0
-  respects other surfaces' zones. A non-zero `panelgap` adds a strip for a
-  floating panel; see below.
+  that is no strip at all - the paper reaches the bottom edge, and the surface
+  asks the compositor for exclusive zone 0, i.e. "move me clear of surfaces
+  that reserve space". Whether that moves it is up to the compositor (the
+  protocol says its use of the request is implementation-dependent), so a
+  panel that ends up under the paper is a `panelgap` case; see below.
 - `tbmode=1` (TB_COVER): the veil ignores every other surface's exclusive
   zone (zone -1) and covers the whole screen, like the Windows mode of the
   same name.
 
 `panelgap` (0-512, default **0**) is how tall that uncovered strip is. Zero is
-right for a panel that reserves its own space (the compositor shrinks the
-surface by itself, because exclusive zone 0 still respects other surfaces'
-zones) and for an auto-hiding panel (it reserves nothing, so there is no
-strip to leave clear and the paper reaches the edge). A non-zero value is only
-for a **floating** panel that reserves nothing yet must stay uncovered - the
-one case the compositor cannot infer. KDE's default floating panel is 72-96
+right for a panel that reserves its own space (zone 0 asks the compositor to
+move the surface clear of it, and a compositor that honours the request
+leaves the panel uncovered) and for an auto-hiding panel (it reserves nothing,
+so there is no strip to leave clear and the paper reaches the edge). A
+non-zero value is for a **floating** panel that reserves nothing yet must stay
+uncovered - the one case the compositor cannot infer - and for any panel a
+compositor leaves under the paper. KDE's default floating panel is 72-96
 logical pixels, GNOME's about 48.
 
 This default used to be 96, which painted a 96px hole under panels that were
-not there. An existing config is migrated once: `cfgver=2` records the schema,
-and a file without it that holds exactly the old default 96 becomes 0. Any
-other stored value is treated as a real choice and kept.
+not there. An existing config is migrated once: `cfgver` records the schema,
+and a file that does not carry that key at all and holds exactly the old
+default 96 becomes 0. Any other stored value is treated as a real choice and
+kept, and so is a 96 in a file that already has the key.
 
 ```bash
 ./mnpaper --set panelgap=48      # a 48px strip for a floating panel that needs one

@@ -215,45 +215,45 @@ static void TestEinkNotRepresentable(void) {
 /* The panelgap migration: the only code that can fix an already-installed
  * config, so every branch is pinned here.  The old default (96) is
  * indistinguishable from a deliberate 96 in a file that predates cfgver, so
- * that exact value migrates and every other value is treated as a choice. */
+ * that exact value migrates and every other value is treated as a choice.
+ *
+ * The migration is keyed on whether the FILE carried a cfgver key, not on the
+ * value: ConfigWrite stamps every file this build saves, so a stamped file has
+ * already been through this and must never be migrated again - otherwise a
+ * panelgap the user chose is reverted on the next start. */
 static void TestPanelgapMigration(void) {
     SETTINGS s;
 
-    /* a pre-v2 file: no cfgver line, and the loader zeroes cfgver before
-     * parsing, so the struct arrives with cfgver == 0 */
+    /* a pre-v2 file: no cfgver line at all, and it holds the old default */
     s = PaperDefaultSettings();
-    s.cfgver = 0;
-    s.panelgap = 96;                 /* the old default */
-    CHECK(MigrateSettings(&s) == 1, "migrate: the old 96 default is migrated");
+    s.panelgap = 96;
+    CHECK(MigrateSettings(&s, 0) == 1, "migrate: the old 96 default is migrated");
     CHECK(s.panelgap == 0, "migrate: 96 becomes 0 (paper reaches the edge)");
     CHECK(s.cfgver == 2, "migrate: the schema version is stamped");
 
-    /* the migration is one-shot: running it again on the result changes
-     * nothing, and a 96 the user sets afterwards survives */
-    CHECK(MigrateSettings(&s) == 0, "migrate: it does not run twice");
-    CHECK(s.panelgap == 0, "migrate: the migrated value is stable");
+    /* the migration is one-shot: the file this build writes carries the key,
+     * so the next start sees it and leaves a 96 alone */
     s.panelgap = 96;                 /* deliberate, post-migration */
-    CHECK(MigrateSettings(&s) == 0, "migrate: a post-v2 96 is not touched");
+    CHECK(MigrateSettings(&s, 1) == 0, "migrate: a stamped file is not touched");
     CHECK(s.panelgap == 96, "migrate: the user's own 96 survives");
+    s.cfgver = 0;                    /* even a hand-edited stamp value */
+    CHECK(MigrateSettings(&s, 1) == 0,
+          "migrate: a stamp of 0 in a stamped file does not re-arm it");
+    CHECK(s.panelgap == 96, "migrate: the stamp's value is not what arms it");
+    CHECK(s.cfgver == 2, "migrate: the stamp is repaired to the current version");
 
     /* any other pre-v2 value was a real choice and is preserved */
     s = PaperDefaultSettings();
-    s.cfgver = 0; s.panelgap = 48;
-    CHECK(MigrateSettings(&s) == 0, "migrate: a non-default pre-v2 gap is kept");
+    s.panelgap = 48;
+    CHECK(MigrateSettings(&s, 0) == 0, "migrate: a non-default pre-v2 gap is kept");
     CHECK(s.panelgap == 48, "migrate: the chosen gap is unchanged");
     CHECK(s.cfgver == 2, "migrate: the version is stamped even when unchanged");
-
-    /* a current file is never rewritten */
-    s = PaperDefaultSettings();
-    s.panelgap = 96;
-    CHECK(MigrateSettings(&s) == 0, "migrate: a v2 file is left alone");
-    CHECK(s.panelgap == 96, "migrate: a v2 96 stays 96");
 
     /* a fresh install already carries the current version and the new
      * default, so it has nothing to migrate */
     s = PaperDefaultSettings();
     CHECK(s.cfgver == 2, "migrate: defaults are already current");
-    CHECK(MigrateSettings(&s) == 0, "migrate: defaults need no migration");
+    CHECK(MigrateSettings(&s, 1) == 0, "migrate: defaults need no migration");
     CHECK(s.panelgap == 0, "migrate: defaults leave no bottom band");
 }
 
@@ -370,10 +370,77 @@ static void TestCliRefusals(const char *argv0) {
     rmdir(cf);
 }
 
+/* The config round trip: what this build writes, it must read back unchanged.
+ * The loader used to zero the schema stamp before parsing, so a file this
+ * build had just written looked pre-v2 on the next start and the migration
+ * silently reverted a panelgap the user had chosen (including one set with
+ * --set on a machine that had no settings file).  Formatting a struct with the
+ * real writer and parsing it back with the real reader pins the property that
+ * broke; the loader's own copy of that sequence is the same two calls. */
+static void TestConfigRoundTrip(void) {
+    SETTINGS s = PaperDefaultSettings(), back = PaperDefaultSettings();
+    char body[2048], *line, *save = NULL;
+    int stamped = 0, loaded = 0;
+    FILE *f = tmpfile();
+    size_t got;
+
+    CHECK(f != NULL, "config: the temp file opens");
+    if (!f) return;
+
+    /* a value the user chose, which the new default would overwrite */
+    s.panelgap = 96;
+    CHECK(ConfigFormat(&s, f) == 0, "config: the file body is written");
+    rewind(f);
+    got = fread(body, 1, sizeof body - 1, f);
+    body[got] = 0;
+    fclose(f);
+
+    /* parse it back the way LoadSettings does */
+    for (line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+        if (ConfigParseLine(&back, line, &stamped) > 0) loaded++;
+    CHECK(stamped, "config: the written file carries the schema stamp");
+    CHECK(loaded > 0, "config: the written file yields its keys");
+    CHECK(back.panelgap == 96, "config: the chosen panelgap reads back");
+    CHECK(back.cfgver == 2, "config: the stamp reads back");
+
+    /* and the migration leaves it alone, because the file carried the stamp */
+    CHECK(MigrateSettings(&back, stamped) == 0,
+          "config: a file this build wrote is not migrated");
+    CHECK(back.panelgap == 96, "config: the chosen panelgap survives a reload");
+
+    /* a genuine pre-v2 body (no cfgver line) still migrates exactly once */
+    back = PaperDefaultSettings();
+    stamped = 0;
+    {
+        char pre[] = "panelgap=96";
+        CHECK(ConfigParseLine(&back, pre, &stamped) > 0,
+              "config: a pre-v2 line parses");
+    }
+    CHECK(!stamped, "config: a pre-v2 body carries no stamp");
+    CHECK(MigrateSettings(&back, stamped) == 1, "config: a pre-v2 96 migrates");
+    CHECK(back.panelgap == 0, "config: the migration yields the new default");
+
+    /* the stamp is presence, not value: even cfgver=0 in the file counts as
+     * stamped, so a hand-edited value cannot re-arm the migration */
+    back = PaperDefaultSettings();
+    back.panelgap = 96;
+    stamped = 0;
+    {
+        char zero[] = "cfgver=0";
+        CHECK(ConfigParseLine(&back, zero, &stamped) > 0,
+              "config: cfgver=0 parses");
+    }
+    CHECK(stamped, "config: cfgver=0 still counts as a stamp");
+    CHECK(MigrateSettings(&back, stamped) == 0,
+          "config: a stamp of 0 does not re-arm the migration");
+    CHECK(back.panelgap == 96, "config: the chosen panelgap is kept");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     TestEinkNotRepresentable();
     TestPanelgapMigration();
+    TestConfigRoundTrip();
     TestDefaultsAndClamp();
     TestSetKeyValueGrammar();
     TestBakeDeterminismAndValidity();

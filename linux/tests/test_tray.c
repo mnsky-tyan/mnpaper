@@ -169,6 +169,18 @@ static sd_bus *subbus;
 static int got_props, got_items, got_layout;
 static char items_sig[64], layout_sig[32], status_value[32];
 static char props_iface[64];
+/* the toggle-state rows the last ItemsPropertiesUpdated carried */
+static struct { int32_t id; int on; } pushed[64];
+static int n_pushed;
+
+/* The toggle-state the last push reported for one id, or -1 when the push
+ * did not mention it at all. */
+static int pushed_state(int32_t id) {
+    int i;
+    for (i = 0; i < n_pushed; i++)
+        if (pushed[i].id == id) return pushed[i].on;
+    return -1;
+}
 
 /* PropertiesChanged is a signal of the standard properties interface - that
  * is where the D-Bus specification puts it, where sd-bus emits it and where
@@ -226,13 +238,53 @@ static int on_props_changed(sd_bus_message *m, void *ud, sd_bus_error *err) {
 }
 
 /* ItemsPropertiesUpdated: the body signature is the whole point, so it is
- * read off the wire instead of being assumed. */
+ * read off the wire instead of being assumed.  The ids and their toggle-states
+ * are collected too: a radio row whose state moved but which the push omits
+ * leaves an open submenu showing the previous checkmark, and the only place
+ * that can be caught is here. */
 static int on_items_updated(sd_bus_message *m, void *ud, sd_bus_error *err) {
     const char *sig;
     (void)ud; (void)err;
     got_items++;
     sig = sd_bus_message_get_signature(m, 1);
     if (sig) snprintf(items_sig, sizeof items_sig, "%s", sig);
+    n_pushed = 0;
+    if (sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(ia{sv})") <= 0)
+        return 0;
+    for (;;) {
+        int32_t id;
+        int r = sd_bus_message_enter_container(m, SD_BUS_TYPE_STRUCT, "ia{sv}");
+        if (r <= 0) break;
+        if (sd_bus_message_read(m, "i", &id) >= 0) {
+            if (sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sv}") >= 0) {
+                for (;;) {
+                    const char *key = NULL;
+                    int e = sd_bus_message_enter_container(m, SD_BUS_TYPE_DICT_ENTRY,
+                                                           "sv");
+                    if (e <= 0) break;
+                    if (sd_bus_message_read(m, "s", &key) >= 0 && key &&
+                        !strcmp(key, "toggle-state") &&
+                        sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT,
+                                                       "i") >= 0) {
+                        int32_t on = -1;
+                        if (sd_bus_message_read(m, "i", &on) >= 0 &&
+                            n_pushed < (int)(sizeof pushed / sizeof pushed[0])) {
+                            pushed[n_pushed].id = id;
+                            pushed[n_pushed].on = on;
+                            n_pushed++;
+                        }
+                        sd_bus_message_exit_container(m);
+                    } else {
+                        sd_bus_message_skip(m, "v");
+                    }
+                    sd_bus_message_exit_container(m);
+                }
+                sd_bus_message_exit_container(m);
+            }
+        }
+        sd_bus_message_exit_container(m);
+    }
+    sd_bus_message_exit_container(m);
     return 0;
 }
 
@@ -891,6 +943,38 @@ int main(void) {
     CHECK(got_layout == 1, "signals: the tray announced the new layout");
     CHECK(strcmp(layout_sig, "ui") == 0,
           "signals: LayoutUpdated carries the body the spec declares");
+
+    /* The push must cover every row whose state can move, not just the two
+     * checkmarks and the strength/warmth radios: a host patches an open
+     * submenu from this signal alone, so a texture radio left out of it keeps
+     * the previous checkmark.  st_* holds the defaults here, so each submenu's
+     * own default row is the checked one and every other row is unchecked. */
+    CHECK(pushed_state(ID_SHOW) == 1, "push: the Show toggle is carried");
+    CHECK(pushed_state(ID_GRAIN_FIRST + 2) == 1,
+          "push: the checked Grain row is carried");
+    CHECK(pushed_state(ID_GRAIN_FIRST) == 0,
+          "push: an unchecked Grain row is carried too");
+    CHECK(pushed_state(ID_FIBRE_FIRST + 4) == 1,
+          "push: the checked Fibre row is carried");
+    CHECK(pushed_state(ID_BLOTCH_FIRST + 3) == 1,
+          "push: the checked Blotch row is carried");
+    CHECK(pushed_state(ID_BLOTCH_FIRST + 9) == 0,
+          "push: the last Blotch row is carried");
+    CHECK(pushed_state(ID_UNKNOWN) == -1,
+          "push: an id outside the model is not carried");
+
+    /* and the checkmark follows the setting: clicking a different texture row
+     * must move it, which is exactly what the host patches from the push */
+    reset_counters();
+    n_pushed = 0;
+    got_items = 0;
+    st_grain = 7;
+    tray_state_changed();
+    wait_signals(5000);
+    CHECK(pushed_state(ID_GRAIN_FIRST + 5) == 1,
+          "push: a new Grain value checks its own row");
+    CHECK(pushed_state(ID_GRAIN_FIRST + 2) == 0,
+          "push: the previously checked Grain row is unchecked");
 
 done:
     kill(bus_pid, SIGTERM);

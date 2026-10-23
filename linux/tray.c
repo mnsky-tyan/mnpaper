@@ -85,19 +85,15 @@ static const int WARMTH_STEPS[4] = { 10, 45, 75, 95 };
 /* Ten steps for each texture row, spanning the same bounds ClampSettingsOf
  * enforces.  Every list contains the setting's default, so a fresh install
  * shows a checked row instead of none.  Grain is an integer period in pixels
- * (2..12); fibre and blotch are 0..100 weights. */
+ * (2..12); fibre and blotch are 0..100 weights, so they share one table. */
 #define TEX_STEPS 10
 static const int GRAIN_STEPS[TEX_STEPS] =
     { 2, 3, 4, 5, 6, 7, 8, 9, 10, 12 };
 static const char *GRAIN_NAMES[TEX_STEPS] =
     { "2", "3", "4", "5", "6", "7", "8", "9", "10", "12" };
-static const int FIBRE_STEPS[TEX_STEPS] =
+static const int TENS_STEPS[TEX_STEPS] =
     { 0, 10, 20, 30, 40, 50, 60, 70, 80, 100 };
-static const char *FIBRE_NAMES[TEX_STEPS] =
-    { "0", "10", "20", "30", "40", "50", "60", "70", "80", "100" };
-static const int BLOTCH_STEPS[TEX_STEPS] =
-    { 0, 10, 20, 30, 40, 50, 60, 70, 80, 100 };
-static const char *BLOTCH_NAMES[TEX_STEPS] =
+static const char *TENS_NAMES[TEX_STEPS] =
     { "0", "10", "20", "30", "40", "50", "60", "70", "80", "100" };
 
 static const struct TRAYCB *cb;
@@ -160,20 +156,56 @@ static int WarmthIndex(void) {
 /* -1 means "the current value is not one of the presets" (a hand-edited
  * config, or a value set with --set): then no radio is checked, which is the
  * honest answer and is what the existing two submenus already do. */
-static int GrainIndex(void) {
-    int i, v = cb->query_grain();
-    for (i = 0; i < TEX_STEPS; i++) if (GRAIN_STEPS[i] == v) return i;
+static int StepIndex(const int *steps, int v) {
+    int i;
+    for (i = 0; i < TEX_STEPS; i++) if (steps[i] == v) return i;
     return -1;
 }
-static int FibreIndex(void) {
-    int i, v = cb->query_fibre();
-    for (i = 0; i < TEX_STEPS; i++) if (FIBRE_STEPS[i] == v) return i;
-    return -1;
-}
-static int BlotchIndex(void) {
-    int i, v = cb->query_blotch();
-    for (i = 0; i < TEX_STEPS; i++) if (BLOTCH_STEPS[i] == v) return i;
-    return -1;
+static int GrainIndex(void)  { return StepIndex(GRAIN_STEPS, cb->query_grain()); }
+static int FibreIndex(void)  { return StepIndex(TENS_STEPS, cb->query_fibre()); }
+static int BlotchIndex(void) { return StepIndex(TENS_STEPS, cb->query_blotch()); }
+
+/* One authority for "is this id a radio row, which row is it, which row of its
+ * submenu is checked, what value does it set, what does it say, and which
+ * callback applies it".  Returns 1 and fills the out-params when id is a radio
+ * row; *cur is -1 when the current value matches no preset, so no row of that
+ * submenu is checked.  The layout (labels, toggle-type, toggle-state), the
+ * click handler and the incremental ItemsPropertiesUpdated push all read this,
+ * so a row whose state can move in one channel can never be missing from the
+ * other, and a new submenu only has to be added here. */
+static int RadioRow(int32_t id, int *row, int *cur, int *step,
+                    const char **name, void (**set)(int)) {
+    int si = id - ID_STRENGTH_BASE - 1;
+    int wi = id - ID_WARMTH_BASE - 1;
+    int gi = id - ID_GRAIN_BASE - 1;
+    int fi = id - ID_FIBRE_BASE - 1;
+    int bi = id - ID_BLOTCH_BASE - 1;
+    if (si >= 0 && si < 4) {
+        *row = si; *cur = StrengthIndex();
+        *step = STRENGTH_STEPS[si]; *name = STRENGTH_NAMES[si];
+        *set = cb->set_intensity; return 1;
+    }
+    if (wi >= 0 && wi < 4) {
+        *row = wi; *cur = WarmthIndex();
+        *step = WARMTH_STEPS[wi]; *name = WARMTH_NAMES[wi];
+        *set = cb->set_warmth; return 1;
+    }
+    if (gi >= 0 && gi < TEX_STEPS) {
+        *row = gi; *cur = GrainIndex();
+        *step = GRAIN_STEPS[gi]; *name = GRAIN_NAMES[gi];
+        *set = cb->set_grain; return 1;
+    }
+    if (fi >= 0 && fi < TEX_STEPS) {
+        *row = fi; *cur = FibreIndex();
+        *step = TENS_STEPS[fi]; *name = TENS_NAMES[fi];
+        *set = cb->set_fibre; return 1;
+    }
+    if (bi >= 0 && bi < TEX_STEPS) {
+        *row = bi; *cur = BlotchIndex();
+        *step = TENS_STEPS[bi]; *name = TENS_NAMES[bi];
+        *set = cb->set_blotch; return 1;
+    }
+    return 0;
 }
 
 static int MenuChildCount(int id) {
@@ -248,16 +280,10 @@ static int PropAppend(sd_bus_message *m, int32_t id, const char *key) {
         case ID_EDITCFG: label = "Edit settings file..."; break;
         case ID_QUIT: label = "Quit"; break;
         default: {
-            int si = id - ID_STRENGTH_BASE - 1;
-            int wi = id - ID_WARMTH_BASE - 1;
-            int gi = id - ID_GRAIN_BASE - 1;
-            int fi = id - ID_FIBRE_BASE - 1;
-            int bi = id - ID_BLOTCH_BASE - 1;
-            if (si >= 0 && si < 4) label = STRENGTH_NAMES[si];
-            else if (wi >= 0 && wi < 4) label = WARMTH_NAMES[wi];
-            else if (gi >= 0 && gi < TEX_STEPS) label = GRAIN_NAMES[gi];
-            else if (fi >= 0 && fi < TEX_STEPS) label = FIBRE_NAMES[fi];
-            else if (bi >= 0 && bi < TEX_STEPS) label = BLOTCH_NAMES[bi];
+            int row, cur, step;
+            const char *name = NULL;
+            void (*set)(int);
+            if (RadioRow(id, &row, &cur, &step, &name, &set)) label = name;
             break;
         }
         }
@@ -270,47 +296,23 @@ static int PropAppend(sd_bus_message *m, int32_t id, const char *key) {
     }
     if (!strcmp(key, "toggle-type")) {
         const char *t = NULL;
+        int row, cur, step;
+        const char *name;
+        void (*set)(int);
         if (id == ID_SHOW || id == ID_AUTOSTART) t = "checkmark";
-        else if (id > ID_STRENGTH_BASE && id <= ID_STRENGTH_BASE + 4) t = "radio";
-        else if (id > ID_WARMTH_BASE   && id <= ID_WARMTH_BASE   + 4) t = "radio";
-        else if (id > ID_GRAIN_BASE    && id <= ID_GRAIN_BASE    + TEX_STEPS) t = "radio";
-        else if (id > ID_FIBRE_BASE    && id <= ID_FIBRE_BASE    + TEX_STEPS) t = "radio";
-        else if (id > ID_BLOTCH_BASE   && id <= ID_BLOTCH_BASE   + TEX_STEPS) t = "radio";
+        else if (RadioRow(id, &row, &cur, &step, &name, &set)) t = "radio";
         if (!t) return 0;
         return Appended(sd_bus_message_append(m, "{sv}", "toggle-type", "s", t));
     }
     if (!strcmp(key, "toggle-state")) {
-        int on;
+        int on, row, cur, step;
+        const char *name;
+        void (*set)(int);
         if (id == ID_SHOW) on = cb->query_master() ? 1 : 0;
         else if (id == ID_AUTOSTART) on = cb->query_autostart() ? 1 : 0;
-        else {
-            int si = id - ID_STRENGTH_BASE - 1;
-            int wi = id - ID_WARMTH_BASE - 1;
-            int gi = id - ID_GRAIN_BASE - 1;
-            int fi = id - ID_FIBRE_BASE - 1;
-            int bi = id - ID_BLOTCH_BASE - 1;
-            if (si >= 0 && si < 4) {
-                int cur = StrengthIndex();
-                if (cur < 0) return 0;
-                on = (cur == si);
-            } else if (wi >= 0 && wi < 4) {
-                int cur = WarmthIndex();
-                if (cur < 0) return 0;
-                on = (cur == wi);
-            } else if (gi >= 0 && gi < TEX_STEPS) {
-                int cur = GrainIndex();
-                if (cur < 0) return 0;
-                on = (cur == gi);
-            } else if (fi >= 0 && fi < TEX_STEPS) {
-                int cur = FibreIndex();
-                if (cur < 0) return 0;
-                on = (cur == fi);
-            } else if (bi >= 0 && bi < TEX_STEPS) {
-                int cur = BlotchIndex();
-                if (cur < 0) return 0;
-                on = (cur == bi);
-            } else return 0;   /* not a toggle row: no toggle-state at all */
-        }
+        else if (RadioRow(id, &row, &cur, &step, &name, &set) && cur >= 0)
+            on = (cur == row);
+        else return 0;   /* not a toggle row, or no preset matches at all */
         return Appended(sd_bus_message_append(m, "{sv}", "toggle-state", "i", on));
     }
     if (!strcmp(key, "children-display")) {
@@ -476,7 +478,9 @@ static int MenuAboutToShow(sd_bus_message *msg, void *ud, sd_bus_error *err) {
  * map exactly the same ids, or a batched click silently does nothing.
  * Returns 0 when the id is not in the model, so the caller can report it. */
 static int MenuActivate(int32_t id, const char *event) {
-    int si, wi, gi, fi, bi;
+    int row, cur, step;
+    const char *name;
+    void (*set)(int);
     if (!MenuIdValid(id)) return 0;
     if (strcmp(event, "clicked")) return 1;
     switch (id) {
@@ -485,16 +489,7 @@ static int MenuActivate(int32_t id, const char *event) {
     case ID_EDITCFG: cb->edit_settings(); break;
     case ID_QUIT: cb->quit(); break;
     default:
-        si = id - ID_STRENGTH_BASE - 1;
-        wi = id - ID_WARMTH_BASE - 1;
-        gi = id - ID_GRAIN_BASE - 1;
-        fi = id - ID_FIBRE_BASE - 1;
-        bi = id - ID_BLOTCH_BASE - 1;
-        if (si >= 0 && si < 4) cb->set_intensity(STRENGTH_STEPS[si]);
-        else if (wi >= 0 && wi < 4) cb->set_warmth(WARMTH_STEPS[wi]);
-        else if (gi >= 0 && gi < TEX_STEPS) cb->set_grain(GRAIN_STEPS[gi]);
-        else if (fi >= 0 && fi < TEX_STEPS) cb->set_fibre(FIBRE_STEPS[fi]);
-        else if (bi >= 0 && bi < TEX_STEPS) cb->set_blotch(BLOTCH_STEPS[bi]);
+        if (RadioRow(id, &row, &cur, &step, &name, &set)) set(step);
         break;
     }
     return 1;
@@ -947,6 +942,18 @@ fail:
     return -1;
 }
 
+/* Streams one "(ia{sv})" entry carrying a row's toggle-state into the
+ * ItemsPropertiesUpdated signal. */
+static int AppendToggle(sd_bus_message *sig, int32_t id, int on) {
+    int r = sd_bus_message_open_container(sig, SD_BUS_TYPE_STRUCT, "ia{sv}");
+    if (r >= 0) r = sd_bus_message_append(sig, "i", id);
+    if (r >= 0) r = sd_bus_message_open_container(sig, SD_BUS_TYPE_ARRAY, "{sv}");
+    if (r >= 0) r = sd_bus_message_append(sig, "{sv}", "toggle-state", "i", on);
+    if (r >= 0) r = sd_bus_message_close_container(sig);
+    if (r >= 0) r = sd_bus_message_close_container(sig);
+    return r;
+}
+
 void tray_state_changed(void) {
     sd_bus_message *sig = NULL;
     int r;
@@ -967,24 +974,32 @@ void tray_state_changed(void) {
         return;
     }
     {
-        /* worst case: show + autostart + 4 strength + 4 warmth radios */
-        int ids[10], states[10], n = 0, i, si = StrengthIndex(), wi = WarmthIndex();
-        ids[n] = ID_SHOW;        states[n++] = cb->query_master() ? 1 : 0;
-        ids[n] = ID_AUTOSTART;   states[n++] = cb->query_autostart() ? 1 : 0;
-        for (i = 0; i < 4; i++) {
-            if (si >= 0) { ids[n] = ID_STRENGTH_BASE + 1 + i; states[n++] = (si == i); }
-            if (wi >= 0) { ids[n] = ID_WARMTH_BASE + 1 + i;  states[n++] = (wi == i); }
-        }
+        /* Every row whose state can move: the two checkmarks, plus every radio
+         * row of every submenu, walked from the model so a submenu added later
+         * cannot be left out of the push channel.  An index of -1 means the
+         * current value matches no preset, and then that submenu contributes
+         * nothing - the layout reports no checked row either.  The entries are
+         * streamed into the signal, so there is no hand-counted array size to
+         * keep in step with the menu. */
+        static const int roots[] = { ID_STRENGTH, ID_WARMTH, ID_GRAIN,
+                                     ID_FIBRE, ID_BLOTCH };
+        int i, j;
         r = sd_bus_message_open_container(sig, SD_BUS_TYPE_ARRAY, "(ia{sv})");
-        for (i = 0; r >= 0 && i < n; i++) {
-            r = sd_bus_message_open_container(sig, SD_BUS_TYPE_STRUCT, "ia{sv}");
-            if (r >= 0) r = sd_bus_message_append(sig, "i", ids[i]);
-            if (r >= 0) r = sd_bus_message_open_container(sig, SD_BUS_TYPE_ARRAY,
-                                                          "{sv}");
-            if (r >= 0) r = sd_bus_message_append(sig, "{sv}", "toggle-state",
-                                                  "i", states[i]);
-            if (r >= 0) r = sd_bus_message_close_container(sig);
-            if (r >= 0) r = sd_bus_message_close_container(sig);
+        if (r >= 0)
+            r = AppendToggle(sig, ID_SHOW, cb->query_master() ? 1 : 0);
+        if (r >= 0)
+            r = AppendToggle(sig, ID_AUTOSTART, cb->query_autostart() ? 1 : 0);
+        for (i = 0; r >= 0 && i < (int)(sizeof roots / sizeof roots[0]); i++) {
+            int m = MenuChildCount(roots[i]);
+            for (j = 0; r >= 0 && j < m; j++) {
+                int32_t id = MenuChild(roots[i], j);
+                int row, cur, step;
+                const char *name;
+                void (*set)(int);
+                if (!RadioRow(id, &row, &cur, &step, &name, &set) || cur < 0)
+                    continue;
+                r = AppendToggle(sig, id, cur == row);
+            }
         }
         if (r >= 0) r = sd_bus_message_close_container(sig);
     }

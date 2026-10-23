@@ -60,28 +60,30 @@ typedef struct {
                     * between the two by way of `panelgap` - 0 leaves the
                     * bottom `panelgap` strip unpainted and asks the compositor
                     * for exclusive zone 0 (with the default panelgap=0 the
-                    * paper simply reaches the edge; a docked panel still gets
-                    * its own space reserved by the compositor); 1 covers the
-                    * whole screen with exclusive zone -1.  Both platforms obey
-                    * it (mnpaper.c's ApplyExclusiveZone). */
+                    * paper simply reaches the edge, and a docked panel keeps
+                    * its space when the compositor honours that request); 1
+                    * covers the whole screen with exclusive zone -1.  Both
+                    * platforms obey it (mnpaper.c's ApplyExclusiveZone). */
     int autoupd;   /* 1 = look for a new version about once a day */
-    int cfgver;    /* config schema version, written by ConfigWrite.  Absent
-                    * (0) means a file from a build before the panelgap
-                    * default changed, which is what LoadSettings migrates. */
+    int cfgver;    /* config schema version, written by ConfigWrite on every
+                    * save.  A file that carries the key at all was written by
+                    * a build that knows it; a file without the line predates
+                    * the panelgap default change, which is what LoadSettings
+                    * migrates. */
     int panelgap;  /* Wayland: logical pixels left uncovered at the bottom.
                     *
                     * 0 (the default) is right for every panel that either
-                    * reserves its own space (the compositor then shrinks our
-                    * surface by itself, because exclusive zone 0 means "not
-                    * exclusive, but respect other surfaces' exclusive
-                    * zones") or auto-hides (it reserves nothing, so there is
-                    * no strip to leave clear and the paper should reach the
-                    * screen edge).  A non-zero value is only for a FLOATING
-                    * panel that reserves nothing but must stay uncovered -
-                    * the one case the compositor cannot infer.  This used to
-                    * default to 96, which painted a 96px hole under panels
-                    * that were not there; the config carries cfgver=2 so such
-                    * a stored 96 is migrated to 0 once (see LoadSettings). */
+                    * reserves its own space (zone 0 asks the compositor to
+                    * move our surface clear of it, and the protocol leaves
+                    * that move to the compositor) or auto-hides (it reserves
+                    * nothing, so there is no strip to leave clear and the
+                    * paper should reach the screen edge).  A non-zero value
+                    * is for a FLOATING panel that reserves nothing but must
+                    * stay uncovered - the one case the compositor cannot
+                    * infer - and for any panel a compositor leaves under the
+                    * paper.  This used to default to 96, which painted a 96px
+                    * hole under panels that were not there; a file without a
+                    * cfgver key is migrated to 0 once (see LoadSettings). */
 } SETTINGS;
 
 /* Same defaults as mnPaper.c's g_s initialiser. Keep the two in step until
@@ -163,23 +165,59 @@ static void ClampSettingsOf(SETTINGS *s) {
     }
 }
 
+/* The config file's two halves, kept next to the parser and the migration so
+ * the headless suite can drive the real round trip: the app's loader and
+ * writer call exactly these, and a test that formats a struct and parses the
+ * result back pins the property that matters - a file this build writes is
+ * read back unchanged, including the schema stamp. */
+
+/* Writes the canonical file body: every key, always, so the file is
+ * diff-friendly.  Returns 0 on success, -1 on a write error. */
+static int ConfigFormat(const SETTINGS *s, FILE *f) {
+    if (fprintf(f,
+            "# mnpaper settings (same keys as the Windows registry values;\n"
+            "# autostart is not stored here - the autostart .desktop file is the\n"
+            "# truth, exactly as the Windows Run key is)\n"
+            "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
+            "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
+            "share=%d\ntbmode=%d\nautoupd=%d\npanelgap=%d\ncfgver=%d\n",
+            s->master, s->mode, s->intensity, s->warmth, s->grain,
+            s->fibre, s->blotch, s->shades, s->contrast, s->dither,
+            s->share, s->tbmode, s->autoupd, s->panelgap, s->cfgver) < 0)
+        return -1;
+    return 0;
+}
+
+/* Applies one line of the file.  `stamped` records whether the file carried
+ * the cfgver key AT ALL - that presence, not the value, is what tells a
+ * cfgver-aware file from a pre-v2 one, so a file this build wrote can never
+ * re-arm the migration.  Returns 1 when the line set a key, 0 when it was a
+ * blank line or a comment, and -1 when the key or value was refused. */
+static int ConfigParseLine(SETTINGS *s, char *line, int *stamped) {
+    char *nl = line + strlen(line);
+    if (nl > line && nl[-1] == '\n') nl[-1] = 0;
+    if (line[0] == '#' || line[0] == 0) return 0;
+    if (!strncasecmp(line, "cfgver=", 7)) *stamped = 1;
+    return SetKeyValue(s, line) ? 1 : -1;
+}
+
 /* Config schema migration, run once per load.  A file written before cfgver
  * existed carries panelgap=96 because that WAS the default, not because the
  * user chose it - and 96 logical pixels is a bigger hole than most panels,
  * so it showed as an uncovered band at the bottom on any panel that reserves
  * no space of its own (auto-hide, floating).  A cfgver-less file holding
  * exactly that value is the old default, so it becomes the new one; any other
- * value is a real choice and is left alone.  cfgver is then stamped, so this
- * never runs twice and a user who deliberately sets 96 later keeps it.
+ * value is a real choice and is left alone.
  *
- * The caller must pass a struct whose cfgver is 0 when the file did not
- * carry one - PaperDefaultSettings() already returns the CURRENT version, so
- * the loader zeroes the field before parsing or a pre-v2 file would look
- * up to date and never migrate.  Returns 1 when panelgap was migrated. */
-static int MigrateSettings(SETTINGS *s) {
-    if (s->cfgver >= 2) return 0;
+ * `file_had_cfgver` is whether the file carried the key at all, not what the
+ * key held: ConfigWrite stamps every file this build saves, so the presence of
+ * the key is proof the file came from a cfgver-aware build and the migration
+ * is done.  Keying on the value instead would let a stamped file re-arm the
+ * migration - 0 is both the clamp floor and a settable value - and silently
+ * revert a panelgap the user chose.  Returns 1 when panelgap was migrated. */
+static int MigrateSettings(SETTINGS *s, int file_had_cfgver) {
     s->cfgver = 2;
-    if (s->panelgap != 96) return 0;
+    if (file_had_cfgver || s->panelgap != 96) return 0;
     s->panelgap = 0;
     return 1;
 }

@@ -160,17 +160,7 @@ static int ConfigWrite(const SETTINGS *s) {
     snprintf(tmp, sizeof tmp, "%s/settings.conf.tmp.%d", dir, (int)getpid());
     f = fopen(tmp, "w");
     if (!f) return 0;
-    /* canonical form: every key, always, so the file is diff-friendly */
-    fprintf(f,
-        "# mnpaper settings (same keys as the Windows registry values;\n"
-        "# autostart is not stored here - the autostart .desktop file is the\n"
-        "# truth, exactly as the Windows Run key is)\n"
-        "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
-        "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
-        "share=%d\ntbmode=%d\nautoupd=%d\npanelgap=%d\ncfgver=%d\n",
-        s->master, s->mode, s->intensity, s->warmth, s->grain,
-        s->fibre, s->blotch, s->shades, s->contrast, s->dither,
-        s->share, s->tbmode, s->autoupd, s->panelgap, s->cfgver);
+    if (ConfigFormat(s, f) < 0) { fclose(f); unlink(tmp); return 0; }
     if (fclose(f)) { unlink(tmp); return 0; }
     if (rename(tmp, path)) { unlink(tmp); return 0; }
     return 1;
@@ -181,54 +171,36 @@ static void AutostartSyncFromDisk(void);   /* defined with the autostart code */
 static void LoadSettings(void) {
     FILE *f;
     char line[256];
-    int loaded = 0, dirty = 0;
+    int loaded = 0, stamped = 0, migrated;
     const char *path;
     g_s = PaperDefaultSettings();
-    /* cfgver is what tells a pre-migration file from a current one, so it
-     * must start at 0: the defaults carry the CURRENT schema version and
-     * leaving it set would make every old file look up to date. */
-    g_s.cfgver = 0;
     path = ConfigPath();
     if (!path) return;
     f = fopen(path, "r");
     if (!f) return;
     while (fgets(line, sizeof line, f)) {
-        char *nl;
-        if (line[0] == '#' || line[0] == '\n') continue;
-        nl = line + strlen(line);
-        if (nl > line && nl[-1] == '\n') nl[-1] = 0;
-        if (!SetKeyValue(&g_s, line))
+        int r = ConfigParseLine(&g_s, line, &stamped);
+        if (r < 0)
             L("config: ignoring unknown or malformed line: %s", line);
-        else loaded++;
+        else if (r > 0) loaded++;
     }
     fclose(f);
-    {
-        int had_cfgver = g_s.cfgver >= 2;   /* did the FILE carry a stamp? */
-        if (MigrateSettings(&g_s)) {
-            L("config: panelgap migrated 96 -> 0 (pre-v2 default; the paper now "
-              "reaches the bottom edge - set panelgap again if a floating panel "
-              "needs the strip)");
-            /* Written back immediately, not just at exit: a migration that
-             * only lives in memory runs again on every start (and re-logs
-             * every time), and a crash before the clean shutdown would lose
-             * it entirely.  The write happens after the clamp below, so what
-             * lands on disk is a valid file. */
-            dirty = 1;
-        } else if (!had_cfgver) {
-            /* the values were already fine but the version stamp is new:
-             * write it back so a pre-v2 file does not re-run the (no-op)
-             * migration on every start forever */
-            dirty = 1;
-        }
-    }
+    migrated = MigrateSettings(&g_s, stamped);
+    if (migrated)
+        L("config: panelgap migrated 96 -> 0 (pre-v2 default; the paper now "
+          "reaches the bottom edge - set panelgap again if a floating panel "
+          "needs the strip)");
     ClampSettingsOf(&g_s);
     NormalizeMode(&g_s);       /* a stored mode=1 is never representable */
+    /* Written back immediately, not just at exit: a migration that only lives
+     * in memory would run again on every start (and re-log every time), an
+     * unstamped file would keep a hand-edited 96 migratable, and a crash
+     * before the clean shutdown would lose the migration.  What lands on disk
+     * is already clamped and normalized. */
+    if ((migrated || !stamped) && !ConfigWrite(&g_s))
+        L("warning: could not persist the settings to %s", path);
     AutostartSyncFromDisk();   /* the .desktop file overrides any stored value */
     if (loaded) L("config: loaded %d keys from %s", loaded, path);
-    /* the migration is only durable once it reaches the file; a failed write
-     * is not fatal (the in-memory value is already right for this run) */
-    if (dirty && !ConfigWrite(&g_s))
-        L("warning: could not persist the migration to %s", path);
 }
 
 /* ------------------------------------------------------------ autostart --- */
