@@ -228,9 +228,30 @@ static const char *AutostartPath(void) {
 
 static char *ExePath(void) {
     static char path[4096];
-    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
-    if (n <= 0) return NULL;
-    path[n] = 0;
+    static int known;
+    if (!known) {
+        ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+        if (n <= 0) return NULL;
+        path[n] = 0;
+        /* Replacing the binary under a running daemon makes Linux report
+         * "<path> (deleted)" here.  Writing that literal into the autostart
+         * .desktop poisons it: the entry then names a file that does not
+         * exist, and the next boot starts nothing (measured live - the
+         * poisoned entry also flipped `autostart` back to 0, because the
+         * ownership comparison no longer matched).  Strip the suffix and
+         * require the path to exist: an exe that is gone for good must yield
+         * NULL, so the callers keep their "cannot determine this executable's
+         * path - entry not touched" fail-soft instead of writing a broken
+         * Exec line.
+         *
+         * The link is read once, because /proc/self/exe also follows a plain
+         * rename of the running binary (no suffix), and that new name is not
+         * this install's identity: the entry and every ownership check are
+         * keyed on the path this process was started from. */
+        if (n > 10 && !memcmp(path + n - 10, " (deleted)", 10)) path[n - 10] = 0;
+        known = 1;
+    }
+    if (access(path, F_OK) != 0) return NULL;
     return path;
 }
 
