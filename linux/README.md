@@ -230,7 +230,8 @@ it diffs cleanly and survives partial edits.
 ## Resource cost (measured on this machine)
 
 A 2880x1800 desktop at 160% (a 2880x1646 buffer with a 96 px bottom panel
-strip left clear):
+strip left clear - `panelgap=96`, the default when this was measured; the
+current default 0 keeps the full 2880x1800):
 
 | | |
 |---|---|
@@ -277,8 +278,9 @@ editing a protocol `.xml`, run `make regen` to re-scan it.
 `make test` runs two binaries, both headless.
 
 The first is the core suite: defaults, clamping, `--set` grammar,
-determinism, premultiplied-alpha validity, odd sizes, cancellation, and
-e-ink normalization. It mirrors the spirit of the Windows hidden
+determinism, premultiplied-alpha validity, odd sizes, cancellation, e-ink
+normalization, the one-shot panelgap migration, and the config-file round
+trip. It mirrors the spirit of the Windows hidden
 suites for the parts this port ships. It also spawns the real `mnpaper`
 binary to pin the CLI refusals (a malformed or over-long `--set` operand,
 a batch past 64 pairs, a dangling `--set`): each child gets a private
@@ -293,7 +295,8 @@ that the bounds on batched events and property queries hold, that
 `Activate`, `Event` and `GetLayout` do what they claim, and it watches the
 bus the way a host does: it asserts that a `PropertiesChanged` really
 carries the `Status` property, and that `ItemsPropertiesUpdated` arrives
-with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`). Those two
+with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`), carrying
+every row whose state can move - the texture radios included. Those two
 fail silently - a typed consumer such as dbusmenu-qt5 drops a signal with
 the wrong element type, and a property change that never leaves the process
 leaves a stale icon - so only the wire can catch them. The case skips
