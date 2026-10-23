@@ -9,6 +9,9 @@
  *       ---------------------
  *       Strength >            Subtle / Soft / Medium / Strong   (radios)
  *       Warmth >              Cool / Neutral / Warm / Aged      (radios)
+ *       Grain >               2 .. 12                           (radios)
+ *       Fibre >               0 .. 100 in tens                 (radios)
+ *       Blotch >              0 .. 100 in tens                 (radios)
  *       ---------------------
  *       Start at login        [checkmark, reflects autostart]
  *       Edit settings file...
@@ -28,12 +31,18 @@ struct TRAYCB {
     void (*toggle_show)(void);       /* left click, or Show paper          */
     void (*set_intensity)(int v);    /* Strength radio (10/20/30/40)       */
     void (*set_warmth)(int v);       /* Warmth radio (10/45/75/95)         */
+    void (*set_grain)(int v);        /* Grain radio (2..12)                */
+    void (*set_fibre)(int v);        /* Fibre radio (0..100)               */
+    void (*set_blotch)(int v);       /* Blotch radio (0..100)              */
     void (*toggle_autostart)(void);  /* Start at login                     */
     void (*edit_settings)(void);     /* Edit settings file...              */
     void (*quit)(void);              /* Quit                               */
     int  (*query_master)(void);      /* current state, for menu checkmarks */
     int  (*query_intensity)(void);
     int  (*query_warmth)(void);
+    int  (*query_grain)(void);
+    int  (*query_fibre)(void);
+    int  (*query_blotch)(void);
     int  (*query_autostart)(void);
 };
 

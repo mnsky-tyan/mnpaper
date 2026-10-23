@@ -58,29 +58,42 @@ void PAPERLOG(const char *fmt, ...) {
 /* The state the menu reflects, plus a count per callback, so a case can
  * tell "applied" from "not applied". */
 static int st_master = 1, st_intensity = 30, st_warmth = 45, st_autostart;
+static int st_grain = 4, st_fibre = 40, st_blotch = 30;
 static int n_show, n_intensity, n_warmth, n_autostart;
+static int n_grain, n_fibre, n_blotch;
 
 static void cb_toggle_show(void) { n_show++; st_master = !st_master; }
 static void cb_set_intensity(int v) { n_intensity++; st_intensity = v; }
 static void cb_set_warmth(int v) { n_warmth++; st_warmth = v; }
+static void cb_set_grain(int v) { n_grain++; st_grain = v; }
+static void cb_set_fibre(int v) { n_fibre++; st_fibre = v; }
+static void cb_set_blotch(int v) { n_blotch++; st_blotch = v; }
 static void cb_toggle_autostart(void) { n_autostart++; st_autostart = !st_autostart; }
 static void cb_edit_settings(void) { }
 static void cb_quit(void) { }
 static int cb_query_master(void) { return st_master; }
 static int cb_query_intensity(void) { return st_intensity; }
 static int cb_query_warmth(void) { return st_warmth; }
+static int cb_query_grain(void) { return st_grain; }
+static int cb_query_fibre(void) { return st_fibre; }
+static int cb_query_blotch(void) { return st_blotch; }
 static int cb_query_autostart(void) { return st_autostart; }
 
 static const struct TRAYCB g_cb = {
-    cb_toggle_show, cb_set_intensity, cb_set_warmth, cb_toggle_autostart,
+    cb_toggle_show, cb_set_intensity, cb_set_warmth,
+    cb_set_grain, cb_set_fibre, cb_set_blotch, cb_toggle_autostart,
     cb_edit_settings, cb_quit,
-    cb_query_master, cb_query_intensity, cb_query_warmth, cb_query_autostart
+    cb_query_master, cb_query_intensity, cb_query_warmth,
+    cb_query_grain, cb_query_fibre, cb_query_blotch, cb_query_autostart
 };
 
-/* Menu ids the test uses: the "Show paper" toggle and the first strength
- * radio, plus one id the model does not have. */
+/* Menu ids the test uses: the "Show paper" toggle, the first row of each
+ * radio submenu, plus one id the model does not have. */
 #define ID_SHOW 1
 #define ID_STRENGTH_FIRST 31
+#define ID_GRAIN_FIRST 101     /* first Grain row: value 2  */
+#define ID_FIBRE_FIRST 121     /* first Fibre row: value 0  */
+#define ID_BLOTCH_FIRST 141    /* first Blotch row: value 0 */
 #define ID_UNKNOWN 999
 
 /* A private session bus, so the test never touches the user's session.
@@ -488,7 +501,7 @@ static void client_event(const char *dest, int id, int fd) {
 /* The menu itself: the DBusMenu GetLayout reply, root id, one level deep.
  * The answer carries the facts the parent asserts on, so the reply is
  * parsed where it arrives. */
-static void client_getlayout(const char *dest, int fd) {
+static void client_getlayout(const char *dest, int fd, int parent) {
     sd_bus *c = NULL;
     sd_bus_message *m = NULL, *reply = NULL;
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -505,7 +518,7 @@ static void client_getlayout(const char *dest, int fd) {
         answer(fd, "ERR nomessage\n");
         return;
     }
-    sd_bus_message_append(m, "ii", 0, 1);        /* root, one level deep */
+    sd_bus_message_append(m, "ii", parent, 1);   /* parent, one level deep */
     sd_bus_message_open_container(m, SD_BUS_TYPE_ARRAY, "s");  /* no filter */
     sd_bus_message_close_container(m);
 
@@ -598,7 +611,7 @@ static int call_tray(const char *dest, const char *method, int n,
         else if (strcmp(method, "Event") == 0)
             client_event(dest, n, fds[1]);
         else if (strcmp(method, "GetLayout") == 0)
-            client_getlayout(dest, fds[1]);
+            client_getlayout(dest, fds[1], n);
         else if (strcmp(method, "ItemIsMenu") == 0)
             client_prop(dest, "ItemIsMenu", fds[1]);
         else
@@ -632,9 +645,13 @@ static int call_tray(const char *dest, const char *method, int n,
 
 static void reset_counters(void) {
     n_show = n_intensity = n_warmth = n_autostart = 0;
+    n_grain = n_fibre = n_blotch = 0;
     st_master = 1;
     st_intensity = 30;
     st_warmth = 45;
+    st_grain = 4;
+    st_fibre = 40;
+    st_blotch = 30;
     st_autostart = 0;
 }
 
@@ -752,6 +769,42 @@ int main(void) {
     CHECK(n_intensity == 1, "event: a 'clicked' event on a radio sets the strength");
     CHECK(st_intensity == 10, "event: the radio took effect");
 
+    /* the three texture submenus: each one must reach its own callback with
+     * the value of the row that was clicked, not with a neighbouring row's
+     * value and not with the intensity callback.  Grain's first row is 2
+     * (its lower clamp bound), fibre's and blotch's is 0, so a mixed-up
+     * base would land on a visibly different number. */
+    reset_counters();
+    call_tray(dest, "Event", ID_GRAIN_FIRST, out, sizeof out);
+    CHECK(strncmp(out, "OK", 2) == 0, "event: a Grain row is answered");
+    CHECK(n_grain == 1, "event: a Grain click reaches set_grain");
+    CHECK(st_grain == 2, "event: the Grain row carries its own value");
+
+    reset_counters();
+    call_tray(dest, "Event", ID_FIBRE_FIRST, out, sizeof out);
+    CHECK(n_fibre == 1, "event: a Fibre click reaches set_fibre");
+    CHECK(st_fibre == 0, "event: the Fibre row carries its own value");
+
+    reset_counters();
+    call_tray(dest, "Event", ID_BLOTCH_FIRST, out, sizeof out);
+    CHECK(n_blotch == 1, "event: a Blotch click reaches set_blotch");
+    CHECK(st_blotch == 0, "event: the Blotch row carries its own value");
+
+    /* the last row of each texture submenu, to prove the whole range maps
+     * (a base with a too-small window would drop the tail rows silently) */
+    reset_counters();
+    call_tray(dest, "Event", ID_GRAIN_FIRST + 9, out, sizeof out);
+    CHECK(n_grain == 1 && st_grain == 12,
+          "event: the last Grain row carries 12");
+    reset_counters();
+    call_tray(dest, "Event", ID_FIBRE_FIRST + 9, out, sizeof out);
+    CHECK(n_fibre == 1 && st_fibre == 100,
+          "event: the last Fibre row carries 100");
+    reset_counters();
+    call_tray(dest, "Event", ID_BLOTCH_FIRST + 9, out, sizeof out);
+    CHECK(n_blotch == 1 && st_blotch == 100,
+          "event: the last Blotch row carries 100");
+
     /* the menu itself */
     {
         unsigned rev = 0;
@@ -764,11 +817,58 @@ int main(void) {
               "layout: the reply carries the root item");
         CHECK(rootid == 0, "layout: the root item is id 0");
         CHECK(nprops > 0, "layout: the root item carries its properties");
-        CHECK(nchildren == 9, "layout: the root carries every row of the menu");
+        CHECK(nchildren == 12, "layout: the root carries every row of the menu");
         CHECK(firstid == ID_SHOW, "layout: the first row is the Show paper toggle");
         CHECK(strcmp(label, "Show paper") == 0,
               "layout: the first row carries its label");
         CHECK(rev >= 1, "layout: the reply carries the menu revision");
+    }
+
+    /* Down into each texture submenu: Plasma fetches a submenu when it is
+     * opened, so an item that advertises children-display="submenu" but
+     * answers GetLayout with an empty child list renders as an empty menu.
+     * The parent id must be the SUBMENU id and the rows must be its own ten -
+     * not the root's.  The reply's label is the FIRST CHILD's (the client
+     * helper reports the root id and the first child), so the child id and
+     * label together pin the base and the ordering. */
+    {
+        static const struct { int id; const char *firstrow; } subs[] = {
+            { 10, "2"  },      /* Grain  */
+            { 11, "0"  },      /* Fibre  */
+            { 12, "0"  },      /* Blotch */
+        };
+        int k;
+        for (k = 0; k < (int)(sizeof subs / sizeof subs[0]); k++) {
+            unsigned rev = 0;
+            int sid = -1, nprops = -1, nchildren = -1, firstid = -1;
+            char label[128] = "";
+            int base = 100 + (k * 20);      /* Grain 100, Fibre 120, Blotch 140 */
+            reset_counters();
+            call_tray(dest, "GetLayout", subs[k].id, out, sizeof out);
+            CHECK(sscanf(out, "OK %u %d %d %d %d \"%127[^\"]\"", &rev,
+                         &sid, &nprops, &nchildren, &firstid, label) == 6,
+                  "submenu: GetLayout answers for a submenu id");
+            CHECK(sid == subs[k].id, "submenu: the reply is the submenu itself");
+            CHECK(nchildren == 10, "submenu: it lists its ten rows");
+            CHECK(firstid == base + 1,
+                  "submenu: the first row id is the submenu's own base");
+            CHECK(strcmp(label, subs[k].firstrow) == 0,
+                  "submenu: the first row carries its value as the label");
+
+            /* and the leaf itself answers with no children, so a host that
+             * drills one level further is not handed a phantom submenu */
+            {
+                unsigned r2 = 0;
+                int cid = -1, cprops = -1, ckids = -1, cfirst = -1;
+                char clabel[128] = "";
+                call_tray(dest, "GetLayout", firstid, out, sizeof out);
+                CHECK(sscanf(out, "OK %u %d %d %d %d \"%127[^\"]\"", &r2,
+                             &cid, &cprops, &ckids, &cfirst, clabel) == 6,
+                      "submenu: a leaf row answers GetLayout");
+                CHECK(cid == firstid, "submenu: the leaf is itself");
+                CHECK(ckids == 0, "submenu: a leaf row has no children");
+            }
+        }
     }
 
     /* the signals a host depends on: the tray's only push channel, and

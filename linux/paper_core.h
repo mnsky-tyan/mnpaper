@@ -57,20 +57,31 @@ typedef struct {
                     * Windows: 0 raises the taskbar above the veil, 1 leaves
                     * it under the paper.  Wayland: an overlay layer surface is
                     * always stacked above the panel, so the modes choose
-                    * between the two by way of `panelgap` - 0 keeps the bottom
-                    * `panelgap` strip unpainted and asks the compositor for
-                    * exclusive zone 0, so a floating panel and its tray stay
-                    * visible and clickable; 1 covers the whole screen with
-                    * exclusive zone -1.  A docked panel gets its own space
-                    * reserved by the compositor on top of that strip, so
-                    * docked-panel users set `panelgap=0`.  Both platforms obey
+                    * between the two by way of `panelgap` - 0 leaves the
+                    * bottom `panelgap` strip unpainted and asks the compositor
+                    * for exclusive zone 0 (with the default panelgap=0 the
+                    * paper simply reaches the edge; a docked panel still gets
+                    * its own space reserved by the compositor); 1 covers the
+                    * whole screen with exclusive zone -1.  Both platforms obey
                     * it (mnpaper.c's ApplyExclusiveZone). */
     int autoupd;   /* 1 = look for a new version about once a day */
-    int panelgap;  /* Wayland: logical pixels left uncovered at the bottom for
-                    * a floating panel/tray (0 = cover everything).  A
-                    * client cannot be stacked between an overlay layer
-                    * surface and the panel, so "do not cover the taskbar"
-                    * means "do not paint that strip". */
+    int cfgver;    /* config schema version, written by ConfigWrite.  Absent
+                    * (0) means a file from a build before the panelgap
+                    * default changed, which is what LoadSettings migrates. */
+    int panelgap;  /* Wayland: logical pixels left uncovered at the bottom.
+                    *
+                    * 0 (the default) is right for every panel that either
+                    * reserves its own space (the compositor then shrinks our
+                    * surface by itself, because exclusive zone 0 means "not
+                    * exclusive, but respect other surfaces' exclusive
+                    * zones") or auto-hides (it reserves nothing, so there is
+                    * no strip to leave clear and the paper should reach the
+                    * screen edge).  A non-zero value is only for a FLOATING
+                    * panel that reserves nothing but must stay uncovered -
+                    * the one case the compositor cannot infer.  This used to
+                    * default to 96, which painted a 96px hole under panels
+                    * that were not there; the config carries cfgver=2 so such
+                    * a stored 96 is migrated to 0 once (see LoadSettings). */
 } SETTINGS;
 
 /* Same defaults as mnPaper.c's g_s initialiser. Keep the two in step until
@@ -82,7 +93,7 @@ static SETTINGS PaperDefaultSettings(void) {
     s.warmth = 45; s.grain = 4; s.fibre = 40; s.blotch = 30;
     s.shades = 4; s.contrast = 50; s.dither = 75;
     s.autostart = 0; s.share = 0; s.tbmode = TB_NOT_COVER;
-    s.autoupd = 1; s.panelgap = 96;
+    s.autoupd = 1; s.cfgver = 2; s.panelgap = 0;
     return s;
 }
 
@@ -124,6 +135,7 @@ static int SetKeyValue(SETTINGS *s, const char *arg) {
     else if (!strcasecmp(key, "share")) s->share = v ? 1 : 0;
     else if (!strcasecmp(key, "tbmode")) s->tbmode = v ? TB_COVER : TB_NOT_COVER;
     else if (!strcasecmp(key, "panelgap")) s->panelgap = v;
+    else if (!strcasecmp(key, "cfgver")) s->cfgver = v;
     else if (!strcasecmp(key, "autoupd")) s->autoupd = v ? 1 : 0;
     else if (!strcasecmp(key, "master")) s->master = v ? 1 : 0;
     else return 0;
@@ -142,13 +154,34 @@ static void ClampSettingsOf(SETTINGS *s) {
         { &s->contrast,  0, 100 }, { &s->dither,    0, 100 },
         { &s->autostart, 0,   1 }, { &s->share,     0,   1 },
         { &s->tbmode,    0,   TB_COVER }, { &s->autoupd,   0,   1 },
-        { &s->panelgap,  0,        512 },
+        { &s->panelgap,  0,        512 }, { &s->cfgver,   0,   2 },
     };
     int i;
     for (i = 0; i < (int)(sizeof(f) / sizeof(f[0])); i++) {
         if (*f[i].v < f[i].lo) *f[i].v = f[i].lo;
         if (*f[i].v > f[i].hi) *f[i].v = f[i].hi;
     }
+}
+
+/* Config schema migration, run once per load.  A file written before cfgver
+ * existed carries panelgap=96 because that WAS the default, not because the
+ * user chose it - and 96 logical pixels is a bigger hole than most panels,
+ * so it showed as an uncovered band at the bottom on any panel that reserves
+ * no space of its own (auto-hide, floating).  A cfgver-less file holding
+ * exactly that value is the old default, so it becomes the new one; any other
+ * value is a real choice and is left alone.  cfgver is then stamped, so this
+ * never runs twice and a user who deliberately sets 96 later keeps it.
+ *
+ * The caller must pass a struct whose cfgver is 0 when the file did not
+ * carry one - PaperDefaultSettings() already returns the CURRENT version, so
+ * the loader zeroes the field before parsing or a pre-v2 file would look
+ * up to date and never migrate.  Returns 1 when panelgap was migrated. */
+static int MigrateSettings(SETTINGS *s) {
+    if (s->cfgver >= 2) return 0;
+    s->cfgver = 2;
+    if (s->panelgap != 96) return 0;
+    s->panelgap = 0;
+    return 1;
 }
 
 /* The only mode this build can represent: e-ink needs screen capture, which

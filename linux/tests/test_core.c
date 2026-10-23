@@ -52,7 +52,12 @@ static void TestDefaultsAndClamp(void) {
     CHECK(s.intensity == 30 && s.warmth == 45, "defaults: intensity/warmth");
     CHECK(s.grain == 4 && s.fibre == 40 && s.blotch == 30, "defaults: texture");
     CHECK(s.tbmode == TB_NOT_COVER, "defaults: tbmode");
-    CHECK(s.panelgap == 96, "defaults: panelgap 96");
+    /* The paper reaches the screen edge by default.  A non-zero default is
+     * what used to paint an uncovered band at the bottom on every panel that
+     * reserves no space of its own (auto-hide, floating): the band is only
+     * ever right for a floating panel, which the user must opt into. */
+    CHECK(s.panelgap == 0, "defaults: panelgap 0 (paper reaches the edge)");
+    CHECK(s.cfgver == 2, "defaults: cfgver is the current schema");
 
     s.intensity = 999; s.warmth = -5; s.grain = 1; s.blotch = 1000;
     s.shades = 0; s.dither = -1; s.master = 7; s.mode = 9;
@@ -207,6 +212,51 @@ static void TestEinkNotRepresentable(void) {
     CHECK(s.mode == MODE_PAPER, "paper mode stays paper");
 }
 
+/* The panelgap migration: the only code that can fix an already-installed
+ * config, so every branch is pinned here.  The old default (96) is
+ * indistinguishable from a deliberate 96 in a file that predates cfgver, so
+ * that exact value migrates and every other value is treated as a choice. */
+static void TestPanelgapMigration(void) {
+    SETTINGS s;
+
+    /* a pre-v2 file: no cfgver line, and the loader zeroes cfgver before
+     * parsing, so the struct arrives with cfgver == 0 */
+    s = PaperDefaultSettings();
+    s.cfgver = 0;
+    s.panelgap = 96;                 /* the old default */
+    CHECK(MigrateSettings(&s) == 1, "migrate: the old 96 default is migrated");
+    CHECK(s.panelgap == 0, "migrate: 96 becomes 0 (paper reaches the edge)");
+    CHECK(s.cfgver == 2, "migrate: the schema version is stamped");
+
+    /* the migration is one-shot: running it again on the result changes
+     * nothing, and a 96 the user sets afterwards survives */
+    CHECK(MigrateSettings(&s) == 0, "migrate: it does not run twice");
+    CHECK(s.panelgap == 0, "migrate: the migrated value is stable");
+    s.panelgap = 96;                 /* deliberate, post-migration */
+    CHECK(MigrateSettings(&s) == 0, "migrate: a post-v2 96 is not touched");
+    CHECK(s.panelgap == 96, "migrate: the user's own 96 survives");
+
+    /* any other pre-v2 value was a real choice and is preserved */
+    s = PaperDefaultSettings();
+    s.cfgver = 0; s.panelgap = 48;
+    CHECK(MigrateSettings(&s) == 0, "migrate: a non-default pre-v2 gap is kept");
+    CHECK(s.panelgap == 48, "migrate: the chosen gap is unchanged");
+    CHECK(s.cfgver == 2, "migrate: the version is stamped even when unchanged");
+
+    /* a current file is never rewritten */
+    s = PaperDefaultSettings();
+    s.panelgap = 96;
+    CHECK(MigrateSettings(&s) == 0, "migrate: a v2 file is left alone");
+    CHECK(s.panelgap == 96, "migrate: a v2 96 stays 96");
+
+    /* a fresh install already carries the current version and the new
+     * default, so it has nothing to migrate */
+    s = PaperDefaultSettings();
+    CHECK(s.cfgver == 2, "migrate: defaults are already current");
+    CHECK(MigrateSettings(&s) == 0, "migrate: defaults need no migration");
+    CHECK(s.panelgap == 0, "migrate: defaults leave no bottom band");
+}
+
 /* Run one CLI invocation through the shell, capturing stdout and stderr;
  * returns the raw wait status (WIFEXITED/WEXITSTATUS apply). */
 static int RunCli(const char *cmd, char *out, size_t outsz) {
@@ -323,6 +373,7 @@ static void TestCliRefusals(const char *argv0) {
 int main(int argc, char **argv) {
     (void)argc;
     TestEinkNotRepresentable();
+    TestPanelgapMigration();
     TestDefaultsAndClamp();
     TestSetKeyValueGrammar();
     TestBakeDeterminismAndValidity();
