@@ -6,8 +6,8 @@
  *   OVERLAY layer (above panels and fullscreen windows - the closest thing
  *   Wayland has to Windows' WS_EX_TOPMOST), anchored to all four edges.  The
  *   exclusive zone and the bottom margin follow tbmode/panelgap (see
- *   ApplyExclusiveZone): the default leaves the panel strip unpainted so a
- *   floating panel and its tray stay clickable above the veil.  The input
+ *   ApplyExclusiveZone): by default the paper reaches every screen edge, and
+ *   a floating panel that needs a clear strip opts into one with `panelgap`.  The input
  *   region is empty, so every click, hover and keystroke falls through to
  *   whatever is underneath - the Wayland equivalent of WS_EX_TRANSPARENT.
  *
@@ -22,8 +22,11 @@
  *     neither wlr-screencopy nor ext-image-copy-capture, so the capture
  *     backend would be KDE's PipeWire screencast.  Requests for e-ink are
  *     refused with a log line; mode stays paper.
- *   - settings GUI, global hotkeys (ext-global-shortcuts-v1), update feed.
- *     Everything they control is reachable through the CLI below.
+ *   - settings GUI, global hotkeys (ext-global-shortcuts-v1), update feed,
+ *     and capture exclusion (`share`: a layer surface is not a Plasma window,
+ *     so KWin's excludeFromCapture is unreachable - the paper DOES appear in
+ *     screen shares on Wayland).  Everything the GUI would control is
+ *     reachable through the CLI and the tray's submenus.
  *   Autostart IS implemented (an XDG .desktop file; see ApplyAutostart),
  *   and so is the tray icon (StatusNotifierItem + DBusMenu, see tray.c).
  *
@@ -157,17 +160,7 @@ static int ConfigWrite(const SETTINGS *s) {
     snprintf(tmp, sizeof tmp, "%s/settings.conf.tmp.%d", dir, (int)getpid());
     f = fopen(tmp, "w");
     if (!f) return 0;
-    /* canonical form: every key, always, so the file is diff-friendly */
-    fprintf(f,
-        "# mnpaper settings (same keys as the Windows registry values;\n"
-        "# autostart is not stored here - the autostart .desktop file is the\n"
-        "# truth, exactly as the Windows Run key is)\n"
-        "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
-        "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
-        "share=%d\ntbmode=%d\nautoupd=%d\npanelgap=%d\n",
-        s->master, s->mode, s->intensity, s->warmth, s->grain,
-        s->fibre, s->blotch, s->shades, s->contrast, s->dither,
-        s->share, s->tbmode, s->autoupd, s->panelgap);
+    if (ConfigFormat(s, f) < 0) { fclose(f); unlink(tmp); return 0; }
     if (fclose(f)) { unlink(tmp); return 0; }
     if (rename(tmp, path)) { unlink(tmp); return 0; }
     return 1;
@@ -178,7 +171,7 @@ static void AutostartSyncFromDisk(void);   /* defined with the autostart code */
 static void LoadSettings(void) {
     FILE *f;
     char line[256];
-    int loaded = 0;
+    int loaded = 0, stamped = 0, migrated;
     const char *path;
     g_s = PaperDefaultSettings();
     path = ConfigPath();
@@ -186,17 +179,26 @@ static void LoadSettings(void) {
     f = fopen(path, "r");
     if (!f) return;
     while (fgets(line, sizeof line, f)) {
-        char *nl;
-        if (line[0] == '#' || line[0] == '\n') continue;
-        nl = line + strlen(line);
-        if (nl > line && nl[-1] == '\n') nl[-1] = 0;
-        if (!SetKeyValue(&g_s, line))
+        int r = ConfigParseLine(&g_s, line, &stamped);
+        if (r < 0)
             L("config: ignoring unknown or malformed line: %s", line);
-        else loaded++;
+        else if (r > 0) loaded++;
     }
     fclose(f);
+    migrated = MigrateSettings(&g_s, stamped);
+    if (migrated)
+        L("config: panelgap migrated 96 -> 0 (pre-v2 default; the paper now "
+          "reaches the bottom edge - set panelgap again if a floating panel "
+          "needs the strip)");
     ClampSettingsOf(&g_s);
     NormalizeMode(&g_s);       /* a stored mode=1 is never representable */
+    /* Written back immediately, not just at exit: a migration that only lives
+     * in memory would run again on every start (and re-log every time), an
+     * unstamped file would keep a hand-edited 96 migratable, and a crash
+     * before the clean shutdown would lose the migration.  What lands on disk
+     * is already clamped and normalized. */
+    if ((migrated || !stamped) && !ConfigWrite(&g_s))
+        L("warning: could not persist the settings to %s", path);
     AutostartSyncFromDisk();   /* the .desktop file overrides any stored value */
     if (loaded) L("config: loaded %d keys from %s", loaded, path);
 }
@@ -971,13 +973,15 @@ static void ApplyClickThrough(struct OUT *o) {
 }
 
 /* tbmode picks the exclusive zone; the panelgap margin below picks the strip
- * the veil leaves unpainted.  tbmode=TB_NOT_COVER (the default) sets zone 0:
- * the surface claims no exclusive space of its own and asks the compositor
- * to move it away from surfaces that do reserve space (a docked panel).
- * tbmode=TB_COVER sets -1: the veil ignores every other surface's exclusive
- * zone and reaches the screen edges - the paper covers the taskbar, exactly
- * like the Windows mode of the same name.  The size of a floating panel, the
- * one case the compositor cannot know, is the user's `panelgap`. */
+ * the veil leaves unpainted (none by default).  tbmode=TB_NOT_COVER (the
+ * default) sets zone 0: the surface claims no exclusive space of its own and
+ * asks the compositor to move it away from surfaces that do reserve space (a
+ * docked panel), so the paper still reaches the edges under a docked panel's
+ * reserved area but never covers it.  tbmode=TB_COVER sets -1: the veil
+ * ignores every other surface's exclusive zone and reaches the screen edges
+ * unconditionally - the paper covers the taskbar, exactly like the Windows
+ * mode of the same name.  The size of a floating panel, the one case the
+ * compositor cannot know, is the user's `panelgap`. */
 static void ApplyExclusiveZone(struct OUT *o) {
     if (!o->ls) return;
     zwlr_layer_surface_v1_set_exclusive_zone(o->ls,
@@ -1364,6 +1368,9 @@ static void SetMode(int mode) {
 static void MenuToggleShow(void)      { SetMaster(!g_s.master); }
 static void MenuSetIntensity(int v)   { g_s.intensity = v; ApplySettings(1); }
 static void MenuSetWarmth(int v)      { g_s.warmth = v; ApplySettings(1); }
+static void MenuSetGrain(int v)       { g_s.grain = v; ApplySettings(1); }
+static void MenuSetFibre(int v)       { g_s.fibre = v; ApplySettings(1); }
+static void MenuSetBlotch(int v)      { g_s.blotch = v; ApplySettings(1); }
 static void MenuToggleAutostart(void) { g_s.autostart = !g_s.autostart; ApplySettings(1); }
 static void MenuQuit(void)            { g_quit = 1; }
 static void MenuEditConfig(void) {
@@ -1384,12 +1391,17 @@ static void MenuEditConfig(void) {
 static int MenuQueryMaster(void)      { return g_s.master; }
 static int MenuQueryIntensity(void)   { return g_s.intensity; }
 static int MenuQueryWarmth(void)      { return g_s.warmth; }
+static int MenuQueryGrain(void)       { return g_s.grain; }
+static int MenuQueryFibre(void)       { return g_s.fibre; }
+static int MenuQueryBlotch(void)      { return g_s.blotch; }
 static int MenuQueryAutostart(void)   { return g_s.autostart; }
 
 static const struct TRAYCB g_traycb = {
-    MenuToggleShow, MenuSetIntensity, MenuSetWarmth, MenuToggleAutostart,
+    MenuToggleShow, MenuSetIntensity, MenuSetWarmth,
+    MenuSetGrain, MenuSetFibre, MenuSetBlotch, MenuToggleAutostart,
     MenuEditConfig, MenuQuit,
-    MenuQueryMaster, MenuQueryIntensity, MenuQueryWarmth, MenuQueryAutostart,
+    MenuQueryMaster, MenuQueryIntensity, MenuQueryWarmth,
+    MenuQueryGrain, MenuQueryFibre, MenuQueryBlotch, MenuQueryAutostart,
 };
 
 /* --------------------------------------------------------------- ipc ------- */

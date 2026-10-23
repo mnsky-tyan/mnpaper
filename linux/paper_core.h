@@ -57,20 +57,33 @@ typedef struct {
                     * Windows: 0 raises the taskbar above the veil, 1 leaves
                     * it under the paper.  Wayland: an overlay layer surface is
                     * always stacked above the panel, so the modes choose
-                    * between the two by way of `panelgap` - 0 keeps the bottom
-                    * `panelgap` strip unpainted and asks the compositor for
-                    * exclusive zone 0, so a floating panel and its tray stay
-                    * visible and clickable; 1 covers the whole screen with
-                    * exclusive zone -1.  A docked panel gets its own space
-                    * reserved by the compositor on top of that strip, so
-                    * docked-panel users set `panelgap=0`.  Both platforms obey
-                    * it (mnpaper.c's ApplyExclusiveZone). */
+                    * between the two by way of `panelgap` - 0 leaves the
+                    * bottom `panelgap` strip unpainted and asks the compositor
+                    * for exclusive zone 0 (with the default panelgap=0 the
+                    * paper simply reaches the edge, and a docked panel keeps
+                    * its space when the compositor honours that request); 1
+                    * covers the whole screen with exclusive zone -1.  Both
+                    * platforms obey it (mnpaper.c's ApplyExclusiveZone). */
     int autoupd;   /* 1 = look for a new version about once a day */
-    int panelgap;  /* Wayland: logical pixels left uncovered at the bottom for
-                    * a floating panel/tray (0 = cover everything).  A
-                    * client cannot be stacked between an overlay layer
-                    * surface and the panel, so "do not cover the taskbar"
-                    * means "do not paint that strip". */
+    int cfgver;    /* config schema version, written by ConfigWrite on every
+                    * save.  A file that carries the key at all was written by
+                    * a build that knows it; a file without the line predates
+                    * the panelgap default change, which is what LoadSettings
+                    * migrates. */
+    int panelgap;  /* Wayland: logical pixels left uncovered at the bottom.
+                    *
+                    * 0 (the default) is right for every panel that either
+                    * reserves its own space (zone 0 asks the compositor to
+                    * move our surface clear of it, and the protocol leaves
+                    * that move to the compositor) or auto-hides (it reserves
+                    * nothing, so there is no strip to leave clear and the
+                    * paper should reach the screen edge).  A non-zero value
+                    * is for a FLOATING panel that reserves nothing but must
+                    * stay uncovered - the one case the compositor cannot
+                    * infer - and for any panel a compositor leaves under the
+                    * paper.  This used to default to 96, which painted a 96px
+                    * hole under panels that were not there; a file without a
+                    * cfgver key is migrated to 0 once (see LoadSettings). */
 } SETTINGS;
 
 /* Same defaults as mnPaper.c's g_s initialiser. Keep the two in step until
@@ -82,7 +95,7 @@ static SETTINGS PaperDefaultSettings(void) {
     s.warmth = 45; s.grain = 4; s.fibre = 40; s.blotch = 30;
     s.shades = 4; s.contrast = 50; s.dither = 75;
     s.autostart = 0; s.share = 0; s.tbmode = TB_NOT_COVER;
-    s.autoupd = 1; s.panelgap = 96;
+    s.autoupd = 1; s.cfgver = 2; s.panelgap = 0;
     return s;
 }
 
@@ -124,6 +137,7 @@ static int SetKeyValue(SETTINGS *s, const char *arg) {
     else if (!strcasecmp(key, "share")) s->share = v ? 1 : 0;
     else if (!strcasecmp(key, "tbmode")) s->tbmode = v ? TB_COVER : TB_NOT_COVER;
     else if (!strcasecmp(key, "panelgap")) s->panelgap = v;
+    else if (!strcasecmp(key, "cfgver")) s->cfgver = v;
     else if (!strcasecmp(key, "autoupd")) s->autoupd = v ? 1 : 0;
     else if (!strcasecmp(key, "master")) s->master = v ? 1 : 0;
     else return 0;
@@ -142,13 +156,70 @@ static void ClampSettingsOf(SETTINGS *s) {
         { &s->contrast,  0, 100 }, { &s->dither,    0, 100 },
         { &s->autostart, 0,   1 }, { &s->share,     0,   1 },
         { &s->tbmode,    0,   TB_COVER }, { &s->autoupd,   0,   1 },
-        { &s->panelgap,  0,        512 },
+        { &s->panelgap,  0,        512 }, { &s->cfgver,   0,   2 },
     };
     int i;
     for (i = 0; i < (int)(sizeof(f) / sizeof(f[0])); i++) {
         if (*f[i].v < f[i].lo) *f[i].v = f[i].lo;
         if (*f[i].v > f[i].hi) *f[i].v = f[i].hi;
     }
+}
+
+/* The config file's two halves, kept next to the parser and the migration so
+ * the headless suite can drive the real round trip: the app's loader and
+ * writer call exactly these, and a test that formats a struct and parses the
+ * result back pins the property that matters - a file this build writes is
+ * read back unchanged, including the schema stamp. */
+
+/* Writes the canonical file body: every key, always, so the file is
+ * diff-friendly.  Returns 0 on success, -1 on a write error. */
+static int ConfigFormat(const SETTINGS *s, FILE *f) {
+    if (fprintf(f,
+            "# mnpaper settings (same keys as the Windows registry values;\n"
+            "# autostart is not stored here - the autostart .desktop file is the\n"
+            "# truth, exactly as the Windows Run key is)\n"
+            "master=%d\nmode=%d\nintensity=%d\nwarmth=%d\ngrain=%d\n"
+            "fibre=%d\nblotch=%d\nshades=%d\ncontrast=%d\ndither=%d\n"
+            "share=%d\ntbmode=%d\nautoupd=%d\npanelgap=%d\ncfgver=%d\n",
+            s->master, s->mode, s->intensity, s->warmth, s->grain,
+            s->fibre, s->blotch, s->shades, s->contrast, s->dither,
+            s->share, s->tbmode, s->autoupd, s->panelgap, s->cfgver) < 0)
+        return -1;
+    return 0;
+}
+
+/* Applies one line of the file.  `stamped` records whether the file carried
+ * the cfgver key AT ALL - that presence, not the value, is what tells a
+ * cfgver-aware file from a pre-v2 one, so a file this build wrote can never
+ * re-arm the migration.  Returns 1 when the line set a key, 0 when it was a
+ * blank line or a comment, and -1 when the key or value was refused. */
+static int ConfigParseLine(SETTINGS *s, char *line, int *stamped) {
+    char *nl = line + strlen(line);
+    if (nl > line && nl[-1] == '\n') nl[-1] = 0;
+    if (line[0] == '#' || line[0] == 0) return 0;
+    if (!strncasecmp(line, "cfgver=", 7)) *stamped = 1;
+    return SetKeyValue(s, line) ? 1 : -1;
+}
+
+/* Config schema migration, run once per load.  A file written before cfgver
+ * existed carries panelgap=96 because that WAS the default, not because the
+ * user chose it - and 96 logical pixels is a bigger hole than most panels,
+ * so it showed as an uncovered band at the bottom on any panel that reserves
+ * no space of its own (auto-hide, floating).  A cfgver-less file holding
+ * exactly that value is the old default, so it becomes the new one; any other
+ * value is a real choice and is left alone.
+ *
+ * `file_had_cfgver` is whether the file carried the key at all, not what the
+ * key held: ConfigWrite stamps every file this build saves, so the presence of
+ * the key is proof the file came from a cfgver-aware build and the migration
+ * is done.  Keying on the value instead would let a stamped file re-arm the
+ * migration - 0 is both the clamp floor and a settable value - and silently
+ * revert a panelgap the user chose.  Returns 1 when panelgap was migrated. */
+static int MigrateSettings(SETTINGS *s, int file_had_cfgver) {
+    s->cfgver = 2;
+    if (file_had_cfgver || s->panelgap != 96) return 0;
+    s->panelgap = 0;
+    return 1;
 }
 
 /* The only mode this build can represent: e-ink needs screen capture, which

@@ -28,8 +28,9 @@ make          # builds ./mnpaper
 - Hotplug: monitors appearing, disappearing or changing scale are picked up
   live.
 - **Tray icon** (StatusNotifierItem + DBusMenu, no toolkit): left-click
-  toggles, scroll steps the strength, and the menu carries the strength and
-  warmth presets, autostart, the settings file and Quit.
+  toggles, scroll steps the strength, and the menu carries the strength,
+  warmth, grain, fibre and blotch presets, autostart, the settings file and
+  Quit.
 
 ## What is not ported yet
 
@@ -38,11 +39,12 @@ rather than surprising:
 
 | Feature | Why it is missing |
 |---|---|
-| **E-ink mode** | Needs screen capture. KWin implements neither `wlr-screencopy` nor `ext-image-copy-capture`, so the backend has to be KDE's PipeWire screencast. `--eink` is refused with a log line and the mode stays paper. |
-| Settings GUI | No toolkit linked yet. All settings are reachable via `--set`, the tray menu, or the config file (plain text). |
+| **E-ink mode** | Needs screen capture. KWin implements neither `wlr-screencopy` nor `ext-image-copy-capture`, so the backend has to be KDE's PipeWire screencast. `--eink` is refused with a log line and the mode stays paper. The three e-ink knobs (`shades`, `contrast`, `dither`) are stored but inert until then. |
+| **Settings GUI** | No toolkit linked. Every setting is reachable through the tray menu, `--set` or the plain-text config file; what is missing is the Windows dialog's single window with live sliders. A GTK/Qt dialog is its own piece of work and is deliberately not started. |
+| **Texture in screenshots (`share`)** | Stored, but nothing acts on it: Wayland has no capture-exclusion protocol here, and a layer surface is not a Plasma window, so `excludeFromCapture` cannot be reached. Unlike the Windows build, the paper is **not** excluded from screen shares on Wayland. |
 | Global hotkeys | Needs `ext-global-shortcuts-v1` (KWin has it); not wired up. |
 | ~~Autostart~~ | **Done.** Writes `~/.config/autostart/mnpaper.desktop`; see below. |
-| Self-update | The Windows feed pins an `.exe`; a Linux release feed would need its own artifact and pin. |
+| Self-update | The Windows feed pins an `.exe`; a Linux release feed would need its own artifact and pin. `autoupd` is stored but inert. |
 
 ## Command line
 
@@ -61,7 +63,8 @@ mnpaper --log FILE               append diagnostics to FILE as well as stderr
 Keys accepted by `--set` (same names and bounds as the Windows registry
 values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 (2-12), `fibre` (0-100), `blotch` (0-100), `shades`, `contrast`, `dither`,
-`share`, `tbmode`, `autostart`, `autoupd`, `panelgap` (0-512).
+`share`, `tbmode`, `autostart`, `autoupd`, `panelgap` (0-512). `cfgver` is
+written by the program for its own migration and is not meant to be set.
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
 The keys that change the Linux image are `grain`, `fibre`, `blotch`,
@@ -99,7 +102,15 @@ in the system tray as a small procedurally-drawn paper swatch.
 - **Left-click** toggles the paper, exactly like `--toggle`.
 - **Scroll** on the icon steps through the strength presets.
 - **Right-click menu**: Show paper, Strength (Subtle/Soft/Medium/Strong),
-  Warmth (Cool/Neutral/Warm/Aged), Start at login, Edit settings file..., Quit.
+  Warmth (Cool/Neutral/Warm/Aged), Grain (2..12), Fibre (0..100 in tens),
+  Blotch (0..100 in tens), Start at login, Edit settings file..., Quit.
+
+Grain, fibre and blotch are the three texture parameters the menu used to
+leave out; each submenu has ten steps spanning the same bounds the clamp
+table enforces, and every list contains the setting's default so a fresh
+install shows a checked row rather than none. A value set by hand (`--set
+fibre=37`, say) matches no preset, so no radio is checked - the honest
+answer, and what the strength and warmth submenus already did.
 
 Everything funnels through the same `SetMaster`/`ApplySettings` path the CLI
 uses, so the menu checkmarks, `--status` and the screen can never disagree.
@@ -119,24 +130,35 @@ placed between them), so "do not cover the taskbar" has to mean "do not paint
 that strip". Two settings control it:
 
 - `tbmode=0` (the default, matching Windows' TB_NOT_COVER): the bottom
-  `panelgap` logical pixels are left uncovered, so a panel there - floating or
-  docked - and the tray icon in it stay visible and clickable. The strip is
-  reserved whether the panel is floating or docked, so a docked panel gets
-  this strip **in addition to** the space the compositor already reserves for
-  it; see `panelgap` below.
-- `tbmode=1` (TB_COVER): the veil covers the whole screen including that
-  strip, like the Windows mode of the same name.
+  `panelgap` logical pixels are left uncovered. With the default `panelgap=0`
+  that is no strip at all - the paper reaches the bottom edge, and the surface
+  asks the compositor for exclusive zone 0, i.e. "move me clear of surfaces
+  that reserve space". Whether that moves it is up to the compositor (the
+  protocol says its use of the request is implementation-dependent), so a
+  panel that ends up under the paper is a `panelgap` case; see below.
+- `tbmode=1` (TB_COVER): the veil ignores every other surface's exclusive
+  zone (zone -1) and covers the whole screen, like the Windows mode of the
+  same name.
 
-`panelgap` (0-512, default 96) is how tall that uncovered strip is. The daemon
-cannot tell a docked panel from a floating one, so the strip is always
-reserved: set it to your floating panel's height (KDE's default floating panel
-is 72-96 logical pixels, GNOME's is about 48) and set `panelgap=0` when your
-panel is docked, letting the compositor's own avoidance keep it clear. Where
-the compositor provides no such avoidance, the veil reaches the screen edge.
+`panelgap` (0-512, default **0**) is how tall that uncovered strip is. Zero is
+right for a panel that reserves its own space (zone 0 asks the compositor to
+move the surface clear of it, and a compositor that honours the request
+leaves the panel uncovered) and for an auto-hiding panel (it reserves nothing,
+so there is no strip to leave clear and the paper reaches the edge). A
+non-zero value is for a **floating** panel that reserves nothing yet must stay
+uncovered - the one case the compositor cannot infer - and for any panel a
+compositor leaves under the paper. KDE's default floating panel is 72-96
+logical pixels, GNOME's about 48.
+
+This default used to be 96, which painted a 96px hole under panels that were
+not there. An existing config is migrated once: `cfgver` records the schema,
+and a file that does not carry that key at all and holds exactly the old
+default 96 becomes 0. Any other stored value is treated as a real choice and
+kept, and so is a 96 in a file that already has the key.
 
 ```bash
-./mnpaper --set panelgap=48      # a 48px strip for a floating GNOME-style panel
-./mnpaper --set panelgap=0       # no extra strip; the compositor still keeps a docked panel clear
+./mnpaper --set panelgap=48      # a 48px strip for a floating panel that needs one
+./mnpaper --set panelgap=0       # no extra strip (the default)
 ```
 
 ## Autostart (start with the session)
@@ -179,10 +201,8 @@ it diffs cleanly and survives partial edits.
 
 - **`zwlr_layer_shell_v1`** puts a surface on the `overlay` layer, anchored to
   all four edges, with a tbmode-dependent exclusive zone (`0` by default, `-1`
-  with `tbmode=1`); in the default tbmode the bottom `panelgap` margin, not
-  the zone, is what keeps the bottom panel strip (and the tray in it)
-  clickable. This is the Wayland equivalent of `WS_EX_TOPMOST` + a fullscreen
-  borderless window.
+  with `tbmode=1`). This is the Wayland equivalent of `WS_EX_TOPMOST` + a
+  fullscreen borderless window.
 - **Autostart** is an XDG `.desktop` file, applied on every settings change
   (idempotent), and read back at load as the source of truth.
 - **`wl_shm` + ARGB8888** is premultiplied BGRA in memory: byte-for-byte the
@@ -210,7 +230,8 @@ it diffs cleanly and survives partial edits.
 ## Resource cost (measured on this machine)
 
 A 2880x1800 desktop at 160% (a 2880x1646 buffer with a 96 px bottom panel
-strip left clear):
+strip left clear - `panelgap=96`, the default when this was measured; the
+current default 0 keeps the full 2880x1800):
 
 | | |
 |---|---|
@@ -257,8 +278,9 @@ editing a protocol `.xml`, run `make regen` to re-scan it.
 `make test` runs two binaries, both headless.
 
 The first is the core suite: defaults, clamping, `--set` grammar,
-determinism, premultiplied-alpha validity, odd sizes, cancellation, and
-e-ink normalization. It mirrors the spirit of the Windows hidden
+determinism, premultiplied-alpha validity, odd sizes, cancellation, e-ink
+normalization, the one-shot panelgap migration, and the config-file round
+trip. It mirrors the spirit of the Windows hidden
 suites for the parts this port ships. It also spawns the real `mnpaper`
 binary to pin the CLI refusals (a malformed or over-long `--set` operand,
 a batch past 64 pairs, a dangling `--set`): each child gets a private
@@ -273,7 +295,8 @@ that the bounds on batched events and property queries hold, that
 `Activate`, `Event` and `GetLayout` do what they claim, and it watches the
 bus the way a host does: it asserts that a `PropertiesChanged` really
 carries the `Status` property, and that `ItemsPropertiesUpdated` arrives
-with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`). Those two
+with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`), carrying
+every row whose state can move - the texture radios included. Those two
 fail silently - a typed consumer such as dbusmenu-qt5 drops a signal with
 the wrong element type, and a property change that never leaves the process
 leaves a stale icon - so only the wire can catch them. The case skips
@@ -297,9 +320,10 @@ touching the buffer or layer-surface code):
 - No capture exclusion. Windows' `WDA_EXCLUDEFROMCAPTURE` has no portable
   Wayland equivalent; `share` is stored but changes nothing on Wayland.
 - `tbmode` is a Windows taskbar concept: on Wayland it decides whether the
-  veil also covers the bottom `panelgap` pixels (see the tray section). It
+  veil ignores other surfaces' exclusive zones (see the tray section). It
   cannot move the surface off the panel, because a layer-shell overlay is
-  always stacked above the panel by the compositor.
+  always stacked above the panel by the compositor - an auto-hiding panel is
+  therefore drawn *under* the paper when it slides in.
 - The texture cannot cover the secure login screen (before a session exists).
 - The default texture at `intensity=30` is subtle: on dark content it shifts
   fewer than 8 levels per channel, which is intended.
