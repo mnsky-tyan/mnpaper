@@ -266,7 +266,12 @@ int main(void) {
         }
         /* Warmth must visibly swing hue, not just nibble a channel: over a
          * neutral backdrop, warmth 0 reads cool (blue > red) and warmth 100
-         * reads warm (red > blue) by a clear margin in the composited pixel. */
+         * reads warm (red > blue) by a clear margin in the composited pixel.
+         * The old thresholds (-3 / +2 / span 5) were tuned to the magnitude the
+         * user could not see: the shipped build moved 0.9% of pixels by two
+         * luminance levels.  A paper veil that is worth showing swings its
+         * chroma far harder than that (measured 20+ levels end to end after the
+         * 2026-10-23 rescale), so the floor now fails an invisible tint. */
         {
             int w = 320, h = 200, warm_br = 0, cool_br = 0;
             unsigned char *buf = malloc((size_t)w * h * 4);
@@ -282,8 +287,29 @@ int main(void) {
             g_s = saved;
             warm_br /= w * h; cool_br /= w * h;
             printf("METRIC warmth swing (blue-red): warm=%d cool=%d\n", warm_br, cool_br);
-            Check(warm_br <= -3 && cool_br >= 2 && cool_br - warm_br > 5,
+            Check(warm_br <= -8 && cool_br >= 8 && cool_br - warm_br > 16,
                   "warmth endpoints read distinctly cool and warm");
+            free(buf);
+        }
+        /* Strength must be an opacity budget worth spending: the shipped build
+         * topped out at a median alpha of 18/255, which is why every slider
+         * felt dead.  Pin the floor so that cannot come back. */
+        {
+            int w = 320, h = 200, i2, cnt[256], cum, med;
+            unsigned char *buf = malloc((size_t)w * h * 4);
+            SETTINGS saved = g_s;
+            g_s.intensity = 30;
+            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "default preview renders");
+            memset(cnt, 0, sizeof cnt);
+            for (i2 = 0; i2 < w * h; i2++) cnt[buf[4*i2 + 3]]++;
+            cum = 0; med = 0;
+            for (i2 = 0; i2 < 256; i2++) {
+                cum += cnt[i2];
+                if (cum * 2 >= w * h) { med = i2; break; }
+            }
+            g_s = saved;
+            printf("METRIC default median alpha: %d/255\n", med);
+            Check(med >= 25, "default strength puts a visible veil on screen");
             free(buf);
         }
     }
