@@ -97,7 +97,9 @@ actually in effect.
 
 The daemon exposes `org.kde.StatusNotifierItem` plus a `com.canonical.dbusmenu`
 menu over the session bus - no GTK or Qt, just libsystemd's sd-bus. It appears
-in the system tray as a small procedurally-drawn paper swatch.
+in the system tray as the mn-brand artwork for mnPaper, baked into `tray.c` as
+`ICON_PIX` - a source table, not a binary asset. The same pixels appear in the
+24x24 entry of `mnPaper.ico`.
 
 - **Left-click** toggles the paper, exactly like `--toggle`.
 - **Scroll** on the icon steps through the strength presets.
