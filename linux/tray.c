@@ -106,9 +106,9 @@ static uint32_t revision = 1;   /* menu revision: bumped on every change */
 /* The mnPaper tray icon: the mn-brand artwork (mnpaper.png, 2048x2048)
  * downscaled to 24x24. Same artwork as the app icon (mnPaper.ico); this
  * table is that render baked in as pixels so the tray still ships no
- * binary asset. Regenerate from
- * /home/tyan/mnsky/mnbrand/icons/mnpaper.png (never from the 300x300 control
- * copy, and never hand-edit: the artwork changes in the mn-brand pipeline).
+ * binary asset. Regenerate from the mn-brand artwork source, never from the
+ * 300x300 control copy, and never hand-edit: the artwork changes in the
+ * mn-brand pipeline.
  *
  * D-Bus ARGB32 is big-endian per pixel: bytes are A, R, G, B. */
 static const unsigned char ICON_PIX[24 * 24 * 4] = {
