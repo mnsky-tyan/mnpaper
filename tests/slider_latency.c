@@ -392,7 +392,9 @@ int main(void) {
             unsigned char *buf = malloc((size_t)w * h * 4);
             SETTINGS saved = g_s;
             g_s = before;                          /* the shipped defaults */
-            floor = PaperParams(w, &g_s).bias;     /* the generator's own floor */
+            /* the generator's own floor, read at the scale the preview
+             * samples at so the comparison cannot drift from the bake */
+            floor = PaperParams(w, (float)PAPER_PREVIEW_STEP, &g_s).bias;
             Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "default preview renders");
             memset(cnt, 0, sizeof cnt);
             for (i2 = 0; i2 < w * h; i2++) cnt[buf[4*i2 + 3]]++;

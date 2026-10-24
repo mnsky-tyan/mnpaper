@@ -431,6 +431,7 @@ static int g_pipe[2] = { -1, -1 };     /* worker -> event loop "done" ping */
 
 struct RESULT {
     int idx, w, h, gen;
+    float fs;                          /* the sampling scale it was baked at */
     double build_ms;
     unsigned char *px;                 /* worker-malloc'd; main thread copies
                                         * into the surface buffer and frees */
@@ -480,6 +481,7 @@ static void *WorkerMain(void *unused) {
             if (built) {
                 struct RESULT r;
                 r.idx = job.idx; r.w = job.w; r.h = job.h; r.gen = job.gen;
+                r.fs = job.fs;
                 r.build_ms = NowMs() - began;
                 r.px = px;
                 pthread_mutex_lock(&g_wlock);
@@ -738,7 +740,10 @@ static void BufferRelease(void *data, struct wl_buffer *buf) {
  * The fractional-scale protocol fixes that: the compositor states the scale
  * it wants (in 120ths), the buffer then holds one pixel per screen pixel,
  * and a viewport maps that buffer onto the surface-local size.  The paper is
- * rendered 1:1.
+ * sampled in surface-local units at the buffer/logical ratio (SurfaceFs), so
+ * the buffer's one-pixel-per-screen-pixel geometry and the texture's
+ * scale-invariance are the same fact stated twice: the pattern is fixed to
+ * the surface, and the buffer resolution only decides how finely it is drawn.
  *
  * This is a sharpness and cost fix, NOT a fix for the black frame: the frame
  * was the ShapeCorners effect stroking our surface as if it were a normal
@@ -750,6 +755,16 @@ static int UseFractionalScale(struct OUT *o) {
      * viewporter extension; without it the fractional path cannot be
      * expressed, so the integer path stays. */
     return o->fs120 > 0 && g_vp != NULL;
+}
+
+/* Device pixels per surface-local pixel for the buffer this output currently
+ * holds.  The paper is sampled in surface-local units, so this ratio is part
+ * of what a bake means: the same buffer size at a different scale is a
+ * different texture (see PaperParams in paper_core.h).  Every place that
+ * bakes, accepts or records a bake reads the ratio from here so the queue, the
+ * result check and the output cannot disagree about it. */
+static float SurfaceFs(const struct OUT *o) {
+    return o->lw > 0 ? (float)o->w / (float)o->lw : 1.f;
 }
 
 /* Buffer pixels and buffer scale for a surface of lw x lh surface-local px. */
@@ -897,10 +912,7 @@ static void QueueBake(struct OUT *o) {
     g_job[o->idx].w = o->w;
     g_job[o->idx].h = o->h;
     g_job[o->idx].gen = g_settings_gen;
-    /* device pixels per surface-local pixel: the noise is sampled in logical
-     * units so the texture is identical at every buffer scale (see
-     * PaperParams in paper_core.h). */
-    g_job[o->idx].fs = o->lw > 0 ? (float)o->w / (float)o->lw : 1.f;
+    g_job[o->idx].fs = SurfaceFs(o);
     g_job[o->idx].s = g_s;
     pthread_mutex_unlock(&g_wlock);
     WorkerKick();
@@ -1804,8 +1816,8 @@ static void WorkerResultsReady(void) {
         r = g_results[--g_nresults];
         pthread_mutex_unlock(&g_wlock);
         o = (r.idx >= 0 && r.idx < MAX_MON) ? g_ov[r.idx] : NULL;
-        if (o && o->configured && o->buf &&
-            r.gen == g_settings_gen && r.w == o->w && r.h == o->h) {
+        if (o && o->configured && o->buf && r.gen == g_settings_gen &&
+            r.w == o->w && r.h == o->h && r.fs == SurfaceFs(o)) {
             stale = 0;
             PresentBake(o, r.px);
             L("output %d: baked %dx%d in %.0f ms%s", r.idx, r.w, r.h,
@@ -1814,11 +1826,17 @@ static void WorkerResultsReady(void) {
         if (r.idx >= 0 && r.idx < MAX_MON)
             BakeIdle(r.idx, r.gen);
         if (stale) {
-            /* A settings change or resize beat this bake.  Never a silent
-             * gap: re-queue deduped so the output converges. */
-            L("output %d: stale bake dropped (gen %d vs %d) - re-queued",
-              r.idx, r.gen, g_settings_gen);
-            if (o) QueueBake(o);
+            /* A settings change, a resize or a scale change beat this bake.
+             * Never a silent gap: re-queue deduped so the output converges. */
+            if (o) {
+                L("output %d: stale bake dropped (gen %d vs %d, %.2fx vs %.2fx) "
+                  "- re-queued",
+                  r.idx, r.gen, g_settings_gen, (double)r.fs,
+                  (double)SurfaceFs(o));
+                QueueBake(o);
+            } else {
+                L("output %d: stale bake dropped, output gone", r.idx);
+            }
         }
         free(r.px);
     }

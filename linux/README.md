@@ -19,7 +19,12 @@ make          # builds ./mnpaper
 - **Ctrl-free CLI** for everything (see below): on/off/toggle, live parameter
   changes, status.
 - Same texture engine as Windows: identical noise, identical parameters,
-  identical defaults. `--dump-tex` produces the same paper the overlay shows.
+  identical defaults. The paper belongs to the surface, not to the pixel grid,
+  so the same settings give the same texture at any buffer scale - the 1.6 and
+  2.0 builds of one panel are the same paper, not two different ones.
+  `--dump-tex` bakes in surface-local pixels at 1:1, so it shows the paper as
+  the overlay draws it at 100% scale, not magnified to the panel's device
+  density.
 - HiDPI: renders at the compositor's preferred fractional scale
   (`wp_fractional_scale_v1` + `wp_viewport`), so a 160% panel gets a buffer
   of exactly its device pixels instead of a rounded-up integer scale. The
@@ -287,8 +292,11 @@ alpha floors at the default and maximum strengths, and every texture control
 moving the composited picture over light, mid and dark backgrounds, so an
 invisible veil fails on its own instead of hiding behind a one-pixel
 difference. A grain of 0 must clamp and still bake a real veil, not a blank
-frame. It mirrors the spirit of the Windows hidden suites for the parts this
-port ships. It also spawns the real `mnpaper`
+frame. It also pins that the texture is a property of the surface: the same
+logical surface baked at 1.0, 1.25, 1.5, 1.6, 2.0 and 3.0 buffer scales must
+produce the same paper, so the 1.6 panel no longer draws a different texture
+from the integer-scale one. It mirrors the spirit of the Windows hidden suites
+for the parts this port ships. It also spawns the real `mnpaper`
 binary to pin the CLI refusals (a malformed or over-long `--set` operand,
 a batch past 64 pairs, a dangling `--set`): each child gets a private
 `XDG_RUNTIME_DIR`, a private `XDG_CONFIG_HOME` and a nonexistent

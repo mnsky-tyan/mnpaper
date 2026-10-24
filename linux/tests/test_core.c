@@ -390,17 +390,24 @@ static void TestSettingsActuallyChangePixels(void) {
  * depending on the order I set the settings", because the buffer width at each
  * bake was what actually varied.
  *
- * Integer scales are used rather than the real 1.6 so the shared logical
- * coordinates land on exact buffer pixels and the comparison is byte-exact. */
+ * The fractional scales are the ones that matter: at an integer scale every
+ * buffer pixel lands on an integer logical coordinate, which is exactly the
+ * case where the coordinate division and the round(w/fs) lattice derivation
+ * cannot disagree.  A 1.6 buffer pixel sits 0.6 of a logical pixel from the
+ * next one, so each scale is given as an exact num/den pair and the comparison
+ * samples only the logical points both grids hold exactly (x = m*den, whose
+ * buffer pixel is m*num). */
 static void TestTextureIsScaleInvariant(void) {
     SETTINGS s = PaperDefaultSettings();
     int lw = 300, lh = 200;                 /* the logical surface */
     int i;
-    float scales[] = { 1.f, 2.f, 3.f };
+    /* 1.0, 2.0, 3.0, 1.25, 1.5, 1.6 - the last is this repo's reference panel */
+    int scales[][2] = { {1,1}, {2,1}, {3,1}, {5,4}, {3,2}, {8,5} };
     unsigned char *base = NULL;
     for (i = 0; i < (int)(sizeof scales / sizeof scales[0]); i++) {
-        float fs = scales[i];
-        int bw = (int)((float)lw * fs + 0.5f), bh = (int)((float)lh * fs + 0.5f);
+        int num = scales[i][0], den = scales[i][1];
+        float fs = (float)num / (float)den;
+        int bw = lw * num / den, bh = lh * num / den;
         unsigned char *px = malloc((size_t)bw * bh * 4);
         int x, y, diff = 0, maxd = 0;
         CHECK(px != NULL, "alloc");
@@ -414,18 +421,19 @@ static void TestTextureIsScaleInvariant(void) {
             CHECK(nonzero > (bw * bh) / 4, "scaled bake has body");
         }
         if (i == 0) { base = px; continue; }
-        for (y = 0; y < lh; y++)
-            for (x = 0; x < lw; x++) {
+        for (y = 0; y < lh; y += den)
+            for (x = 0; x < lw; x += den) {
+                int sx = x / den * num, sy = y / den * num;
                 int d = abs(base[4 * ((size_t)y * lw + x) + 3] -
-                            px[4 * ((size_t)(y * (int)fs) * bw + x * (int)fs) + 3]);
+                            px[4 * ((size_t)sy * bw + sx) + 3]);
                 if (d > maxd) maxd = d;
                 if (d > 1) diff++;
             }
         CHECK(diff == 0 && maxd <= 1, "scale invariance: no pixel moves");
         if (diff || maxd > 1)
-            printf("FAIL %s (line %d): scale invariance at fs %.0f: "
+            printf("FAIL %s (line %d): scale invariance at fs %.2f: "
                    "%d pixels moved, max %d\n",
-                   __func__, __LINE__, fs, diff, maxd);
+                   __func__, __LINE__, (double)fs, diff, maxd);
         free(px);
     }
     free(base);
