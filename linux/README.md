@@ -22,9 +22,11 @@ make          # builds ./mnpaper
   identical defaults. The paper belongs to the surface, not to the pixel grid,
   so the same settings give the same texture at any buffer scale - the 1.6 and
   2.0 builds of one panel are the same paper, not two different ones.
-  `--dump-tex` bakes in surface-local pixels at 1:1, so it shows the paper as
-  the overlay draws it at 100% scale, not magnified to the panel's device
-  density.
+  `--dump-tex` bakes the same generator in logical pixels at 1:1: a 300x200
+  dump is the paper a 480x320 buffer draws on a 160% panel. It is not a
+  pixel-for-pixel copy of the screen, because the overlay samples the surface
+  at the buffer/logical ratio - use it to compare settings, not to match one
+  on-screen pixel.
 - HiDPI: renders at the compositor's preferred fractional scale
   (`wp_fractional_scale_v1` + `wp_viewport`), so a 160% panel gets a buffer
   of exactly its device pixels instead of a rounded-up integer scale. The
@@ -96,6 +98,10 @@ actually in effect.
 ./mnpaper --set warmth=80 --set intensity=40   # warmer, stronger
 ./mnpaper --set warmth=20                      # cooler
 ./mnpaper --dump-tex paper.bmp 1920 1080       # see a setting before applying
+#                                                  # the dump bakes logical
+#                                                  # pixels at 1:1; the overlay
+#                                                  # samples the same surface
+#                                                  # at the compositor's scale
 ```
 
 ## Tray icon
@@ -214,7 +220,9 @@ it diffs cleanly and survives partial edits.
   (idempotent), and read back at load as the source of truth.
 - **`wl_shm` + ARGB8888** is premultiplied BGRA in memory: byte-for-byte the
   format the Windows build paints into its top-down DIBs. That is why the
-  generator could be lifted across unchanged.
+  generator (`linux/paper_core.h`) is shared with `mnPaper.c` and only the
+  scale it is sampled at differs: this port passes the buffer/logical ratio so
+  the texture is fixed to the surface, while Windows bakes its own pixels at 1.
 - **Two buffers, one mapping.** Each output has a shm pool holding a texture
   half and an all-zero transparent half. Showing and hiding is a buffer swap,
   never an unmap: KWin sends no new `configure` to an unmapped layer surface,
@@ -229,7 +237,10 @@ it diffs cleanly and survives partial edits.
   its mapping once the compositor has released both halves.
 - **One bake per real change.** A generation counter advances only when
   texture parameters change, so toggling, `share` or `tbmode` never triggers
-  a re-bake. In-flight duplicate bakes are suppressed.
+  a re-bake. In-flight duplicate bakes are suppressed, and a finished bake is
+  only accepted when its width, height *and* sampling scale still match the
+  output, so a scale change mid-bake re-queues instead of presenting the old
+  paper at the new size.
 - **Second instance = unix socket** at `$XDG_RUNTIME_DIR/mnpaper.sock`
   (text protocol), replacing Windows' `FindWindow` + `WM_COPYDATA`. A stale
   socket left by a killed instance is detected and reclaimed.
