@@ -114,7 +114,7 @@ static void TestTextureIsActuallyVisible(void) {
 
     {
         SETTINGS s = PaperDefaultSettings();       /* intensity 30 */
-        BuildPaperFull(px, w, h, &s, NULL);
+        BuildPaperFull(px, w, h, 1.f, &s, NULL);
         CHECK(AlphaPercentile(px, w, h, 50) >= 25,
               "default strength puts a visible veil on screen (median alpha)");
         CHECK(AlphaPercentile(px, w, h, 99) >= 45,
@@ -123,7 +123,7 @@ static void TestTextureIsActuallyVisible(void) {
     {
         SETTINGS s = PaperDefaultSettings();
         s.intensity = 40;                          /* the maximum */
-        BuildPaperFull(px, w, h, &s, NULL);
+        BuildPaperFull(px, w, h, 1.f, &s, NULL);
         CHECK(AlphaPercentile(px, w, h, 50) >= 35,
               "maximum strength is a real veil, not a haze (median alpha)");
         CHECK(AlphaPercentile(px, w, h, 99) >= 65,
@@ -137,9 +137,9 @@ static void TestTextureIsActuallyVisible(void) {
     {
         SETTINGS s = PaperDefaultSettings();
         int med, floor;
-        BuildPaperFull(px, w, h, &s, NULL);
+        BuildPaperFull(px, w, h, 1.f, &s, NULL);
         med = AlphaPercentile(px, w, h, 50);
-        floor = PaperParams(w, &s).bias;           /* the generator's floor */
+        floor = PaperParams(w, 1.f, &s).bias;       /* the generator's floor */
         CHECK(med >= floor * 3,
               "most of the veil is texture, not a flat bias floor");
     }
@@ -171,8 +171,8 @@ static void TestSettingsArePerceptible(void) {
         /* fibre: the strongest of the three texture controls */
         {
             SETTINGS s = PaperDefaultSettings();
-            s.fibre = 0;  BuildPaperFull(a, w, h, &s, NULL);
-            s.fibre = 100; BuildPaperFull(b, w, h, &s, NULL);
+            s.fibre = 0;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
+            s.fibre = 100; BuildPaperFull(b, w, h, 1.f, &s, NULL);
             CompositeOverBg(a, w, h, bg);
             CompositeOverBg(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
@@ -182,8 +182,8 @@ static void TestSettingsArePerceptible(void) {
         /* blotch */
         {
             SETTINGS s = PaperDefaultSettings();
-            s.blotch = 0;  BuildPaperFull(a, w, h, &s, NULL);
-            s.blotch = 100; BuildPaperFull(b, w, h, &s, NULL);
+            s.blotch = 0;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
+            s.blotch = 100; BuildPaperFull(b, w, h, 1.f, &s, NULL);
             CompositeOverBg(a, w, h, bg);
             CompositeOverBg(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
@@ -193,8 +193,8 @@ static void TestSettingsArePerceptible(void) {
         /* grain changes the structure, so it must move luminance too */
         {
             SETTINGS s = PaperDefaultSettings();
-            s.grain = 2;  BuildPaperFull(a, w, h, &s, NULL);
-            s.grain = 12; BuildPaperFull(b, w, h, &s, NULL);
+            s.grain = 2;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
+            s.grain = 12; BuildPaperFull(b, w, h, 1.f, &s, NULL);
             CompositeOverBg(a, w, h, bg);
             CompositeOverBg(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
@@ -205,8 +205,8 @@ static void TestSettingsArePerceptible(void) {
          * smaller luminance fraction but also assert the chroma swing below */
         {
             SETTINGS s = PaperDefaultSettings();
-            s.warmth = 10; BuildPaperFull(a, w, h, &s, NULL);
-            s.warmth = 95; BuildPaperFull(b, w, h, &s, NULL);
+            s.warmth = 10; BuildPaperFull(a, w, h, 1.f, &s, NULL);
+            s.warmth = 95; BuildPaperFull(b, w, h, 1.f, &s, NULL);
             CompositeOverBg(a, w, h, bg);
             CompositeOverBg(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
@@ -227,7 +227,7 @@ static void TestSettingsArePerceptible(void) {
             double sum = 0.0;
             int i;
             s.warmth = wt;
-            BuildPaperFull(a, w, h, &s, NULL);
+            BuildPaperFull(a, w, h, 1.f, &s, NULL);
             CompositeOverBg(a, w, h, 245);
             for (i = 0; i < w * h; i++)
                 sum += (double)a[4 * (size_t)i + 2] - (double)a[4 * (size_t)i + 0];
@@ -335,8 +335,8 @@ static void TestBakeDeterminismAndValidity(void) {
         unsigned char *b = malloc((size_t)w * h * 4);
         CHECK(a && b, "alloc");
         if (!a || !b) { free(a); free(b); return; }
-        CHECK(BuildPaperFull(a, w, h, &s, NULL), "bake a");
-        CHECK(BuildPaperFull(b, w, h, &s, NULL), "bake b");
+        CHECK(BuildPaperFull(a, w, h, 1.f, &s, NULL), "bake a");
+        CHECK(BuildPaperFull(b, w, h, 1.f, &s, NULL), "bake b");
         CHECK(memcmp(a, b, (size_t)w * h * 4) == 0, "determinism");
         CheckPremultiplied(a, w, h, "default settings");
         if (si == 1) {   /* odd size: corners and centre must have texture */
@@ -357,18 +357,18 @@ static void TestSettingsActuallyChangePixels(void) {
     CHECK(a && b, "alloc");
     if (!a || !b) { free(a); free(b); return; }
 
-    BuildPaperFull(a, w, h, &s, NULL);
+    BuildPaperFull(a, w, h, 1.f, &s, NULL);
     s.warmth = 100;                                  /* fully aged amber */
-    BuildPaperFull(b, w, h, &s, NULL);
+    BuildPaperFull(b, w, h, 1.f, &s, NULL);
     CHECK(memcmp(a, b, (size_t)w * h * 4) != 0, "warmth changes pixels");
     CheckPremultiplied(b, w, h, "warmth=100");
 
     s = PaperDefaultSettings();
-    BuildPaperFull(b, w, h, &s, NULL);
+    BuildPaperFull(b, w, h, 1.f, &s, NULL);
     CHECK(memcmp(a, b, (size_t)w * h * 4) == 0, "default settings reproduce");
 
     s.intensity = 0;                                 /* strength zero: off */
-    BuildPaperFull(b, w, h, &s, NULL);
+    BuildPaperFull(b, w, h, 1.f, &s, NULL);
     {
         int i, all_transparent = 1;
         for (i = 0; i < w * h; i++)
@@ -379,6 +379,58 @@ static void TestSettingsActuallyChangePixels(void) {
     free(a); free(b);
 }
 
+/* The texture is a property of the surface, not of the pixel grid.  The
+ * lattice periods come from the width in SAMPLING units and PaperPixel divides
+ * the pixel coordinate by fs, so rendering the same logical surface at two
+ * buffer scales must give the same paper.  Before 2026-10-24 the port sampled
+ * raw device pixels while deriving the lattice from the device-pixel width, so
+ * a 2880px buffer at 1.6x and a 1800px buffer at 1.0x - the same screen - gave
+ * completely different textures (measured: 96% of alphas differed by more than
+ * one level, max 111).  The user met that as "the same config looks different
+ * depending on the order I set the settings", because the buffer width at each
+ * bake was what actually varied.
+ *
+ * Integer scales are used rather than the real 1.6 so the shared logical
+ * coordinates land on exact buffer pixels and the comparison is byte-exact. */
+static void TestTextureIsScaleInvariant(void) {
+    SETTINGS s = PaperDefaultSettings();
+    int lw = 300, lh = 200;                 /* the logical surface */
+    int i;
+    float scales[] = { 1.f, 2.f, 3.f };
+    unsigned char *base = NULL;
+    for (i = 0; i < (int)(sizeof scales / sizeof scales[0]); i++) {
+        float fs = scales[i];
+        int bw = (int)((float)lw * fs + 0.5f), bh = (int)((float)lh * fs + 0.5f);
+        unsigned char *px = malloc((size_t)bw * bh * 4);
+        int x, y, diff = 0, maxd = 0;
+        CHECK(px != NULL, "alloc");
+        if (!px) { free(base); return; }
+        CHECK(BuildPaperFull(px, bw, bh, fs, &s, NULL), "bake");
+        /* the alpha must actually be there: a scale test comparing two blank
+         * frames would pass for the wrong reason */
+        {
+            int nonzero = 0, k;
+            for (k = 0; k < bw * bh; k++) if (px[4 * (size_t)k + 3]) nonzero++;
+            CHECK(nonzero > (bw * bh) / 4, "scaled bake has body");
+        }
+        if (i == 0) { base = px; continue; }
+        for (y = 0; y < lh; y++)
+            for (x = 0; x < lw; x++) {
+                int d = abs(base[4 * ((size_t)y * lw + x) + 3] -
+                            px[4 * ((size_t)(y * (int)fs) * bw + x * (int)fs) + 3]);
+                if (d > maxd) maxd = d;
+                if (d > 1) diff++;
+            }
+        CHECK(diff == 0 && maxd <= 1, "scale invariance: no pixel moves");
+        if (diff || maxd > 1)
+            printf("FAIL %s (line %d): scale invariance at fs %.0f: "
+                   "%d pixels moved, max %d\n",
+                   __func__, __LINE__, fs, diff, maxd);
+        free(px);
+    }
+    free(base);
+}
+
 static void TestCancellation(void) {
     SETTINGS s = PaperDefaultSettings();
     int w = 200, h = 200;
@@ -387,9 +439,9 @@ static void TestCancellation(void) {
     CHECK(px != NULL, "alloc");
     if (!px) return;
     memset(&c, 0, sizeof c);
-    CHECK(BuildPaperFull(px, w, h, &s, &c), "uncancelled bake completes");
+    CHECK(BuildPaperFull(px, w, h, 1.f, &s, &c), "uncancelled bake completes");
     c.stop = 1;
-    CHECK(!BuildPaperFull(px, w, h, &s, &c), "cancel flag stops the bake");
+    CHECK(!BuildPaperFull(px, w, h, 1.f, &s, &c), "cancel flag stops the bake");
     free(px);
 }
 
@@ -405,7 +457,7 @@ static void TestGrainZeroBakes(void) {
     CHECK(px != NULL, "alloc");
     if (!px) return;
     s.grain = 0;                    /* below the clamp floor: the guard's case */
-    CHECK(BuildPaperFull(px, w, h, &s, NULL), "grain 0 bake completes");
+    CHECK(BuildPaperFull(px, w, h, 1.f, &s, NULL), "grain 0 bake completes");
     CheckPremultiplied(px, w, h, "grain 0");
     for (i = 0; i < w * h; i++) if (px[4 * (size_t)i + 3]) opaque++;
     CHECK(opaque == w * h, "grain 0 bakes the real veil, not a blank frame");
@@ -668,6 +720,7 @@ int main(int argc, char **argv) {
     TestSettingsActuallyChangePixels();
     TestCancellation();
     TestGrainZeroBakes();
+    TestTextureIsScaleInvariant();
     TestCliRefusals(argc >= 1 && argv[0] ? argv[0] : "test_core");
     printf("%s: %d failure(s)\n", failures ? "RESULT" : "RESULT 0", failures);
     return failures ? 1 : 0;

@@ -416,7 +416,7 @@ static volatile sig_atomic_t g_quit;
  * Windows build cancels row-wise); the stale result is simply dropped at
  * present time by its generation number, at the cost of one wasted bake. */
 
-struct JOB { int used; int idx, w, h, gen; SETTINGS s; };
+struct JOB { int used; int idx, w, h, gen; float fs; SETTINGS s; };
 static struct JOB g_job[MAX_MON];
 static int g_baking[MAX_MON];          /* gen the worker is baking now, 0 = idle */
 
@@ -476,7 +476,7 @@ static void *WorkerMain(void *unused) {
             size_t bytes = (size_t)job.w * job.h * 4;
             unsigned char *px = malloc(bytes ? bytes : 4);
             double began = NowMs();
-            int built = px && BuildPaperFull(px, job.w, job.h, &job.s, &g_wcancel);
+            int built = px && BuildPaperFull(px, job.w, job.h, job.fs, &job.s, &g_wcancel);
             if (built) {
                 struct RESULT r;
                 r.idx = job.idx; r.w = job.w; r.h = job.h; r.gen = job.gen;
@@ -897,6 +897,10 @@ static void QueueBake(struct OUT *o) {
     g_job[o->idx].w = o->w;
     g_job[o->idx].h = o->h;
     g_job[o->idx].gen = g_settings_gen;
+    /* device pixels per surface-local pixel: the noise is sampled in logical
+     * units so the texture is identical at every buffer scale (see
+     * PaperParams in paper_core.h). */
+    g_job[o->idx].fs = o->lw > 0 ? (float)o->w / (float)o->lw : 1.f;
     g_job[o->idx].s = g_s;
     pthread_mutex_unlock(&g_wlock);
     WorkerKick();
@@ -1947,7 +1951,7 @@ int main(int argc, char **argv) {
         }
         px = malloc((size_t)dump_w * dump_h * 4);
         if (!px) { L("out of memory"); return 2; }
-        BuildPaperFull(px, dump_w, dump_h, &g_s, NULL);
+        BuildPaperFull(px, dump_w, dump_h, 1.f, &g_s, NULL);
         CompositeOver(px, dump_w, dump_h, dump_bg);
         if (!DumpBmp(dump_tex, px, dump_w, dump_h)) L("dump write failed: %s", dump_tex);
         else L("dump: %s (%dx%d, bg %d, mode %s)", dump_tex, dump_w, dump_h, dump_bg,
