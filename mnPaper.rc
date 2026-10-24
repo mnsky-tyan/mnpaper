@@ -5,8 +5,8 @@
 #include <winver.h>
 #include "version.h"
 
-// Application icon: layered paper waves. ID 1 = default icon Explorer uses
-// for the exe.
+// Application icon: the mn-brand mnPaper mark. ID 1 = default icon Explorer
+// uses for the exe.
 1 ICON "mnPaper.ico"
 
 VS_VERSION_INFO VERSIONINFO
