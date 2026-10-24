@@ -129,15 +129,18 @@ static void TestTextureIsActuallyVisible(void) {
         CHECK(AlphaPercentile(px, w, h, 99) >= 65,
               "maximum strength has real contrast (p99 alpha)");
     }
-    /* and the texture, not a flat tint, must carry the veil: the floor is
-     * `bias`, so the median has to sit well above it */
+    /* and the texture, not a flat tint, must carry the veil: the generator's
+     * own bias is the floor, so the median has to sit far above it.  The bias
+     * is read out of PaperParams rather than recomputed here - a duplicated
+     * formula would keep passing no matter what the generator did - and the
+     * 3x bar is what fails a bias of intensity*3/4 (median 54, floor 22). */
     {
         SETTINGS s = PaperDefaultSettings();
         int med, floor;
         BuildPaperFull(px, w, h, &s, NULL);
         med = AlphaPercentile(px, w, h, 50);
-        floor = s.intensity / 4;                   /* PaperParams' bias */
-        CHECK(med >= floor * 2,
+        floor = PaperParams(w, &s).bias;           /* the generator's floor */
+        CHECK(med >= floor * 3,
               "most of the veil is texture, not a flat bias floor");
     }
     free(px);
@@ -387,6 +390,25 @@ static void TestCancellation(void) {
     CHECK(BuildPaperFull(px, w, h, &s, &c), "uncancelled bake completes");
     c.stop = 1;
     CHECK(!BuildPaperFull(px, w, h, &s, &c), "cancel flag stops the bake");
+    free(px);
+}
+
+/* The engine is documented to survive a caller that skipped ClampSettingsOf:
+ * grain 0 must clamp inside PaperParams, where both the noise period and the
+ * per-pixel divisor read it. Unclamped it is a zero divisor on the bake thread
+ * - a fault on the period, or 0/0 noise in float that lands as a fully
+ * transparent bake reporting success. */
+static void TestGrainZeroBakes(void) {
+    SETTINGS s = PaperDefaultSettings();
+    int w = 120, h = 90, i, opaque = 0;
+    unsigned char *px = malloc((size_t)w * h * 4);
+    CHECK(px != NULL, "alloc");
+    if (!px) return;
+    s.grain = 0;                    /* below the clamp floor: the guard's case */
+    CHECK(BuildPaperFull(px, w, h, &s, NULL), "grain 0 bake completes");
+    CheckPremultiplied(px, w, h, "grain 0");
+    for (i = 0; i < w * h; i++) if (px[4 * (size_t)i + 3]) opaque++;
+    CHECK(opaque == w * h, "grain 0 bakes the real veil, not a blank frame");
     free(px);
 }
 
@@ -645,6 +667,7 @@ int main(int argc, char **argv) {
     TestSettingsArePerceptible();
     TestSettingsActuallyChangePixels();
     TestCancellation();
+    TestGrainZeroBakes();
     TestCliRefusals(argc >= 1 && argv[0] ? argv[0] : "test_core");
     printf("%s: %d failure(s)\n", failures ? "RESULT" : "RESULT 0", failures);
     return failures ? 1 : 0;

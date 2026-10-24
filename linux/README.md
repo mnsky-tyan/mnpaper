@@ -326,9 +326,9 @@ touching the buffer or layer-surface code):
   therefore drawn *under* the paper when it slides in.
 - The texture cannot cover the secure login screen (before a session exists).
 - The default texture at `intensity=30` is a light but clearly visible veil:
-  a median opacity of about 15%, peaking near 29%. Before 2.7.23 the whole
-  range topped out at 7% median / 18% peak, so the texture was barely
-  distinguishable from the desktop and every slider looked dead. If it now
+  a median opacity of about 15%, peaking near 29%. Earlier builds topped out
+  at 7% median / 18% peak, so the texture was barely distinguishable from the
+  desktop and every slider looked dead. If it now
   reads too strong, lower `intensity` rather than the individual texture
   sliders - strength is the opacity budget, and grain/fibre/blotch shape the
   texture inside it.

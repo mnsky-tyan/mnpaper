@@ -539,10 +539,12 @@ static volatile LONG g_pepoch[MAX_MON];
  * was 4.7 alpha levels out of a nominal 30, which is why every slider looked
  * dead (2026-10-23 review, user report "nothing happens when I adjust them").
  * This constant is ~3 sigma of the measured distribution, so the swing uses
- * the range the slider promises and clips only the rare extreme.  Keep it tied
- * to the noise: if the octave weights or the field count change, re-measure
- * and update this - and keep it identical to linux/paper_core.h, which carries
- * the same constant for the same reason. */
+ * the range the slider promises.  The clamp is not rare: at the defaults it
+ * saturates the folded term on ~7% of a 1200x800 frame and the fibre and macro
+ * terms - folded from a single fbm each - on ~21%.  Keep it tied to the noise:
+ * if the octave weights or the field count change, re-measure and update this
+ * - and keep it identical to linux/paper_core.h, which carries the same
+ * constant for the same reason. */
 #define PAPER_MAG_SCALE 2.9f
 
 typedef struct {
@@ -555,7 +557,7 @@ typedef struct {
 
 static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     PAPERPARAMS p;
-    int wb, grain;
+    int wb;
     /* Warmth spans cool -> neutral(50) -> aged amber. The old mapping only
      * moved endpoints by ~24/255 and never went below neutral, so 0-100
      * looked identical on screen (user feedback: "too calm"). Signed swing:
@@ -565,11 +567,13 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
     p.fs = 1.f;   /* full-res default; the preview build raises it to step */
-    /* PaperParams is the only place grain is consumed and it divides by it;
-     * clamp here so a caller that skipped ClampSettingsOf cannot divide by
-     * zero inside a bake thread. */
-    grain = sp->grain < 1 ? 1 : sp->grain;
-    p.pg = NextPow2(w / grain + 2);
+    /* PaperParams is the only place grain is consumed and both the period
+     * below and PaperPixel divide by it, so the clamp has to land in the copy
+     * the pixel loop reads: a caller that skipped ClampSettingsOf must not be
+     * able to divide by zero or flood the frame with 0/0 noise inside a bake
+     * thread. */
+    if (p.s.grain < 1) p.s.grain = 1;
+    p.pg = NextPow2(w / p.s.grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
     p.wg = 0.45f;
@@ -607,9 +611,10 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     /* Fibre and blotch used to only nudge the noise mix (early feedback:
      * "they don't seem to do much"). They now add their own alpha modulation on
      * top of the mix, scaled with the strength slider, so the endpoints are
-     * unmistakable and 0 still means off.  The gain is computed in float: the
-     * old all-integer form `spread * 13 * fibre / 10 / 100` truncated to 0 at
-     * low strength, so several slider positions produced no modulation. */
+     * unmistakable and 0 still means off.  The gain is one float expression
+     * with a single truncation at the end; over every reachable spread/fibre
+     * pair it rounds to exactly what the old `spread * 13 * fibre / 10 / 100`
+     * produced, so the visible gain comes from the spread change above. */
     p.fspread = (int)(p.spread * 1.3f * sp->fibre / 100.f);   /* up to +1.3x */
     p.bspread = (int)(p.spread * 1.2f * sp->blotch / 100.f);  /* up to +1.2x */
     return p;

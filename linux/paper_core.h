@@ -296,15 +296,17 @@ typedef struct {
  * away ~84% of the amplitude: at the old maximum intensity the texture's own
  * contribution was 4.7 alpha levels out of a nominal 30, which is why every
  * slider looked dead (2026-10-23 review).  This constant is ~3 sigma of the
- * measured distribution, so the swing uses the range the slider promises and
- * clips only the rare extreme (measured max 0.728 * 2.9 = 2.1, i.e. the top
- * ~1% of pixels saturate).  Keep it tied to the noise: if the octave weights
- * or the field count change, re-measure and update this. */
+ * measured distribution, so the swing uses the range the slider promises.
+ * The clamp is not rare: over the same frame at the defaults it saturates the
+ * folded term on ~7% of pixels and the fibre and macro terms - folded from a
+ * single fbm each - on ~21%, which caps their strongest patches instead of
+ * letting them dwarf the mix.  Keep it tied to the noise: if the octave
+ * weights or the field count change, re-measure and update this. */
 #define PAPER_MAG_SCALE 2.9f
 
 static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     PAPERPARAMS p;
-    int wb, grain;
+    int wb;
     /* Warmth spans cool -> neutral(50) -> aged amber; signed swing, as in
      * mnPaper.c: cool reduces red and raises blue, warm raises red/brown and
      * cuts blue. */
@@ -312,11 +314,13 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
-    /* PaperParams is the only place grain is consumed, and it divides by it.
-     * Clamp here so a caller that skipped ClampSettingsOf (this header is the
-     * shared engine) cannot divide by zero inside a bake thread. */
-    grain = sp->grain < 1 ? 1 : sp->grain;
-    p.pg = NextPow2(w / grain + 2);
+    /* PaperParams is the only place grain is consumed, and both the period
+     * below and PaperPixel divide by it, so the clamp has to land in the copy
+     * the pixel loop reads: a caller that skipped ClampSettingsOf (this header
+     * is the shared engine) must not be able to divide by zero or flood the
+     * frame with 0/0 noise inside a bake thread. */
+    if (p.s.grain < 1) p.s.grain = 1;
+    p.pg = NextPow2(w / p.s.grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
     p.wg = 0.45f;
@@ -353,9 +357,10 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     p.bias = sp->intensity / 4;             /* 0..10  */
     p.spread = sp->intensity * 6 / 5;       /* 0..48  */
     /* Fibre and blotch add their own alpha modulation on top of the mix.  The
-     * gain is computed in float: the old all-integer form `spread * 13 * fibre
-     * / 10 / 100` truncated to 0 at low strength, so several of the tray's own
-     * ten-step rows produced literally no modulation. */
+     * gain is one float expression with a single truncation at the end; over
+     * every reachable spread/fibre pair it rounds to exactly what the old
+     * `spread * 13 * fibre / 10 / 100` produced, so the visible gain comes
+     * from the spread change above, not from this line. */
     p.fspread = (int)(p.spread * 1.3f * sp->fibre / 100.f);   /* up to +1.3x */
     p.bspread = (int)(p.spread * 1.2f * sp->blotch / 100.f);  /* up to +1.2x */
     return p;
