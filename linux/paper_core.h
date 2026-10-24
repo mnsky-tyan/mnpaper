@@ -285,6 +285,7 @@ typedef struct {
     int pg, pf, pm, wr, wg_r, wb_r, dr, dg, db, bias, spread;
     int fspread, bspread;      /* fibre/blotch own alpha-modulation gain */
     float wg, wf, wm, wsum;
+    float fs;                  /* coordinate scale: 1 full, ratio on Linux */
 } PAPERPARAMS;
 
 /* The noise fields are averages of averages: one fbm is four octaves of value
@@ -304,7 +305,7 @@ typedef struct {
  * weights or the field count change, re-measure and update this. */
 #define PAPER_MAG_SCALE 2.9f
 
-static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
+static PAPERPARAMS PaperParams(int w, float fs, const SETTINGS *sp) {
     PAPERPARAMS p;
     int wb;
     /* Warmth spans cool -> neutral(50) -> aged amber; signed swing, as in
@@ -314,6 +315,19 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
+    /* fs is device pixels per sampling unit.  It scales ALL noise frequencies
+     * at once, so a coarser grid samples a coarser paper (same character,
+     * larger features) instead of aliasing fine grain into a flat smear.  The
+     * Linux port passes the buffer/logical ratio here, which is what keeps the
+     * texture a property of the surface rather than of the pixel grid: the
+     * lattice below is derived from `w` in sampling units, so a 2880px buffer
+     * at 1.6x and a 1800px buffer at 1.0x render the SAME pattern.  Sampling
+     * raw device pixels instead made identical settings render a completely
+     * different texture at the two sizes (measured 2026-10-24: pattern
+     * correlation 0.00, ~15 luminance levels apart), which is what the user
+     * reported as "the same config looks different depending on the order I
+     * set the settings" - the buffer width at each bake was what varied. */
+    p.fs = fs > 0.f ? fs : 1.f;
     /* PaperParams is the only place grain is consumed, and both the period
      * below and PaperPixel divide by it, so the clamp has to land in the copy
      * the pixel loop reads: a caller that skipped ClampSettingsOf (this header
@@ -367,7 +381,7 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
 }
 
 static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
-    float u = (float)x, v = (float)y;
+    float u = (float)x / p->fs, v = (float)y / p->fs;
     float grain = fbm(u / (float)p->s.grain, v / (float)p->s.grain, p->pg);
     float fibre = fbm(u / 2.f, v / 12.f, p->pf);
     float macro = fbm(u / 90.f, v / 70.f, p->pm);
@@ -408,9 +422,13 @@ typedef struct { volatile int stop; } PAPERCANCEL;   /* portable stand-in for
                                              * the Windows interlocked flags */
 static int PaperCancelledOf(const PAPERCANCEL *c) { return c && c->stop; }
 
-static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
-                          const PAPERCANCEL *cancel) {
-    PAPERPARAMS p = PaperParams(w, sp);
+static int BuildPaperFull(unsigned char *px, int w, int h, float fs,
+                          const SETTINGS *sp, const PAPERCANCEL *cancel) {
+    /* `w`/`h` are buffer pixels; `fs` is device pixels per sampling unit, so
+     * the lattice is derived from the surface-local width and the pattern does
+     * not change when the buffer scale does. */
+    float step = fs > 0.f ? fs : 1.f;
+    PAPERPARAMS p = PaperParams((int)((float)w / step + 0.5f), step, sp);
     int x, y;
     for (y = 0; y < h; y++) {
         if (PaperCancelledOf(cancel)) return 0;

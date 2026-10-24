@@ -555,7 +555,7 @@ typedef struct {
     float fs;                  /* coordinate scale: 1 full, step in preview */
 } PAPERPARAMS;
 
-static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
+static PAPERPARAMS PaperParams(int w, float fs, const SETTINGS *sp) {
     PAPERPARAMS p;
     int wb;
     /* Warmth spans cool -> neutral(50) -> aged amber. The old mapping only
@@ -566,7 +566,18 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
-    p.fs = 1.f;   /* full-res default; the preview build raises it to step */
+    /* fs is device pixels per sampling unit.  It scales ALL noise frequencies
+     * at once, so a coarser grid samples a coarser paper (same character,
+     * larger features) instead of aliasing fine grain into a flat smear - the
+     * 8px preview used to make grain changes look dead until the full refine
+     * landed (user feedback: "grain lags behind").  The Linux port passes the
+     * buffer/logical ratio here, which is what keeps the texture a property of
+     * the surface rather than of the pixel grid: the lattice below is derived
+     * from `w` in sampling units, so a 2880px buffer at 1.6x and a 1800px
+     * buffer at 1.0x render the SAME pattern (measured: sampling raw device
+     * pixels made identical settings differ completely between the two,
+     * 2026-10-24). */
+    p.fs = fs > 0.f ? fs : 1.f;
     /* PaperParams is the only place grain is consumed and both the period
      * below and PaperPixel divide by it, so the clamp has to land in the copy
      * the pixel loop reads: a caller that skipped ClampSettingsOf must not be
@@ -666,9 +677,10 @@ static int PaperCancelled(volatile LONG *epoch, LONG expected) {
                     InterlockedCompareExchange(epoch, 0, 0) != expected);
 }
 
-static int BuildPaperFull(unsigned char *px, int w, int h, const SETTINGS *sp,
-                          volatile LONG *epoch, LONG expected) {
-    PAPERPARAMS p = PaperParams(w, sp);
+static int BuildPaperFull(unsigned char *px, int w, int h, float fs,
+                          const SETTINGS *sp, volatile LONG *epoch, LONG expected) {
+    float step = fs > 0.f ? fs : 1.f;
+    PAPERPARAMS p = PaperParams((int)((float)w / step + 0.5f), step, sp);
     int x, y;
     for (y = 0; y < h; y++) {
         if (PaperCancelled(epoch, expected)) return 0;
@@ -694,9 +706,8 @@ static void ExpandPaperRow(unsigned char *dst, const unsigned char *grid, int w)
  * stop flag at 1 while it shows the strips). */
 static int BuildPaperPreview(unsigned char *px, int w, int h, const SETTINGS *sp,
                              volatile LONG *epoch, LONG expected) {
-    PAPERPARAMS p = PaperParams(w, sp);
     int step = PAPER_PREVIEW_STEP;
-    p.fs = (float)step;   /* preview: same character, step-x coarser noise */
+    PAPERPARAMS p = PaperParams(w, (float)step, sp);
     int gw = (w + step - 1) / step + 1, gh = (h + step - 1) / step + 1;
     unsigned char *grid = (unsigned char *)malloc((size_t)gw * gh * 4);
     unsigned char *rows = (unsigned char *)malloc((size_t)w * 8);
@@ -744,7 +755,7 @@ cancelled:
 }
 
 static void BuildPaperInto(unsigned char *px, int w, int h, const SETTINGS *sp) {
-    BuildPaperFull(px, w, h, sp, NULL, 0);
+    BuildPaperFull(px, w, h, 1.f, sp, NULL, 0);
 }
 
 
@@ -1296,7 +1307,7 @@ static DWORD WINAPI PaperWorker(LPVOID unused) {
         began = GetTickCount();
         built = job.preview ? BuildPaperPreview(d->px, job.w, job.h, &job.s,
                                                 &g_pepoch[job.idx], job.epoch)
-                            : BuildPaperFull(d->px, job.w, job.h, &job.s,
+                            : BuildPaperFull(d->px, job.w, job.h, 1.f, &job.s,
                                              &g_pepoch[job.idx], job.epoch);
         if (!built || InterlockedCompareExchange(&g_stop_thread, 0, 0)) {
             FreePaperDone(d);
