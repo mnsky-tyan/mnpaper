@@ -280,8 +280,13 @@ editing a protocol `.xml`, run `make regen` to re-scan it.
 The first is the core suite: defaults, clamping, `--set` grammar,
 determinism, premultiplied-alpha validity, odd sizes, cancellation, e-ink
 normalization, the one-shot panelgap migration, and the config-file round
-trip. It mirrors the spirit of the Windows hidden
-suites for the parts this port ships. It also spawns the real `mnpaper`
+trip. It also pins that the texture is actually visible: median and p99
+alpha floors at the default and maximum strengths, and every texture control
+moving the composited picture over light, mid and dark backgrounds, so an
+invisible veil fails on its own instead of hiding behind a one-pixel
+difference. A grain of 0 must clamp and still bake a real veil, not a blank
+frame. It mirrors the spirit of the Windows hidden suites for the parts this
+port ships. It also spawns the real `mnpaper`
 binary to pin the CLI refusals (a malformed or over-long `--set` operand,
 a batch past 64 pairs, a dangling `--set`): each child gets a private
 `XDG_RUNTIME_DIR`, a private `XDG_CONFIG_HOME` and a nonexistent
@@ -325,5 +330,9 @@ touching the buffer or layer-surface code):
   always stacked above the panel by the compositor - an auto-hiding panel is
   therefore drawn *under* the paper when it slides in.
 - The texture cannot cover the secure login screen (before a session exists).
-- The default texture at `intensity=30` is subtle: on dark content it shifts
-  fewer than 8 levels per channel, which is intended.
+- The default texture at `intensity=30` is a light but clearly visible veil:
+  a median opacity of about 15%, peaking near 29%. Earlier builds topped out
+  at 7% median / 18% peak, so the texture was barely distinguishable from the
+  desktop and every slider looked dead. If it now reads too strong, lower
+  `intensity` rather than the individual texture sliders - strength is the
+  opacity budget, and grain/fibre/blotch shape the texture inside it.

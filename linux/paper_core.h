@@ -287,6 +287,23 @@ typedef struct {
     float wg, wf, wm, wsum;
 } PAPERPARAMS;
 
+/* The noise fields are averages of averages: one fbm is four octaves of value
+ * noise weighted 0.533/0.267/0.133/0.067, and `n` is a wsum-weighted mean of
+ * three such fields.  Averaging shrinks the spread, so the deviation from the
+ * midpoint is far narrower than the [0,1] that a naive |2n-1| suggests.
+ * Measured over a full 1200x800 frame the folded magnitude has mean 0.158,
+ * sd 0.113 and max 0.728.  Scaling the swing by a nominal 1.0 therefore threw
+ * away ~84% of the amplitude: at the old maximum intensity the texture's own
+ * contribution was 4.7 alpha levels out of a nominal 30, which is why every
+ * slider looked dead (2026-10-23 review).  This constant is ~3 sigma of the
+ * measured distribution, so the swing uses the range the slider promises.
+ * The clamp is not rare: over the same frame at the defaults it saturates the
+ * folded term on ~7% of pixels and the fibre and macro terms - folded from a
+ * single fbm each - on ~21%, which caps their strongest patches instead of
+ * letting them dwarf the mix.  Keep it tied to the noise: if the octave
+ * weights or the field count change, re-measure and update this. */
+#define PAPER_MAG_SCALE 2.9f
+
 static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     PAPERPARAMS p;
     int wb;
@@ -297,7 +314,13 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     int cool = tw < 0 ? -tw : 0;
     int warm = tw > 0 ? tw : 0;
     p.s = *sp;
-    p.pg = NextPow2(w / sp->grain + 2);
+    /* PaperParams is the only place grain is consumed, and both the period
+     * below and PaperPixel divide by it, so the clamp has to land in the copy
+     * the pixel loop reads: a caller that skipped ClampSettingsOf (this header
+     * is the shared engine) must not be able to divide by zero or flood the
+     * frame with 0/0 noise inside a bake thread. */
+    if (p.s.grain < 1) p.s.grain = 1;
+    p.pg = NextPow2(w / p.s.grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
     p.wg = 0.45f;
@@ -305,18 +328,41 @@ static PAPERPARAMS PaperParams(int w, const SETTINGS *sp) {
     p.wm = 0.25f * sp->blotch / 100.f;
     p.wsum = p.wg + p.wf + p.wm;
     wb = warm * 44 / 100;
-    p.wr = 255 - cool * 55 / 100;           /* highlight red: cool drops to 200 */
-    p.wg_r = 250 + cool / 25 - warm / 7;    /* highlight green */
-    p.wb_r = 236 + cool / 5 - wb;           /* highlight blue (255-capped when cool) */
+    /* The highlight family used to sit at 236..255, i.e. inside the range of a
+     * white page, so the positive half of the noise was invisible on light
+     * content: the paper could only darken, and warmth - whose whole job is
+     * tinting the highlight branch - had almost nothing to tint.  Pulling the
+     * highlights down to 222..244 keeps the cream cast while putting them
+     * below any plausible background. */
+    p.wr = 244 - cool * 55 / 100;           /* highlight red: cool drops to 189 */
+    p.wg_r = 238 + cool / 25 - warm / 7;    /* highlight green */
+    p.wb_r = 222 + cool / 5 - wb;           /* highlight blue (255-capped when cool) */
     if (p.wb_r > 255) p.wb_r = 255;
     p.dr = 145 + warm / 8 - cool * 40 / 100;  /* shadow red   */
     p.dg = 133 + warm / 10 - cool / 8;        /* shadow green */
     p.db = 108 - wb + cool / 2;               /* shadow blue  */
-    p.bias = sp->intensity / 4; p.spread = sp->intensity * 3 / 4;
-    /* Fibre and blotch add their own alpha modulation on top of the mix,
-     * scaled with the strength slider: unmistakable endpoints, 0 still off. */
-    p.fspread = p.spread * 13 * sp->fibre / 10 / 100;   /* up to +1.3x spread */
-    p.bspread = p.spread * 12 * sp->blotch / 10 / 100;  /* up to +1.2x spread */
+    /* Strength is an opacity budget, so it has to be spent on opacity.  The old
+     * mapping made `bias + spread == intensity`, i.e. a ceiling of 40/255
+     * (15.7%) for a slider that every neighbouring control runs to 100, and the
+     * folded `mag` then delivered only 16% of even that.  With the magnitude
+     * normalised (see PAPER_MAG_SCALE) the same budget buys a real veil: at the
+     * default intensity 30 the median opacity is 15% and the peak 29%, where
+     * the old code's *maximum* setting reached 7% median / 18% peak.
+     *
+     * `bias` stays a floor so the paper never vanishes in the middle of a
+     * texture; `spread` is the swing on top of it.  The 6/5 factor keeps the
+     * top setting a pleasant 21% median rather than a grey wash - measured
+     * against rendered candidates over a white page (2026-10-23).
+     * intensity 0 still means fully transparent, which the tests pin. */
+    p.bias = sp->intensity / 4;             /* 0..10  */
+    p.spread = sp->intensity * 6 / 5;       /* 0..48  */
+    /* Fibre and blotch add their own alpha modulation on top of the mix.  The
+     * gain is one float expression with a single truncation at the end; over
+     * every reachable spread/fibre pair it rounds to exactly what the old
+     * `spread * 13 * fibre / 10 / 100` produced, so the visible gain comes
+     * from the spread change above, not from this line. */
+    p.fspread = (int)(p.spread * 1.3f * sp->fibre / 100.f);   /* up to +1.3x */
+    p.bspread = (int)(p.spread * 1.2f * sp->blotch / 100.f);  /* up to +1.2x */
     return p;
 }
 
@@ -328,12 +374,26 @@ static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
     float n = (grain * p->wg + fibre * p->wf + macro * p->wm) / p->wsum;
     float d = (n - 0.5f) * 2.f;
     float mag = d < 0 ? -d : d;
-    int ai = p->bias + (int)(mag * (float)p->spread)
-           + (int)((fabsf(fibre - 0.5f) * 2.f) * (float)p->fspread)
-           + (int)((fabsf(macro - 0.5f) * 2.f) * (float)p->bspread);
-    int cr = d >= 0 ? p->wr : p->dr;
-    int cg = d >= 0 ? p->wg_r : p->dg;
-    int cb = d >= 0 ? p->wb_r : p->db;
+    /* Normalise the folded magnitude to the range the swing is scaled for; see
+     * PAPER_MAG_SCALE.  The fibre/blotch terms come from the same narrow
+     * distribution and get the same treatment. */
+    float magN = mag * PAPER_MAG_SCALE;
+    float fibN = fabsf(fibre - 0.5f) * 2.f * PAPER_MAG_SCALE;
+    float macN = fabsf(macro - 0.5f) * 2.f * PAPER_MAG_SCALE;
+    float a;
+    int ai, cr, cg, cb;
+    if (magN > 1.f) magN = 1.f;
+    if (fibN > 1.f) fibN = 1.f;
+    if (macN > 1.f) macN = 1.f;
+    /* One accumulation, one rounding: the old code cast each term to int
+     * separately, dropping up to a full level per term from a mean alpha of
+     * about 10. */
+    a = (float)p->bias + magN * (float)p->spread
+      + fibN * (float)p->fspread + macN * (float)p->bspread;
+    ai = (int)(a + 0.5f);
+    cr = d >= 0 ? p->wr : p->dr;
+    cg = d >= 0 ? p->wg_r : p->dg;
+    cb = d >= 0 ? p->wb_r : p->db;
     if (ai < 0) ai = 0;
     if (ai > 255) ai = 255;
     out[0] = (unsigned char)(cb * ai / 255);

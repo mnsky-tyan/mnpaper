@@ -62,6 +62,13 @@ Covered:
   same, and the unscaled 8px preview ignored the grain slider entirely.
   Fibre 0->100 / blotch 0->100 add clearly more structure than their zero
   points.
+- Every texture control is now judged on what a person sees: the paper
+  composited over a light page, mid grey and a dark terminal, in whole
+  luminance levels, at the shipped defaults with only that control moved.
+  Warmth must also swing its red-blue separation monotonically across its
+  range, and the default strength must put a median veil of at least 25/255
+  on screen with most of it carried by the texture rather than by the flat
+  bias floor.
 - Test windows never become visible.
 
 `update_help_capture.c` is the companion hidden regression for the release

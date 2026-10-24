@@ -30,6 +30,34 @@ static void Check(int ok, const char *what) {
     printf("%s %s\n", ok ? "PASS" : "FAIL", what);
     if (!ok) failures++;
 }
+/* The composited-delta harness: a control is judged on what a person sees, the
+ * paper over a flat background in whole luminance levels - the same measure the
+ * Linux suite pins (linux/tests/test_core.c). bg is the stand-in background;
+ * the fill it contributes is exactly what the dump path's CompositeOver adds to
+ * every channel, so the two agree channel for channel. Premultiplied colour is
+ * <= alpha, so channel + fill never exceeds 255. */
+static unsigned char CompositeLum(const unsigned char *p, int bg) {
+    int a = p[3];
+    int k = bg * (255 - a) / 255;
+    int b = p[0] + k, g = p[1] + k, r = p[2] + k;
+    return (unsigned char)((r * 299 + g * 587 + b * 114) / 1000);
+}
+static void FillCompositeLum(const unsigned char *px, unsigned char *lum,
+                             int n, int bg) {
+    int i;
+    for (i = 0; i < n; i++) lum[i] = CompositeLum(px + 4 * (size_t)i, bg);
+}
+/* Percentage of pixels whose composited luminance differs by >= levels. */
+static int PctDifferingByLum(const unsigned char *a, const unsigned char *b,
+                             int n, int levels) {
+    int i, hit = 0;
+    for (i = 0; i < n; i++) {
+        int d = (int)a[i] - (int)b[i];
+        if (d < 0) d = -d;
+        if (d >= levels) hit++;
+    }
+    return hit * 100 / n;
+}
 static LRESULT CALLBACK TestHost(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_APP_PAPER) {
         PaperDone *d = (PaperDone *)l;
@@ -65,6 +93,13 @@ static void Pump(DWORD ms) {
         }
         Sleep(1);
     } while ((LONG)(GetTickCount() - end) < 0);
+}
+/* The suite's own settle: the newest request has been applied to monitor 0, so
+ * the overlay bits are the frame the current settings produced. */
+static void WaitApplied(void) {
+    DWORD stop = GetTickCount() + 10000;
+    while (g_papplied[0] != g_platest[0] && (LONG)(GetTickCount() - stop) < 0)
+        Pump(20);
 }
 static void Slider(int value) {
     SendMessageW(g_tb_intensity, TBM_SETPOS, TRUE, value);
@@ -237,12 +272,25 @@ int main(void) {
               "each monitor receives the final snapshot after a 200-request burst");
         free(expected);
     }
-    /* Each slider changes actual preview pixels across its endpoints. */
+    /* Each slider must move the COMPOSITED picture over a light page, mid grey
+     * and a dark terminal - "the sliders do nothing" was the 2026-10-23 report,
+     * and a one-pixel byte difference cannot tell a working control from a dead
+     * one. Every endpoint is measured at the shipped defaults with only that
+     * control moved, and on the real trackbars: WM_HSCROLL's handler reads the
+     * bars, not g_s, so a defaults baseline has to land there. */
     {
-        HWND bars[4];
+        static const int bgs[3] = {245, 128, 20};       /* light / mid / dark */
+        static const int floors[4] = {10, 15, 15, 15};  /* % of pixels at 2 levels */
+        int basepos[5];
+        HWND bars[5];
         int mins[4] = {0,2,0,0}, maxs[4] = {100,12,100,100};
         const char *names[4] = {"warmth", "grain", "fibre", "blotch"};
         WNDCLASSW dwc = {0};
+        int npix, bi, k;
+        unsigned char *lumLow[3], *lumHigh;
+        basepos[0] = before.warmth; basepos[1] = before.grain;
+        basepos[2] = before.fibre; basepos[3] = before.blotch;
+        basepos[4] = before.intensity;
         dwc.hInstance = GetModuleHandleW(NULL);
         dwc.lpfnWndProc = DlgProc; dwc.lpszClassName = SET_CLASS;
         RegisterClassW(&dwc);
@@ -250,40 +298,113 @@ int main(void) {
         FitClient(g_dlg, 402, 402);
         bars[0] = g_tb_warmth; bars[1] = g_tb_grain;
         bars[2] = g_tb_fibre; bars[3] = g_tb_blotch;
+        bars[4] = g_tb_intensity;
+        npix = g_ov[0].w * g_ov[0].h;
+        for (k = 0; k < 3; k++) lumLow[k] = (unsigned char *)malloc((size_t)npix);
+        lumHigh = (unsigned char *)malloc((size_t)npix);
         for (i = 0; i < 4; i++) {
-            ULONGLONG low, high;
             char message[128];
+            for (k = 0; k < 5; k++) SendMessageW(bars[k], TBM_SETPOS, TRUE, basepos[k]);
             SendMessageW(bars[i], TBM_SETPOS, TRUE, mins[i]);
             SendMessageW(g_dlg, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)bars[i]);
             Pump(150); KillTimer(g_dlg, TIMER_DEBOUNCE);
-            low = PixelHash(g_ov[0].bits, (size_t)g_ov[0].w * g_ov[0].h * 4);
+            WaitApplied();
+            for (bi = 0; bi < 3; bi++)
+                FillCompositeLum((const unsigned char *)g_ov[0].bits, lumLow[bi],
+                                 npix, bgs[bi]);
+            for (k = 0; k < 5; k++) SendMessageW(bars[k], TBM_SETPOS, TRUE, basepos[k]);
             SendMessageW(bars[i], TBM_SETPOS, TRUE, maxs[i]);
             SendMessageW(g_dlg, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)bars[i]);
             Pump(150); KillTimer(g_dlg, TIMER_DEBOUNCE);
-            high = PixelHash(g_ov[0].bits, (size_t)g_ov[0].w * g_ov[0].h * 4);
-            sprintf(message, "%s endpoints change uploaded preview pixels", names[i]);
-            Check(low != high && g_papplied[0] == g_platest[0], message);
+            WaitApplied();
+            for (bi = 0; bi < 3; bi++) {
+                int pct;
+                FillCompositeLum((const unsigned char *)g_ov[0].bits, lumHigh,
+                                 npix, bgs[bi]);
+                pct = PctDifferingByLum(lumLow[bi], lumHigh, npix, 2);
+                sprintf(message, "%s endpoints move the composited picture over bg %d",
+                        names[i], bgs[bi]);
+                Check(pct >= floors[i] && g_papplied[0] == g_platest[0], message);
+            }
         }
-        /* Warmth must visibly swing hue, not just nibble a channel: over a
-         * neutral backdrop, warmth 0 reads cool (blue > red) and warmth 100
-         * reads warm (red > blue) by a clear margin in the composited pixel. */
+        for (k = 0; k < 3; k++) free(lumLow[k]);
+        free(lumHigh);
+        /* Warmth must visibly swing hue over every background, not just nibble a
+         * channel: over a neutral backdrop, warmth 0 reads cool (blue > red) and
+         * warmth 100 reads warm (red > blue) by a clear margin in the composited
+         * pixel, and the composited luminance has to move over a light page, mid
+         * grey and a dark terminal.  The old thresholds (-3 / +2 / span 5) were
+         * tuned to the magnitude the user could not see: the shipped build moved
+         * 0.9% of pixels by two luminance levels.  A paper veil that is worth
+         * showing swings its chroma far harder than that (measured 20+ levels end
+         * to end after the 2026-10-23 rescale), so the floor now fails an
+         * invisible tint. */
         {
-            int w = 320, h = 200, warm_br = 0, cool_br = 0;
-            unsigned char *buf = malloc((size_t)w * h * 4);
+            int w = 320, h = 200, k, i3, warm_br = 0, cool_br = 0;
+            unsigned char *wbuf = malloc((size_t)w * h * 4);
+            unsigned char *cbuf = malloc((size_t)w * h * 4);
+            unsigned char *lw = malloc((size_t)w * h), *lc = malloc((size_t)w * h);
+            unsigned char *scr = malloc((size_t)w * h * 4);
             SETTINGS saved = g_s;
+            g_s = before;                  /* the shipped defaults */
             g_s.warmth = 100;
-            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "warm preview renders");
-            for (i = 0; i < w * h; i++)
-                warm_br += (int)buf[4*i] - (int)buf[4*i+2];  /* blue - red */
+            Check(BuildPaperPreview(wbuf, w, h, &g_s, NULL, 0), "warm preview renders");
             g_s.warmth = 0;
-            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "cool preview renders");
-            for (i = 0; i < w * h; i++)
-                cool_br += (int)buf[4*i] - (int)buf[4*i+2];
+            Check(BuildPaperPreview(cbuf, w, h, &g_s, NULL, 0), "cool preview renders");
+            for (k = 0; k < 3; k++) {
+                int bg = bgs[k], hit = 0;
+                FillCompositeLum(wbuf, lw, w * h, bg);
+                FillCompositeLum(cbuf, lc, w * h, bg);
+                for (i3 = 0; i3 < w * h; i3++) {
+                    int d = (int)lw[i3] - (int)lc[i3];
+                    if (d < 0) d = -d;
+                    if (d >= 2) hit++;
+                }
+                Check(hit * 100 / (w * h) >= 10,
+                      "warmth endpoints move the composited picture (light/mid/dark)");
+            }
+            /* chroma on the composited light page: a neutral background adds the
+             * same fill to blue and red, so the swing survives compositing */
+            memcpy(scr, wbuf, (size_t)w * h * 4);
+            CompositeOver(scr, w, h, bgs[0]);
+            for (k = 0; k < w * h; k++)
+                warm_br += (int)scr[4*k] - (int)scr[4*k+2];  /* blue - red */
+            memcpy(scr, cbuf, (size_t)w * h * 4);
+            CompositeOver(scr, w, h, bgs[0]);
+            for (k = 0; k < w * h; k++)
+                cool_br += (int)scr[4*k] - (int)scr[4*k+2];
             g_s = saved;
             warm_br /= w * h; cool_br /= w * h;
             printf("METRIC warmth swing (blue-red): warm=%d cool=%d\n", warm_br, cool_br);
-            Check(warm_br <= -3 && cool_br >= 2 && cool_br - warm_br > 5,
+            Check(warm_br <= -8 && cool_br >= 8 && cool_br - warm_br > 16,
                   "warmth endpoints read distinctly cool and warm");
+            free(wbuf); free(cbuf); free(lw); free(lc); free(scr);
+        }
+        /* Strength must be an opacity budget worth spending, and the veil must
+         * be carried by the texture rather than by its flat bias floor: the
+         * shipped build topped out at a median alpha of 18/255 with the bias
+         * supplying a large share of it, which is why every slider felt dead.
+         * The whole default state is measured - the blocks above leave the
+         * texture sliders at their maxima - and the bias is read out of
+         * PaperParams, so a bias regression cannot hide behind a copied formula. */
+        {
+            int w = 320, h = 200, i2, cnt[256], cum, med, floor;
+            unsigned char *buf = malloc((size_t)w * h * 4);
+            SETTINGS saved = g_s;
+            g_s = before;                          /* the shipped defaults */
+            floor = PaperParams(w, &g_s).bias;     /* the generator's own floor */
+            Check(BuildPaperPreview(buf, w, h, &g_s, NULL, 0), "default preview renders");
+            memset(cnt, 0, sizeof cnt);
+            for (i2 = 0; i2 < w * h; i2++) cnt[buf[4*i2 + 3]]++;
+            cum = 0; med = 0;
+            for (i2 = 0; i2 < 256; i2++) {
+                cum += cnt[i2];
+                if (cum * 2 >= w * h) { med = i2; break; }
+            }
+            g_s = saved;
+            printf("METRIC default median alpha: %d/255 (bias floor %d)\n", med, floor);
+            Check(med >= 25, "default strength puts a visible veil on screen");
+            Check(med >= floor * 3, "most of the veil is texture, not a flat bias floor");
             free(buf);
         }
     }

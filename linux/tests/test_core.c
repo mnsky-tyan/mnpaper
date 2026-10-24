@@ -46,6 +46,206 @@ static void CheckPremultiplied(const unsigned char *px, int w, int h,
     }
 }
 
+/* ------------------------------------------------------- legibility ----- */
+
+/* The 2026-10-23 review found the whole texture suite could not tell a
+ * visible paper from an invisible one: the only "the texture responds"
+ * assertion was `memcmp(a,b) != 0`, which a one-pixel change satisfies, and
+ * the product shipped at a median alpha of 18/255 with warmth moving 0.9% of
+ * pixels by 2 luminance levels.  These helpers measure what a person actually
+ * sees: the texture composited over a background, in whole luminance levels.
+ *
+ * A level here is one unit of the 0..255 luminance the panel receives, so a
+ * threshold of 2 is the smallest difference that is reliably visible on a
+ * mid-tone area - roughly the Weber limit for a flat field.  They are
+ * deliberately floors, not targets: they fail an invisible texture without
+ * pinning an exact look, so tuning the generator stays possible. */
+
+/* Composite a premultiplied BGRA buffer over a flat background, in place. */
+static void CompositeOverBg(unsigned char *px, int w, int h, int bg) {
+    int i;
+    for (i = 0; i < w * h; i++) {
+        unsigned char *p = px + 4 * (size_t)i;
+        int a = p[3];
+        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
+        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
+        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
+        p[3] = 255;
+    }
+}
+
+static double LumOf(const unsigned char *p) {
+    return 0.299 * p[2] + 0.587 * p[1] + 0.114 * p[0];
+}
+
+/* Fraction of pixels whose luminance differs by at least `levels` between two
+ * composited buffers.  Returns 0..100. */
+static double PctDifferingBy(const unsigned char *a, const unsigned char *b,
+                             int w, int h, double levels) {
+    int i, n = w * h, hit = 0;
+    for (i = 0; i < n; i++) {
+        double d = LumOf(a + 4 * (size_t)i) - LumOf(b + 4 * (size_t)i);
+        if (d < 0) d = -d;
+        if (d >= levels) hit++;
+    }
+    return 100.0 * hit / n;
+}
+
+/* Alpha percentile: p in 0..100.  alpha=0 everywhere returns 0. */
+static int AlphaPercentile(const unsigned char *px, int w, int h, int p) {
+    int cnt[256], i, cum = 0, n = w * h;
+    memset(cnt, 0, sizeof cnt);
+    for (i = 0; i < n; i++) cnt[px[4 * (size_t)i + 3]]++;
+    for (i = 0; i < 256; i++) {
+        cum += cnt[i];
+        if (cum * 100 >= n * p) return i;
+    }
+    return 255;
+}
+
+/* The default and maximum strengths must both put real paper on the screen.
+ * The old mapping peaked at 7% median / 18% peak opacity, which is why every
+ * slider felt dead; this pins the fix so it cannot silently regress. */
+static void TestTextureIsActuallyVisible(void) {
+    int w = 400, h = 300;
+    unsigned char *px = malloc((size_t)w * h * 4);
+    CHECK(px != NULL, "alloc");
+    if (!px) return;
+
+    {
+        SETTINGS s = PaperDefaultSettings();       /* intensity 30 */
+        BuildPaperFull(px, w, h, &s, NULL);
+        CHECK(AlphaPercentile(px, w, h, 50) >= 25,
+              "default strength puts a visible veil on screen (median alpha)");
+        CHECK(AlphaPercentile(px, w, h, 99) >= 45,
+              "default strength has visible structure (p99 alpha)");
+    }
+    {
+        SETTINGS s = PaperDefaultSettings();
+        s.intensity = 40;                          /* the maximum */
+        BuildPaperFull(px, w, h, &s, NULL);
+        CHECK(AlphaPercentile(px, w, h, 50) >= 35,
+              "maximum strength is a real veil, not a haze (median alpha)");
+        CHECK(AlphaPercentile(px, w, h, 99) >= 65,
+              "maximum strength has real contrast (p99 alpha)");
+    }
+    /* and the texture, not a flat tint, must carry the veil: the generator's
+     * own bias is the floor, so the median has to sit far above it.  The bias
+     * is read out of PaperParams rather than recomputed here - a duplicated
+     * formula would keep passing no matter what the generator did - and the
+     * 3x bar is what fails a bias of intensity*3/4 (median 54, floor 22). */
+    {
+        SETTINGS s = PaperDefaultSettings();
+        int med, floor;
+        BuildPaperFull(px, w, h, &s, NULL);
+        med = AlphaPercentile(px, w, h, 50);
+        floor = PaperParams(w, &s).bias;           /* the generator's floor */
+        CHECK(med >= floor * 3,
+              "most of the veil is texture, not a flat bias floor");
+    }
+    free(px);
+}
+
+/* Every control that is documented to change the image must change it
+ * PERCEPTIBLY, measured after compositing over a background - the old suite
+ * accepted a one-pixel difference.  Backgrounds are light, mid and dark
+ * because a texture that only works on dark content is the bug that was
+ * reported. */
+static void TestSettingsArePerceptible(void) {
+    int w = 400, h = 300;
+    int bgs[3];
+    size_t bi;
+    unsigned char *a = malloc((size_t)w * h * 4);
+    unsigned char *b = malloc((size_t)w * h * 4);
+    CHECK(a && b, "alloc");
+    if (!a || !b) { free(a); free(b); return; }
+
+    bgs[0] = 245;   /* a light page - where the old build was invisible */
+    bgs[1] = 128;   /* mid grey */
+    bgs[2] = 20;    /* a dark terminal */
+
+    for (bi = 0; bi < 3; bi++) {
+        int bg = bgs[bi];
+        double pct;
+
+        /* fibre: the strongest of the three texture controls */
+        {
+            SETTINGS s = PaperDefaultSettings();
+            s.fibre = 0;  BuildPaperFull(a, w, h, &s, NULL);
+            s.fibre = 100; BuildPaperFull(b, w, h, &s, NULL);
+            CompositeOverBg(a, w, h, bg);
+            CompositeOverBg(b, w, h, bg);
+            pct = PctDifferingBy(a, b, w, h, 2.0);
+            CHECK(pct >= 15.0,
+                  "fibre 0 vs 100 is visibly different on every background");
+        }
+        /* blotch */
+        {
+            SETTINGS s = PaperDefaultSettings();
+            s.blotch = 0;  BuildPaperFull(a, w, h, &s, NULL);
+            s.blotch = 100; BuildPaperFull(b, w, h, &s, NULL);
+            CompositeOverBg(a, w, h, bg);
+            CompositeOverBg(b, w, h, bg);
+            pct = PctDifferingBy(a, b, w, h, 2.0);
+            CHECK(pct >= 15.0,
+                  "blotch 0 vs 100 is visibly different on every background");
+        }
+        /* grain changes the structure, so it must move luminance too */
+        {
+            SETTINGS s = PaperDefaultSettings();
+            s.grain = 2;  BuildPaperFull(a, w, h, &s, NULL);
+            s.grain = 12; BuildPaperFull(b, w, h, &s, NULL);
+            CompositeOverBg(a, w, h, bg);
+            CompositeOverBg(b, w, h, bg);
+            pct = PctDifferingBy(a, b, w, h, 2.0);
+            CHECK(pct >= 15.0,
+                  "grain 2 vs 12 is visibly different on every background");
+        }
+        /* warmth is a hue shift, so luminance alone understates it; require a
+         * smaller luminance fraction but also assert the chroma swing below */
+        {
+            SETTINGS s = PaperDefaultSettings();
+            s.warmth = 10; BuildPaperFull(a, w, h, &s, NULL);
+            s.warmth = 95; BuildPaperFull(b, w, h, &s, NULL);
+            CompositeOverBg(a, w, h, bg);
+            CompositeOverBg(b, w, h, bg);
+            pct = PctDifferingBy(a, b, w, h, 2.0);
+            CHECK(pct >= 10.0,
+                  "warmth 10 vs 95 is visibly different on every background");
+        }
+    }
+
+    /* warmth must also move the RED-BLUE separation monotonically across its
+     * range: the old mapping moved it 5.7 levels end to end and was quantised
+     * by integer division into a staircase. */
+    {
+        SETTINGS s = PaperDefaultSettings();
+        double prev = 0.0;
+        int wt, ok = 1;
+        double lo = 0.0, hi = 0.0;
+        for (wt = 0; wt <= 100; wt += 20) {
+            double sum = 0.0;
+            int i;
+            s.warmth = wt;
+            BuildPaperFull(a, w, h, &s, NULL);
+            CompositeOverBg(a, w, h, 245);
+            for (i = 0; i < w * h; i++)
+                sum += (double)a[4 * (size_t)i + 2] - (double)a[4 * (size_t)i + 0];
+            sum /= (double)(w * h);
+            if (wt == 0) lo = sum;
+            if (wt == 100) hi = sum;
+            /* never decreases: cool -> neutral -> warm is one direction */
+            if (wt > 0 && sum <= prev) ok = 0;
+            prev = sum;
+        }
+        CHECK(ok, "warmth increases R-B monotonically across its range");
+        CHECK(hi - lo >= 12.0,
+              "warmth spans a visible chroma range, not a staircase");
+    }
+
+    free(a); free(b);
+}
+
 static void TestDefaultsAndClamp(void) {
     SETTINGS s = PaperDefaultSettings();
     CHECK(s.master == 1 && s.mode == MODE_PAPER, "defaults: master/mode");
@@ -190,6 +390,25 @@ static void TestCancellation(void) {
     CHECK(BuildPaperFull(px, w, h, &s, &c), "uncancelled bake completes");
     c.stop = 1;
     CHECK(!BuildPaperFull(px, w, h, &s, &c), "cancel flag stops the bake");
+    free(px);
+}
+
+/* The engine is documented to survive a caller that skipped ClampSettingsOf:
+ * grain 0 must clamp inside PaperParams, where both the noise period and the
+ * per-pixel divisor read it. Unclamped it is a zero divisor on the bake thread
+ * - a fault on the period, or 0/0 noise in float that lands as a fully
+ * transparent bake reporting success. */
+static void TestGrainZeroBakes(void) {
+    SETTINGS s = PaperDefaultSettings();
+    int w = 120, h = 90, i, opaque = 0;
+    unsigned char *px = malloc((size_t)w * h * 4);
+    CHECK(px != NULL, "alloc");
+    if (!px) return;
+    s.grain = 0;                    /* below the clamp floor: the guard's case */
+    CHECK(BuildPaperFull(px, w, h, &s, NULL), "grain 0 bake completes");
+    CheckPremultiplied(px, w, h, "grain 0");
+    for (i = 0; i < w * h; i++) if (px[4 * (size_t)i + 3]) opaque++;
+    CHECK(opaque == w * h, "grain 0 bakes the real veil, not a blank frame");
     free(px);
 }
 
@@ -444,8 +663,11 @@ int main(int argc, char **argv) {
     TestDefaultsAndClamp();
     TestSetKeyValueGrammar();
     TestBakeDeterminismAndValidity();
+    TestTextureIsActuallyVisible();
+    TestSettingsArePerceptible();
     TestSettingsActuallyChangePixels();
     TestCancellation();
+    TestGrainZeroBakes();
     TestCliRefusals(argc >= 1 && argv[0] ? argv[0] : "test_core");
     printf("%s: %d failure(s)\n", failures ? "RESULT" : "RESULT 0", failures);
     return failures ? 1 : 0;
