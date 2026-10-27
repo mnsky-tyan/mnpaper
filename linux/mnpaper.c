@@ -968,13 +968,14 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
     o->baked_gen = g_settings_gen;
     /* The stamp consumes the generation: QueueBake will never re-bake this
      * paper.  So if master wants the texture on screen, THIS is the last
-     * chance to commit it - a bake that lands in the window where a resize
-     * or toggle left `attached` behind would otherwise sit in the half
-     * uncommitted, the screen frozen on the previous frame, and every later
-     * settings change a no-op ("this exact paper is ready") until the user
-     * cycles Show paper twice.  AttachCurrentBuffer attaches and commits
-     * (buf_pending is 0 here); with master off it is the designed arming. */
-    if (g_s.master) AttachCurrentBuffer(o);
+     * chance to hand it over - a bake that lands in the window where a
+     * resize or toggle left `attached` behind would otherwise sit in the
+     * half uncommitted, the screen frozen on the previous frame, and every
+     * later settings change a no-op ("this exact paper is ready") until the
+     * user cycles Show paper twice.  Claim the half here and let the single
+     * commit below hand it over: attaching it twice would owe two releases
+     * for one buffer and park every later bake. */
+    if (g_s.master) o->attached = HALF_TEX;
     /* Only a commit hands the buffer to the compositor, so only a commit can
      * owe a release.  Clearing the token while hidden would wait forever for
      * an event that never comes and wedge every later bake. */
@@ -2027,15 +2028,15 @@ int main(int argc, char **argv) {
     /* ---- become the daemon ---- */
     /* At login the autostart entry can fire before the compositor's socket
      * exists.  Without this retry the texture would silently never appear
-     * and there would be nothing running to ask.  Bounded: ~20 s, then the
+     * and there would be nothing running to ask.  Bounded: 60 s, then the
      * honest error below.  A human-started run usually connects on the
-     * first try and pays nothing. */
+     * first try and pays nothing.  The bound is 60 s, not 20, because a real
+     * 2026-10-24 boot outlived the old one: the autostart instance exited
+     * "cannot connect" and only Plasma's session-restore second start gave
+     * the session a paper.  A login race the process idles through is not a
+     * wait a human watches. */
     {
         int tries;
-        /* 60 s, not 20: a real 2026-10-24 boot outlived the old bound - the
-         * autostart instance exited "cannot connect" and only Plasma's
-         * session-restore second start gave the session a paper.  This is a
-         * login race the process idles through, not a wait a human watches. */
         for (tries = 0; !(g_dpy = wl_display_connect(NULL)) && tries < 120; tries++) {
             if (!(tries % 20))
                 L("compositor not reachable yet - waiting (autostart race, "
