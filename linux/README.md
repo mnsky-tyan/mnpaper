@@ -216,7 +216,7 @@ XDG-compliant desktop launch at login. Points worth knowing:
   autostart entry pointing into a build directory breaks the moment you
   `make clean`.
 - At login the entry can fire before the compositor socket exists. The daemon
-  retries the connection for about 20 seconds before giving up, so the
+  retries the connection for up to 60 seconds before giving up, so the
   texture still appears when the session is slow to start.
 
 ## Settings file
