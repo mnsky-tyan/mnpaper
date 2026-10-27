@@ -338,7 +338,11 @@ int main(void) {
          * 0.9% of pixels by two luminance levels.  A paper veil that is worth
          * showing swings its chroma far harder than that (measured 20+ levels end
          * to end after the 2026-10-23 rescale), so the floor now fails an
-         * invisible tint. */
+         * invisible tint.  After the 2026-10-27 pattern decoupling (fibre and
+         * blotch no longer re-weight the light/dark mix) the swing measures
+         * warm -11 / cool +7..8 full-res, so the floor is 6: a quarter of
+         * margin under the measurement, still 2x the sub-3-level cast this
+         * check exists to reject. */
         {
             int w = 320, h = 200, k, i3, warm_br = 0, cool_br = 0;
             unsigned char *wbuf = malloc((size_t)w * h * 4);
@@ -376,7 +380,7 @@ int main(void) {
             g_s = saved;
             warm_br /= w * h; cool_br /= w * h;
             printf("METRIC warmth swing (blue-red): warm=%d cool=%d\n", warm_br, cool_br);
-            Check(warm_br <= -8 && cool_br >= 8 && cool_br - warm_br > 16,
+            Check(warm_br <= -6 && cool_br >= 6 && cool_br - warm_br > 12,
                   "warmth endpoints read distinctly cool and warm");
             free(wbuf); free(cbuf); free(lw); free(lc); free(scr);
         }

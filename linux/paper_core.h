@@ -284,26 +284,20 @@ typedef struct {
     SETTINGS s;
     int pg, pf, pm, wr, wg_r, wb_r, dr, dg, db, bias, spread;
     int fspread, bspread;      /* fibre/blotch own alpha-modulation gain */
-    float wg, wf, wm, wsum;
     float fs;                  /* coordinate scale: 1 full, ratio on Linux */
 } PAPERPARAMS;
 
-/* The noise fields are averages of averages: one fbm is four octaves of value
- * noise weighted 0.533/0.267/0.133/0.067, and `n` is a wsum-weighted mean of
- * three such fields.  Averaging shrinks the spread, so the deviation from the
- * midpoint is far narrower than the [0,1] that a naive |2n-1| suggests.
- * Measured over a full 1200x800 frame the folded magnitude has mean 0.158,
- * sd 0.113 and max 0.728.  Scaling the swing by a nominal 1.0 therefore threw
- * away ~84% of the amplitude: at the old maximum intensity the texture's own
- * contribution was 4.7 alpha levels out of a nominal 30, which is why every
- * slider looked dead (2026-10-23 review).  This constant is ~3 sigma of the
- * measured distribution, so the swing uses the range the slider promises.
- * The clamp is not rare: over the same frame at the defaults it saturates the
- * folded term on ~7% of pixels and the fibre and macro terms - folded from a
- * single fbm each - on ~21%, which caps their strongest patches instead of
- * letting them dwarf the mix.  Keep it tied to the noise: if the octave
- * weights or the field count change, re-measure and update this. */
-#define PAPER_MAG_SCALE 2.9f
+/* One fbm is four octaves of value noise weighted 0.533/0.267/0.133/0.067.
+ * Averaging shrinks the spread, so the deviation from the midpoint is far
+ * narrower than the [0,1] that a naive |2n-1| suggests.  Measured over a full
+ * 1800x1125 frame the grain field's folded magnitude has mean 0.216, sd 0.152
+ * and max 0.895 (2026-10-27, single-field after the pattern decoupling).  The
+ * scale is 1/(3 sigma) so the swing reaches its design range at three sigma
+ * and clips only past it; the alpha it buys at intensity 30 is median 38 /
+ * p99 68, matching the calibration the user accepted in 2.7.23.  Keep it tied
+ * to the noise: if the octave weights or the field count change, re-measure
+ * and update this.  Keep it identical to mnPaper.c. */
+#define PAPER_MAG_SCALE 2.3f
 
 static PAPERPARAMS PaperParams(int w, float fs, const SETTINGS *sp) {
     PAPERPARAMS p;
@@ -337,10 +331,6 @@ static PAPERPARAMS PaperParams(int w, float fs, const SETTINGS *sp) {
     p.pg = NextPow2(w / p.s.grain + 2);
     p.pf = NextPow2(w / 2 + 2);
     p.pm = NextPow2(w / 90 + 2);
-    p.wg = 0.45f;
-    p.wf = 0.30f * sp->fibre / 100.f;
-    p.wm = 0.25f * sp->blotch / 100.f;
-    p.wsum = p.wg + p.wf + p.wm;
     wb = warm * 44 / 100;
     /* The highlight family used to sit at 236..255, i.e. inside the range of a
      * white page, so the positive half of the noise was invisible on light
@@ -385,8 +375,17 @@ static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
     float grain = fbm(u / (float)p->s.grain, v / (float)p->s.grain, p->pg);
     float fibre = fbm(u / 2.f, v / 12.f, p->pf);
     float macro = fbm(u / 90.f, v / 70.f, p->pm);
-    float n = (grain * p->wg + fibre * p->wf + macro * p->wm) / p->wsum;
-    float d = (n - 0.5f) * 2.f;
+    /* The light/dark pattern is the grain field ALONE.  It used to be a
+     * weighted mix whose fibre and macro weights were the fibre and blotch
+     * SETTINGS, so moving those sliders re-decided which patches are warm
+     * highlights and which are shadows - a third of the screen flips sides
+     * between fibre 40 and 100 (measured 2026-10-27), while adjacent steps
+     * moved under 2% of pixels.  Half the dial felt dead and the rest felt
+     * like a different paper: the user called it "same settings, different
+     * output".  Sliders must scale VISIBILITY, never re-weight the pattern:
+     * grain sizes the pattern, fibre and blotch are pure alpha overlays on
+     * it, and warmth only tints. */
+    float d = (grain - 0.5f) * 2.f;
     float mag = d < 0 ? -d : d;
     /* Normalise the folded magnitude to the range the swing is scaled for; see
      * PAPER_MAG_SCALE.  The fibre/blotch terms come from the same narrow
