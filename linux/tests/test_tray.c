@@ -634,9 +634,6 @@ static void client_prop(const char *dest, const char *prop, int fd) {
     sd_bus_unref(c);
 }
 
-/* Send one call from a forked child - the call blocks until the tray
- * answers, and the tray is served from this process - and collect the
- * answer.  The tray's bus is pumped while the child waits. */
 /* IconPixmap decides what the panel actually draws, and a property that
  * reads back wrong there shows up as a blurry or square icon nobody can
  * trace.  The child fetches the property and reports, per entry:
@@ -706,6 +703,9 @@ static void client_icon_pixmap(const char *dest, int fd) {
     }
 }
 
+/* Send one call from a forked child - the call blocks until the tray
+ * answers, and the tray is served from this process - and collect the
+ * answer.  The tray's bus is pumped while the child waits. */
 static int call_tray(const char *dest, const char *method, int n,
                      char *out, size_t outsz) {
     int fds[2];

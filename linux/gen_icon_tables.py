@@ -4,18 +4,24 @@
     python3 gen_icon_tables.py <mnpaper-2048.png> --header icon_tables.h
     python3 gen_icon_tables.py <mnpaper-2048.png> --ico OUT.ico
 
+The source is the mn-brand pipeline's `icons/mnpaper.png` (2048x2048), which
+lives in the mnbrand repository, not here - this repo ships only the baked
+results, so regeneration needs that checkout.
+
 The header is always written to the --header path (default icon_tables.h
 in the current directory); --ico additionally writes a multi-size .ico.
 Both outputs come from the same pipeline, so the tray tables and every .ico
-entry are the same pixels by construction.
+entry are the same pixels by construction. Needs Pillow (`pip install
+Pillow`) and nothing else; neither artifact is generated at build time,
+both are committed.
 
 What this does to the artwork (and what it deliberately does NOT do):
 
 - Crops to the brand card's outer edge (its 1.5-unit white stroke included).
   The card's stroke-center rectangle is exactly 277x270 units at (11,12) in
-  the 300-unit mn master viewBox; at the render's 2048/300 scale that was
-  measured as x 70..1970, y 76..1929 (stroke-centre rect 1891x1844 px =
-  277x270 x 6.827 to within a pixel).
+  the 300-unit mn master viewBox; at the render's 2048/300 scale that is
+  1891x1843 px, and the stroke-outer box around it is x 70..1971, y 76..1930
+  (CARD_BOX below, 1901x1854 px), which is what gets cropped.
 - Fits the card into a square canvas with transparent top/bottom padding
   (~1.2% of the edge each) instead of cropping into the stroke.
 - Clips to the brand corner radius, r = 43/277 of the icon edge (~15.5%),

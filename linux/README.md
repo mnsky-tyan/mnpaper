@@ -109,13 +109,14 @@ actually in effect.
 The daemon exposes `org.kde.StatusNotifierItem` plus a `com.canonical.dbusmenu`
 menu over the session bus - no GTK or Qt, just libsystemd's sd-bus. It appears
 in the system tray as the mn-brand artwork for mnPaper: the brand card
-cropped out of the 2048 render, clipped to the shared corner radius
-(43/277 of the edge, see mnbrand docs/icon-corner-radius.md) and served at
+cropped out of the 2048 render, clipped to the mn-brand shared corner radius
+(43/277 of the edge, the same value every mn app icon uses) and served at
 six sizes (16..128) from `icon_tables.h`, a source table rather than a
 binary asset. Six sizes because a panel must never upscale the icon - at
 compositor scale 2 a lone 24x24 pixmap was smoothed into 48 device pixels
-and read as blurry. The `.ico` entries come from the same generator, so
-every size of both icons is the same pixels.
+and read as blurry. `mnPaper.ico` and the table both come out of
+`linux/gen_icon_tables.py`, so every size the two share is the same pixels;
+that script's docstring is the regeneration procedure.
 
 - **Left-click** toggles the paper, exactly like `--toggle`.
 - **Scroll** on the icon steps through the strength presets.
@@ -323,15 +324,17 @@ The second is the tray case. It starts a private `dbus-daemon`, runs the
 real tray code on it and drives it with the messages a panel sends, so it
 never touches the session bus, the live daemon or the desktop. It checks
 that the bounds on batched events and property queries hold, that
-`Activate`, `Event` and `GetLayout` do what they claim, and it watches the
-bus the way a host does: it asserts that a `PropertiesChanged` really
-carries the `Status` property, and that `ItemsPropertiesUpdated` arrives
-with the body the DBusMenu spec declares (`a(ia{sv})a(ias)`), carrying
-every row whose state can move - the texture radios included. Those two
-fail silently - a typed consumer such as dbusmenu-qt5 drops a signal with
-the wrong element type, and a property change that never leaves the process
-leaves a stale icon - so only the wire can catch them. The case skips
-itself when `dbus-daemon` is not installed.
+`Activate`, `Event` and `GetLayout` do what they claim, that `IconPixmap`
+carries six square sizes with the rounded, partly transparent corners of
+the brand card, and it watches the bus the way a host does: it asserts
+that a `PropertiesChanged` really carries the `Status` property, and that
+`ItemsPropertiesUpdated` arrives with the body the DBusMenu spec declares
+(`a(ia{sv})a(ias)`), carrying every row whose state can move - the texture
+radios included. Those two fail silently - a typed consumer such as
+dbusmenu-qt5 drops a signal with the wrong element type, and a property
+change that never leaves the process leaves a stale icon - so only the
+wire can catch them. The case skips itself when `dbus-daemon` is not
+installed.
 
 Live checks that found real bugs during the port (worth re-running after
 touching the buffer or layer-surface code):
