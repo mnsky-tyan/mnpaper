@@ -379,6 +379,76 @@ static void TestSettingsActuallyChangePixels(void) {
     free(a); free(b);
 }
 
+/* Strength sliders must scale VISIBILITY, never repaint the pattern.  The
+ * light/dark structure belongs to the grain field alone; fibre and blotch are
+ * pure alpha overlays.  The property that matters: the UN-premultiplied
+ * colour of every pixel is identical at any fibre and blotch, so moving those
+ * sliders can fade strands and patches in and out but can never re-decide
+ * which patches are warm highlights and which are shadows.  Before
+ * 2026-10-27 the mix weights WERE the settings: fibre 40 -> 100 flipped a
+ * tenth of the screen across the highlight/shadow line while adjacent steps
+ * moved under 2% of pixels - the user's "same settings, different output". */
+static void TestStrengthSlidersDoNotRepaintPattern(void) {
+    SETTINGS s = PaperDefaultSettings();
+    int w = 240, h = 160, x, y, flips = 0, compared = 0, colbad = 0;
+    PAPERPARAMS pp = PaperParams(w, 1.f, &s);
+    int hi = (pp.wr * 299 + pp.wg_r * 587 + pp.wb_r * 114) / 1000;
+    int lo = (pp.dr * 299 + pp.dg * 587 + pp.db * 114) / 1000;
+    int mid = (hi + lo) / 2;
+    unsigned char *a = malloc((size_t)w * h * 4);
+    unsigned char *b = malloc((size_t)w * h * 4);
+    CHECK(a && b, "alloc");
+    if (!a || !b) { free(a); free(b); return; }
+    CHECK(hi - lo > 64,
+          "family colours sit far enough apart to classify at alpha 8");
+
+    s.fibre = 0; s.blotch = 0;
+    BuildPaperFull(a, w, h, 1.f, &s, NULL);
+    s.fibre = 100; s.blotch = 100;
+    BuildPaperFull(b, w, h, 1.f, &s, NULL);
+
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            unsigned char *pa = a + 4 * ((size_t)y * w + x);
+            unsigned char *pb = b + 4 * ((size_t)y * w + x);
+            int c, la, lb;
+            if (pa[3] < 8 || pb[3] < 8) continue;   /* too thin to un-multiply */
+            /* the branch map: highlight vs shadow, un-premultiplied luminance
+             * against the midpoint of the two family colours.  Un-multiply
+             * only rounds down and by at most 255/alpha levels, so with the
+             * gap checked above, alpha >= 8 cannot cross the midpoint. */
+            la = (pa[2] * 299 + pa[1] * 587 + pa[0] * 114) * 255 / (1000 * pa[3]);
+            lb = (pb[2] * 299 + pb[1] * 587 + pb[0] * 114) * 255 / (1000 * pb[3]);
+            compared++;
+            if ((la >= mid) != (lb >= mid)) flips++;
+            /* where both are solid, the un-premultiplied colour must also
+             * match within quantization (255/100 amplifies by 2.5) */
+            if (pa[3] >= 100 && pb[3] >= 100)
+                for (c = 0; c < 3; c++) {
+                    int ca = (pa[c] * 255 + pa[3] / 2) / pa[3];
+                    int cb = (pb[c] * 255 + pb[3] / 2) / pb[3];
+                    if (abs(ca - cb) > 4) colbad++;
+                }
+        }
+    CHECK(compared > w * h / 4, "both bakes carry real alpha");
+    CHECK(flips == 0, "fibre/blotch must not flip the highlight/shadow map");
+    if (flips)
+        printf("FAIL %s (line %d): %d of %d pixels flipped colour class\n",
+               __func__, __LINE__, flips, compared);
+    CHECK(colbad == 0, "solid pixels keep their un-premultiplied colour");
+    if (colbad)
+        printf("FAIL %s (line %d): %d solid pixels changed colour\n",
+               __func__, __LINE__, colbad);
+    /* and the overlays must still be real: full fibre/blotch adds visible
+     * alpha on top of the bare grain */
+    {
+        size_t i, n = (size_t)w * h, sum = 0;
+        for (i = 0; i < n; i++) sum += b[4*i+3] - a[4*i+3];
+        CHECK(sum > 0, "fibre/blotch overlays add alpha");
+    }
+    free(a); free(b);
+}
+
 /* The texture is a property of the surface, not of the pixel grid.  The
  * lattice periods come from the width in SAMPLING units and PaperPixel divides
  * the pixel coordinate by fs, so rendering the same logical surface at two
@@ -729,6 +799,7 @@ int main(int argc, char **argv) {
     TestCancellation();
     TestGrainZeroBakes();
     TestTextureIsScaleInvariant();
+    TestStrengthSlidersDoNotRepaintPattern();
     TestCliRefusals(argc >= 1 && argv[0] ? argv[0] : "test_core");
     printf("%s: %d failure(s)\n", failures ? "RESULT" : "RESULT 0", failures);
     return failures ? 1 : 0;

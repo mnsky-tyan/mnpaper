@@ -124,6 +124,17 @@ that script's docstring is the regeneration procedure.
   Warmth (Cool/Neutral/Warm/Aged), Grain (2..12), Fibre (0..100 in tens),
   Blotch (0..100 in tens), Start at login, Edit settings file..., Quit.
 
+The texture has a fixed light/dark structure: the grain field alone decides
+which patches read as warm highlights and which as shadows. Fibre and blotch
+are pure alpha overlays on that structure - fibre lays in paper strands,
+blotch lays in uneven patches - and their sliders only scale how strongly
+each overlay shows. Moving them can never re-decide the highlight/shadow map
+(that regression is pinned by `TestStrengthSlidersDoNotRepaintPattern`: the
+old engine flipped 10.3% of pixels across the highlight/shadow line between
+fibre 40 and 100 at the shipped defaults, and the largest dial sweep - both
+sliders end to end - re-decided 22%, which read as "same settings, different
+output").
+
 Grain, fibre and blotch are the three texture parameters the menu used to
 leave out; each submenu has ten steps spanning the same bounds the clamp
 table enforces, and every list contains the setting's default so a fresh

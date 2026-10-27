@@ -68,7 +68,11 @@ Covered:
   Warmth must also swing its red-blue separation monotonically across its
   range, and the default strength must put a median veil of at least 25/255
   on screen with most of it carried by the texture rather than by the flat
-  bias floor.
+  bias floor. The strength sliders must also never repaint the pattern: the
+  un-premultiplied colour of every pixel is identical at any fibre and
+  blotch - the branch map belongs to the grain field alone, classified at
+  the midpoint of the generator's own two family colours, the same property
+  linux/tests/test_core.c pins on the portable engine.
 - Test windows never become visible.
 
 `update_help_capture.c` is the companion hidden regression for the release
