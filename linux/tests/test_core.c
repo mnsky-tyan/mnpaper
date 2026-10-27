@@ -723,8 +723,14 @@ static void TestConfigRoundTrip(void) {
     CHECK(f != NULL, "config: the temp file opens");
     if (!f) return;
 
-    /* a value the user chose, which the new default would overwrite */
-    s.panelgap = 96;
+    /* every key the writer emits starts away from its default and in
+     * bounds, so a key lost in either direction - dropped by the writer,
+     * refused or mis-parsed by the parser - cannot hide behind one;
+     * panelgap stays the user-chosen 96 the migration checks build on */
+    s.master = 0; s.mode = MODE_EINK; s.intensity = 33; s.warmth = 63;
+    s.grain = 7; s.fibre = 55; s.blotch = 66; s.shades = 9;
+    s.contrast = 51; s.dither = 76; s.share = 1; s.tbmode = TB_COVER;
+    s.autoupd = 0; s.panelgap = 96; s.cfgver = 1;
     CHECK(ConfigFormat(&s, f) == 0, "config: the file body is written");
     rewind(f);
     got = fread(body, 1, sizeof body - 1, f);
@@ -734,17 +740,40 @@ static void TestConfigRoundTrip(void) {
      * for the total round-trip comparison at the end */
     memcpy(pristine, body, got + 1);
 
+    /* the written body is the file contract this build owns: all 15 keys
+     * must be in it.  The byte comparison at the end cannot see a key the
+     * writer drops - both of its bodies come from the same writer - so the
+     * contract is checked on the body itself */
+    {
+        const char *const keys[15] = {
+            "master", "mode", "intensity", "warmth", "grain", "fibre",
+            "blotch", "shades", "contrast", "dither", "share", "tbmode",
+            "autoupd", "panelgap", "cfgver"
+        };
+        char needle[16];
+        int i;
+        for (i = 0; i < 15; i++) {
+            snprintf(needle, sizeof needle, "\n%s=", keys[i]);
+            if (!strstr(pristine, needle)) {
+                printf("FAIL %s: the written body lacks the %s key\n",
+                       __func__, keys[i]);
+                failures++;
+            }
+        }
+    }
+
     /* parse it back the way LoadSettings does */
     for (line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
         if (ConfigParseLine(&back, line, &stamped) > 0) loaded++;
     CHECK(stamped, "config: the written file carries the schema stamp");
     CHECK(loaded > 0, "config: the written file yields its keys");
     CHECK(back.panelgap == 96, "config: the chosen panelgap reads back");
-    CHECK(back.cfgver == 2, "config: the stamp reads back");
+    CHECK(back.cfgver == 1, "config: the stamp value reads back");
 
     /* total round trip: re-serialize the parsed state and require the same
-     * bytes.  The sampled checks above would still pass if a key were
-     * dropped from the format or mis-parsed; this one cannot. */
+     * bytes.  The key scan above holds the writer to every key; this one
+     * holds the parser: no seeded field sits at its default, so a key that
+     * is refused, lost or mapped into the wrong field changes the bytes. */
     {
         char body2[2048];
         FILE *f2 = tmpfile();
