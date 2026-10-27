@@ -108,9 +108,14 @@ actually in effect.
 
 The daemon exposes `org.kde.StatusNotifierItem` plus a `com.canonical.dbusmenu`
 menu over the session bus - no GTK or Qt, just libsystemd's sd-bus. It appears
-in the system tray as the mn-brand artwork for mnPaper, baked into `tray.c` as
-`ICON_PIX` - a source table, not a binary asset. The same pixels appear in the
-24x24 entry of `mnPaper.ico`.
+in the system tray as the mn-brand artwork for mnPaper: the brand card
+cropped out of the 2048 render, clipped to the shared corner radius
+(43/277 of the edge, see mnbrand docs/icon-corner-radius.md) and served at
+six sizes (16..128) from `icon_tables.h`, a source table rather than a
+binary asset. Six sizes because a panel must never upscale the icon - at
+compositor scale 2 a lone 24x24 pixmap was smoothed into 48 device pixels
+and read as blurry. The `.ico` entries come from the same generator, so
+every size of both icons is the same pixels.
 
 - **Left-click** toggles the paper, exactly like `--toggle`.
 - **Scroll** on the icon steps through the strength presets.

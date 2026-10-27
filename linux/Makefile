@@ -23,7 +23,7 @@ VPOR = protocols/viewporter
 
 all: $(BIN)
 
-$(BIN): mnpaper.c tray.c tray.h paper_core.h $(PROT).h $(PROT).c $(XDG).c $(FRAC).h $(FRAC).c $(VPOR).h $(VPOR).c ../version.h
+$(BIN): mnpaper.c tray.c tray.h icon_tables.h paper_core.h $(PROT).h $(PROT).c $(XDG).c $(FRAC).h $(FRAC).c $(VPOR).h $(VPOR).c ../version.h
 	$(CC) $(CFLAGS) $(WARN) mnpaper.c tray.c $(PROT).c $(XDG).c $(FRAC).c $(VPOR).c -o $@ $(LDLIBS)
 
 # regenerate the vendored protocol code only when the XML changes; the XML is
@@ -68,7 +68,7 @@ tests/test_core: tests/test_core.c paper_core.h
 	$(CC) $(CFLAGS) $(WARN) tests/test_core.c -o $@ $(LDLIBS)
 
 # the tray test drives the real tray code over a private session bus
-tests/test_tray: tests/test_tray.c tray.c tray.h
+tests/test_tray: tests/test_tray.c tray.c icon_tables.h tray.h
 	$(CC) $(CFLAGS) $(WARN) tests/test_tray.c tray.c -o $@ $(LDLIBS)
 
 clean:

@@ -637,6 +637,75 @@ static void client_prop(const char *dest, const char *prop, int fd) {
 /* Send one call from a forked child - the call blocks until the tray
  * answers, and the tray is served from this process - and collect the
  * answer.  The tray's bus is pumped while the child waits. */
+/* IconPixmap decides what the panel actually draws, and a property that
+ * reads back wrong there shows up as a blurry or square icon nobody can
+ * trace.  The child fetches the property and reports, per entry:
+ *   w : corner-alpha : centre-alpha
+ * so the parent can assert the multi-size array and the rounded mask. */
+static void client_icon_pixmap(const char *dest, int fd) {
+    sd_bus *c = NULL;
+    sd_bus_message *m = NULL, *reply = NULL;
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    char line[1024];
+    int r;
+
+    if (sd_bus_open_user(&c) < 0) { answer(fd, "ERR noconn\n"); return; }
+    sd_bus_set_method_call_timeout(c, 5u * 1000000u);
+    if (sd_bus_message_new_method_call(c, &m, dest, "/StatusNotifierItem",
+                                        "org.freedesktop.DBus.Properties",
+                                        "Get") < 0) {
+        answer(fd, "ERR nomessage\n");
+        return;
+    }
+    sd_bus_message_append(m, "s", "org.kde.StatusNotifierItem");
+    sd_bus_message_append(m, "s", "IconPixmap");
+    r = sd_bus_call(c, m, 0, &err, &reply);
+    if (r < 0) {
+        snprintf(line, sizeof line, "ERR %s\n",
+                 err.name ? err.name : "unknown");
+        answer(fd, line);
+        return;
+    }
+    /* reply: v a(iiay) */
+    r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_VARIANT, "a(iiay)");
+    if (r < 0) { answer(fd, "ERR variant\n"); return; }
+    r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(iiay)");
+    if (r < 0) { answer(fd, "ERR array\n"); return; }
+    {
+        int n = 0;
+        size_t len;
+        const void *p;
+        line[0] = 0;
+        while (sd_bus_message_enter_container(reply,
+                       SD_BUS_TYPE_STRUCT, "iiay") > 0) {
+            int w = 0, h = 0, corner = -1, centre = -1;
+            if (sd_bus_message_read(reply, "ii", &w, &h) < 0 || w <= 0 ||
+                w != h ||
+                sd_bus_message_read_array(reply, 'y', &p, &len) < 0 ||
+                len != (size_t)w * w * 4) {
+                snprintf(line + strlen(line), sizeof line - strlen(line),
+                         " bad-entry");
+                sd_bus_message_exit_container(reply);
+                break;
+            }
+            /* ARGB32 big-endian per pixel: byte 0 of each pixel is alpha */
+            corner = ((const unsigned char *)p)[0];
+            centre = ((const unsigned char *)p)[(size_t)(w * (w / 2) + w / 2) * 4];
+            snprintf(line + strlen(line), sizeof line - strlen(line),
+                     " %d:%d:%d", w, corner, centre);
+            n++;
+            sd_bus_message_exit_container(reply);
+        }
+        sd_bus_message_exit_container(reply);   /* array */
+        sd_bus_message_exit_container(reply);   /* variant */
+        {
+            char out[1100];
+            snprintf(out, sizeof out, "OK %d%s\n", n, line);
+            answer(fd, out);
+        }
+    }
+}
+
 static int call_tray(const char *dest, const char *method, int n,
                      char *out, size_t outsz) {
     int fds[2];
@@ -666,6 +735,8 @@ static int call_tray(const char *dest, const char *method, int n,
             client_getlayout(dest, fds[1], n);
         else if (strcmp(method, "ItemIsMenu") == 0)
             client_prop(dest, "ItemIsMenu", fds[1]);
+        else if (strcmp(method, "IconPixmap") == 0)
+            client_icon_pixmap(dest, fds[1]);
         else
             answer(fds[1], "ERR unknown\n");
         close(fds[1]);
@@ -800,6 +871,21 @@ int main(void) {
     call_tray(dest, "ItemIsMenu", 0, out, sizeof out);
     CHECK(strncmp(out, "OK 0", 4) == 0,
           "sni: the item is no menu, so a left click activates it");
+
+    /* the icon on the wire: six sizes so a scale-2 panel never upscales
+     * (a lone 24x24 pixmap was smoothed into 48 device pixels), and the
+     * corners transparent so the brand card reads as a rounded tile */
+    call_tray(dest, "IconPixmap", 0, out, sizeof out);
+    CHECK(strncmp(out, "OK 6 ", 5) == 0,
+          "icon: six sizes are served on the wire");
+    CHECK(strstr(out, " 16:48:255") != NULL, "icon: 16px baked (AA corner, solid centre)");
+    CHECK(strstr(out, " 24:0:255") != NULL, "icon: 24px baked, corner transparent");
+    CHECK(strstr(out, " 32:0:255") != NULL, "icon: 32px baked, corner transparent");
+    CHECK(strstr(out, " 48:0:255") != NULL, "icon: 48px baked (a scale-2 panel's native size)");
+    CHECK(strstr(out, " 64:0:255") != NULL, "icon: 64px baked");
+    CHECK(strstr(out, " 128:0:255") != NULL, "icon: 128px baked");
+    CHECK(strstr(out, "bad-entry") == NULL,
+          "icon: every entry is square and carries w*h*4 bytes");
 
     /* the left click: Activate */
     reset_counters();
