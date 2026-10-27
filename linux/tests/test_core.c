@@ -61,19 +61,6 @@ static void CheckPremultiplied(const unsigned char *px, int w, int h,
  * deliberately floors, not targets: they fail an invisible texture without
  * pinning an exact look, so tuning the generator stays possible. */
 
-/* Composite a premultiplied BGRA buffer over a flat background, in place. */
-static void CompositeOverBg(unsigned char *px, int w, int h, int bg) {
-    int i;
-    for (i = 0; i < w * h; i++) {
-        unsigned char *p = px + 4 * (size_t)i;
-        int a = p[3];
-        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
-        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
-        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
-        p[3] = 255;
-    }
-}
-
 static double LumOf(const unsigned char *p) {
     return 0.299 * p[2] + 0.587 * p[1] + 0.114 * p[0];
 }
@@ -173,8 +160,8 @@ static void TestSettingsArePerceptible(void) {
             SETTINGS s = PaperDefaultSettings();
             s.fibre = 0;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
             s.fibre = 100; BuildPaperFull(b, w, h, 1.f, &s, NULL);
-            CompositeOverBg(a, w, h, bg);
-            CompositeOverBg(b, w, h, bg);
+            CompositeOver(a, w, h, bg);
+            CompositeOver(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
             CHECK(pct >= 15.0,
                   "fibre 0 vs 100 is visibly different on every background");
@@ -184,8 +171,8 @@ static void TestSettingsArePerceptible(void) {
             SETTINGS s = PaperDefaultSettings();
             s.blotch = 0;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
             s.blotch = 100; BuildPaperFull(b, w, h, 1.f, &s, NULL);
-            CompositeOverBg(a, w, h, bg);
-            CompositeOverBg(b, w, h, bg);
+            CompositeOver(a, w, h, bg);
+            CompositeOver(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
             CHECK(pct >= 15.0,
                   "blotch 0 vs 100 is visibly different on every background");
@@ -195,8 +182,8 @@ static void TestSettingsArePerceptible(void) {
             SETTINGS s = PaperDefaultSettings();
             s.grain = 2;  BuildPaperFull(a, w, h, 1.f, &s, NULL);
             s.grain = 12; BuildPaperFull(b, w, h, 1.f, &s, NULL);
-            CompositeOverBg(a, w, h, bg);
-            CompositeOverBg(b, w, h, bg);
+            CompositeOver(a, w, h, bg);
+            CompositeOver(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
             CHECK(pct >= 15.0,
                   "grain 2 vs 12 is visibly different on every background");
@@ -207,8 +194,8 @@ static void TestSettingsArePerceptible(void) {
             SETTINGS s = PaperDefaultSettings();
             s.warmth = 10; BuildPaperFull(a, w, h, 1.f, &s, NULL);
             s.warmth = 95; BuildPaperFull(b, w, h, 1.f, &s, NULL);
-            CompositeOverBg(a, w, h, bg);
-            CompositeOverBg(b, w, h, bg);
+            CompositeOver(a, w, h, bg);
+            CompositeOver(b, w, h, bg);
             pct = PctDifferingBy(a, b, w, h, 2.0);
             CHECK(pct >= 10.0,
                   "warmth 10 vs 95 is visibly different on every background");
@@ -228,7 +215,7 @@ static void TestSettingsArePerceptible(void) {
             int i;
             s.warmth = wt;
             BuildPaperFull(a, w, h, 1.f, &s, NULL);
-            CompositeOverBg(a, w, h, 245);
+            CompositeOver(a, w, h, 245);
             for (i = 0; i < w * h; i++)
                 sum += (double)a[4 * (size_t)i + 2] - (double)a[4 * (size_t)i + 0];
             sum /= (double)(w * h);
@@ -728,7 +715,7 @@ static void TestCliRefusals(const char *argv0) {
  * broke; the loader's own copy of that sequence is the same two calls. */
 static void TestConfigRoundTrip(void) {
     SETTINGS s = PaperDefaultSettings(), back = PaperDefaultSettings();
-    char body[2048], *line, *save = NULL;
+    char body[2048], pristine[2048], *line, *save = NULL;
     int stamped = 0, loaded = 0;
     FILE *f = tmpfile();
     size_t got;
@@ -743,6 +730,9 @@ static void TestConfigRoundTrip(void) {
     got = fread(body, 1, sizeof body - 1, f);
     body[got] = 0;
     fclose(f);
+    /* strtok_r below writes NULs into body, so keep the pristine bytes
+     * for the total round-trip comparison at the end */
+    memcpy(pristine, body, got + 1);
 
     /* parse it back the way LoadSettings does */
     for (line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
@@ -751,6 +741,24 @@ static void TestConfigRoundTrip(void) {
     CHECK(loaded > 0, "config: the written file yields its keys");
     CHECK(back.panelgap == 96, "config: the chosen panelgap reads back");
     CHECK(back.cfgver == 2, "config: the stamp reads back");
+
+    /* total round trip: re-serialize the parsed state and require the same
+     * bytes.  The sampled checks above would still pass if a key were
+     * dropped from the format or mis-parsed; this one cannot. */
+    {
+        char body2[2048];
+        FILE *f2 = tmpfile();
+        size_t got2;
+        CHECK(f2 != NULL, "config: the second temp file opens");
+        if (!f2) return;
+        CHECK(ConfigFormat(&back, f2) == 0, "config: the parsed state re-writes");
+        rewind(f2);
+        got2 = fread(body2, 1, sizeof body2 - 1, f2);
+        body2[got2] = 0;
+        fclose(f2);
+        CHECK(strcmp(pristine, body2) == 0,
+              "config: what this build writes it reads back unchanged");
+    }
 
     /* and the migration leaves it alone, because the file carried the stamp */
     CHECK(MigrateSettings(&back, stamped) == 0,

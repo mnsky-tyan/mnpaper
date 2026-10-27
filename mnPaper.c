@@ -2413,7 +2413,9 @@ static void DumpBgra(const char *path, unsigned char *bgra, int w, int h) {
 }
 
 /* composite the low-alpha veil over a stand-in app background (default light
-   gray) so the dump shows what the eye actually sees, not the raw bitmap */
+   gray) so the dump shows what the eye actually sees, not the raw bitmap.
+   Keep byte-identical to CompositeOver in linux/paper_core.h - the Linux
+   daemon, --dump-tex and the Linux tests share that one copy. */
 static int g_dump_bg = 235;
 static void CompositeOver(unsigned char *bgra, int w, int h, int bg) {
     int i;

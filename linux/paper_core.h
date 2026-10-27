@@ -439,6 +439,23 @@ static int BuildPaperFull(unsigned char *px, int w, int h, float fs,
     return 1;
 }
 
+/* Composite a premultiplied BGRA buffer over a flat background, in place.
+ * This is "what a person sees", the same premise the measuring rules below
+ * rely on, so there is exactly one copy: the Linux daemon, --dump-tex and
+ * the tests all call this one.  mnPaper.c keeps its own byte-identical copy
+ * until the Windows build is unified onto this header - keep them identical. */
+static void CompositeOver(unsigned char *px, int w, int h, int bg) {
+    int i;
+    for (i = 0; i < w * h; i++) {
+        unsigned char *p = px + 4 * (size_t)i;
+        int a = p[3];
+        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
+        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
+        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
+        p[3] = 255;
+    }
+}
+
 /* The 8px preview sampler (BuildPaperPreview/ExpandPaperRow) is Windows-only
  * today: mnPaper.c defines it for the settings GUI's live slider feedback and
  * the Windows tests/ tree covers it.  It was never carried into this port, so

@@ -60,7 +60,7 @@ void PAPERLOG(const char *fmt, ...) {
 static int st_master = 1, st_intensity = 30, st_warmth = 45, st_autostart;
 static int st_grain = 4, st_fibre = 40, st_blotch = 30;
 static int n_show, n_intensity, n_warmth, n_autostart;
-static int n_grain, n_fibre, n_blotch;
+static int n_grain, n_fibre, n_blotch, n_editcfg, n_quit;
 
 static void cb_toggle_show(void) { n_show++; st_master = !st_master; }
 static void cb_set_intensity(int v) { n_intensity++; st_intensity = v; }
@@ -69,8 +69,8 @@ static void cb_set_grain(int v) { n_grain++; st_grain = v; }
 static void cb_set_fibre(int v) { n_fibre++; st_fibre = v; }
 static void cb_set_blotch(int v) { n_blotch++; st_blotch = v; }
 static void cb_toggle_autostart(void) { n_autostart++; st_autostart = !st_autostart; }
-static void cb_edit_settings(void) { }
-static void cb_quit(void) { }
+static void cb_edit_settings(void) { n_editcfg++; }
+static void cb_quit(void) { n_quit++; }
 static int cb_query_master(void) { return st_master; }
 static int cb_query_intensity(void) { return st_intensity; }
 static int cb_query_warmth(void) { return st_warmth; }
@@ -90,7 +90,12 @@ static const struct TRAYCB g_cb = {
 /* Menu ids the test uses: the "Show paper" toggle, the first row of each
  * radio submenu, plus one id the model does not have. */
 #define ID_SHOW 1
+#define ID_AUTOSTART 6
+#define ID_EDITCFG 7
+#define ID_QUIT 9
 #define ID_STRENGTH_FIRST 31
+#define ID_WARMTH_FIRST 41    /* first Warmth row: value 10 */
+#define ID_WARMTH_LAST 44     /* last Warmth row: value 95  */
 #define ID_GRAIN_FIRST 101     /* first Grain row: value 2  */
 #define ID_FIBRE_FIRST 121     /* first Fibre row: value 0  */
 #define ID_BLOTCH_FIRST 141    /* first Blotch row: value 0 */
@@ -550,6 +555,39 @@ static void client_event(const char *dest, int id, int fd) {
     sd_bus_unref(c);
 }
 
+/* Scroll (is): the panel's wheel on the icon steps through the strength
+ * presets.  The answer is an empty reply; the parent asserts on the
+ * callback the scroll reached (or did not reach). */
+static void client_scroll(const char *dest, int delta, int fd) {
+    sd_bus *c = NULL;
+    sd_bus_message *m = NULL, *reply = NULL;
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    char line[256];
+    int r;
+
+    if (sd_bus_open_user(&c) < 0) { answer(fd, "ERR noconn\n"); return; }
+    sd_bus_set_method_call_timeout(c, 5u * 1000000u);
+    if (sd_bus_message_new_method_call(c, &m, dest, "/StatusNotifierItem",
+                                        "org.kde.StatusNotifierItem",
+                                        "Scroll") < 0) {
+        answer(fd, "ERR nomessage\n");
+        return;
+    }
+    sd_bus_message_append(m, "is", delta, "vertical");
+    r = sd_bus_call(c, m, 0, &err, &reply);
+    if (r < 0) {
+        snprintf(line, sizeof line, "ERR %s\n",
+                 err.name ? err.name : "unknown");
+        answer(fd, line);
+    } else {
+        answer(fd, "OK\n");
+    }
+    sd_bus_error_free(&err);
+    if (reply) sd_bus_message_unref(reply);
+    sd_bus_message_unref(m);
+    sd_bus_unref(c);
+}
+
 /* The menu itself: the DBusMenu GetLayout reply, root id, one level deep.
  * The answer carries the facts the parent asserts on, so the reply is
  * parsed where it arrives. */
@@ -731,6 +769,8 @@ static int call_tray(const char *dest, const char *method, int n,
             client_activate(dest, fds[1]);
         else if (strcmp(method, "Event") == 0)
             client_event(dest, n, fds[1]);
+        else if (strcmp(method, "Scroll") == 0)
+            client_scroll(dest, n, fds[1]);
         else if (strcmp(method, "GetLayout") == 0)
             client_getlayout(dest, fds[1], n);
         else if (strcmp(method, "ItemIsMenu") == 0)
@@ -768,7 +808,7 @@ static int call_tray(const char *dest, const char *method, int n,
 
 static void reset_counters(void) {
     n_show = n_intensity = n_warmth = n_autostart = 0;
-    n_grain = n_fibre = n_blotch = 0;
+    n_grain = n_fibre = n_blotch = n_editcfg = n_quit = 0;
     st_master = 1;
     st_intensity = 30;
     st_warmth = 45;
@@ -965,29 +1005,32 @@ int main(void) {
     /* Down into each texture submenu: Plasma fetches a submenu when it is
      * opened, so an item that advertises children-display="submenu" but
      * answers GetLayout with an empty child list renders as an empty menu.
-     * The parent id must be the SUBMENU id and the rows must be its own ten -
+     * The parent id must be the SUBMENU id and the rows must be its own -
      * not the root's.  The reply's label is the FIRST CHILD's (the client
      * helper reports the root id and the first child), so the child id and
      * label together pin the base and the ordering. */
     {
-        static const struct { int id; const char *firstrow; } subs[] = {
-            { 10, "2"  },      /* Grain  */
-            { 11, "0"  },      /* Fibre  */
-            { 12, "0"  },      /* Blotch */
+        static const struct { int id; const char *firstrow; int base;
+                              int nrow; } subs[] = {
+            { 4,  "Cool (10)", 40, 4 },  /* Warmth: labels are the preset names */
+            { 10, "2",  100, 10 },       /* Grain  */
+            { 11, "0",  120, 10 },       /* Fibre  */
+            { 12, "0",  140, 10 },       /* Blotch */
         };
         int k;
         for (k = 0; k < (int)(sizeof subs / sizeof subs[0]); k++) {
             unsigned rev = 0;
             int sid = -1, nprops = -1, nchildren = -1, firstid = -1;
             char label[128] = "";
-            int base = 100 + (k * 20);      /* Grain 100, Fibre 120, Blotch 140 */
+            int base = subs[k].base;
             reset_counters();
             call_tray(dest, "GetLayout", subs[k].id, out, sizeof out);
             CHECK(sscanf(out, "OK %u %d %d %d %d \"%127[^\"]\"", &rev,
                          &sid, &nprops, &nchildren, &firstid, label) == 6,
                   "submenu: GetLayout answers for a submenu id");
             CHECK(sid == subs[k].id, "submenu: the reply is the submenu itself");
-            CHECK(nchildren == 10, "submenu: it lists its ten rows");
+            CHECK(nchildren == subs[k].nrow,
+                  "submenu: it lists every one of its rows");
             CHECK(firstid == base + 1,
                   "submenu: the first row id is the submenu's own base");
             CHECK(strcmp(label, subs[k].firstrow) == 0,
@@ -1061,6 +1104,81 @@ int main(void) {
           "push: a new Grain value checks its own row");
     CHECK(pushed_state(ID_GRAIN_FIRST + 2) == 0,
           "push: the previously checked Grain row is unchecked");
+
+    /* The rows the first passes never clicked: a wiring regression in the
+     * Warmth branch of RadioRow or in the autostart/edit/quit id mapping
+     * used to pass this whole suite silently. */
+
+    /* Warmth radio: first and last row must reach their own callback with
+     * their own value (Cool=10, Aged=95 - not a texture row's 0/100, and
+     * not the strength callback's presets). */
+    reset_counters();
+    call_tray(dest, "Event", ID_WARMTH_FIRST, out, sizeof out);
+    CHECK(strncmp(out, "OK", 2) == 0, "event: a Warmth row is answered");
+    CHECK(n_warmth == 1, "event: a Warmth click reaches set_warmth");
+    CHECK(st_warmth == 10, "event: the Warmth row carries its own value");
+    reset_counters();
+    call_tray(dest, "Event", ID_WARMTH_LAST, out, sizeof out);
+    CHECK(n_warmth == 1 && st_warmth == 95,
+          "event: the last Warmth row carries 95");
+
+    /* and the checkmark follows, over the same push channel the host
+     * patches an open submenu from */
+    reset_counters();
+    n_pushed = 0;
+    got_items = 0;
+    tray_state_changed();
+    wait_signals(5000);
+    CHECK(pushed_state(ID_WARMTH_FIRST + 1) == 1,
+          "push: the default Warmth row (Neutral) is carried");
+    CHECK(pushed_state(ID_WARMTH_FIRST) == 0,
+          "push: an unchecked Warmth row is carried too");
+    st_warmth = 10;
+    n_pushed = 0;
+    got_items = 0;
+    tray_state_changed();
+    wait_signals(5000);
+    CHECK(pushed_state(ID_WARMTH_FIRST) == 1,
+          "push: a new Warmth value checks its own row");
+    CHECK(pushed_state(ID_WARMTH_FIRST + 1) == 0,
+          "push: the previously checked Warmth row is unchecked");
+
+    /* the three plain rows: Start at login, Edit settings file..., Quit -
+     * each must reach the callback the id map names */
+    reset_counters();
+    call_tray(dest, "Event", ID_AUTOSTART, out, sizeof out);
+    CHECK(n_autostart == 1 && st_autostart == 1,
+          "event: Start at login toggles autostart");
+    call_tray(dest, "Event", ID_EDITCFG, out, sizeof out);
+    CHECK(n_editcfg == 1,
+          "event: Edit settings file... reaches its callback");
+    call_tray(dest, "Event", ID_QUIT, out, sizeof out);
+    CHECK(n_quit == 1, "event: Quit reaches its callback");
+
+    /* Scroll: the panel's wheel steps through the strength presets like a
+     * volume icon - up is stronger, clamped at both ends, and a custom
+     * value first snaps into the preset ladder (it reads as Medium). */
+    reset_counters();
+    st_intensity = 30;
+    call_tray(dest, "Scroll", 1, out, sizeof out);      /* up: 30 -> 40 */
+    CHECK(strncmp(out, "OK", 2) == 0, "scroll: the call is answered");
+    CHECK(n_intensity == 1 && st_intensity == 40,
+          "scroll: scrolling up steps to the next-stronger preset");
+    call_tray(dest, "Scroll", 1, out, sizeof out);      /* already Strong */
+    CHECK(n_intensity == 1,
+          "scroll: at the top preset no further callback fires");
+    call_tray(dest, "Scroll", -1, out, sizeof out);     /* 40 -> 30 */
+    call_tray(dest, "Scroll", -1, out, sizeof out);     /* 30 -> 20 */
+    call_tray(dest, "Scroll", -1, out, sizeof out);     /* 20 -> 10 */
+    CHECK(n_intensity == 4 && st_intensity == 10,
+          "scroll: scrolling down walks the presets back to Subtle");
+    call_tray(dest, "Scroll", -1, out, sizeof out);     /* already Subtle */
+    CHECK(n_intensity == 4,
+          "scroll: at the bottom preset no further callback fires");
+    st_intensity = 37;                                  /* a hand-set value */
+    call_tray(dest, "Scroll", 1, out, sizeof out);
+    CHECK(n_intensity == 5 && st_intensity == 40,
+          "scroll: a custom value snaps into the ladder, then steps");
 
 done:
     kill(bus_pid, SIGTERM);
