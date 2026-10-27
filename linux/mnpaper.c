@@ -105,13 +105,22 @@
 FILE *paper_log_file;
 void PAPERLOG(const char *fmt, ...) {
     va_list ap;
-    char buf[512];
+    char buf[512], ts[16];
+    time_t t = time(NULL);
+    struct tm tm;
+    /* wall-clock prefix on every line: a boot-race bug reconstructable only
+     * from the log is undiagnosable without timestamps (the 2026-10-27
+     * "unticked after reboot" report could not be placed in time at all) */
+    if (localtime_r(&t, &tm))
+        strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+    else
+        snprintf(ts, sizeof ts, "--:--:--");
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    fprintf(stderr, "%s\n", buf);
+    fprintf(stderr, "%s %s\n", ts, buf);
     if (paper_log_file) {
-        fprintf(paper_log_file, "%s\n", buf);
+        fprintf(paper_log_file, "%s %s\n", ts, buf);
         fflush(paper_log_file);
     }
 }
@@ -957,6 +966,15 @@ static void PresentBake(struct OUT *o, const unsigned char *px) {
     }
     memcpy(o->data, px, (size_t)o->w * o->h * 4);
     o->baked_gen = g_settings_gen;
+    /* The stamp consumes the generation: QueueBake will never re-bake this
+     * paper.  So if master wants the texture on screen, THIS is the last
+     * chance to commit it - a bake that lands in the window where a resize
+     * or toggle left `attached` behind would otherwise sit in the half
+     * uncommitted, the screen frozen on the previous frame, and every later
+     * settings change a no-op ("this exact paper is ready") until the user
+     * cycles Show paper twice.  AttachCurrentBuffer attaches and commits
+     * (buf_pending is 0 here); with master off it is the designed arming. */
+    if (g_s.master) AttachCurrentBuffer(o);
     /* Only a commit hands the buffer to the compositor, so only a commit can
      * owe a release.  Clearing the token while hidden would wait forever for
      * an event that never comes and wedge every later bake. */
@@ -1339,6 +1357,9 @@ static void ApplySettings(int save) {
     if (dirty) {
         memcpy(last_tex, tex, sizeof tex);
         g_settings_gen++;
+        L("settings: gen %d (intensity %d warmth %d grain %d fibre %d blotch %d)",
+          g_settings_gen, g_s.intensity, g_s.warmth, g_s.grain, g_s.fibre,
+          g_s.blotch);
         pthread_mutex_lock(&g_wlock);
         /* re-stamp queued jobs with the new generation and settings: one
          * bake per change, never a stale one */
@@ -1359,8 +1380,9 @@ static void ApplySettings(int save) {
 
 /* --------------------------------------------------------------- commands -- */
 
-static void SetMaster(int on) {
+static void SetMaster(int on, const char *src) {
     if (g_s.master == on) return;
+    L("master: %d -> %d (%s)", g_s.master, on, src);
     g_s.master = on;
     ApplySettings(1);
 }
@@ -1381,7 +1403,7 @@ static void SetMode(int mode) {
 /* The tray mirrors the same state the CLI drives; every menu action lands in
  * the SetMaster/ApplySettings paths, so one choke point keeps the screen,
  * the config and the menu checkmarks in agreement. */
-static void MenuToggleShow(void)      { SetMaster(!g_s.master); }
+static void MenuToggleShow(void)      { SetMaster(!g_s.master, "tray menu"); }
 static void MenuSetIntensity(int v)   { g_s.intensity = v; ApplySettings(1); }
 static void MenuSetWarmth(int v)      { g_s.warmth = v; ApplySettings(1); }
 static void MenuSetGrain(int v)       { g_s.grain = v; ApplySettings(1); }
@@ -1562,15 +1584,16 @@ static void StatusLine(struct IPC *c) {
 
 static void IpcCommand(struct IPC *c, char *line) {
     while (*line == ' ' || *line == '\t') line++;
+    L("ipc: %s", line);
     if (!strcmp(line, "status")) { StatusLine(c); return; }
     if (!strcmp(line, "quit")) {
         IpcSend(c, "ok quit\n");
         g_quit = 1;
         return;
     }
-    if (!strcmp(line, "toggle")) { SetMaster(!g_s.master); IpcSend(c, "ok master %d\n", g_s.master); return; }
-    if (!strcmp(line, "on"))     { SetMaster(1); IpcSend(c, "ok master %d\n", g_s.master); return; }
-    if (!strcmp(line, "off"))    { SetMaster(0); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "toggle")) { SetMaster(!g_s.master, "ipc toggle"); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "on"))     { SetMaster(1, "ipc on"); IpcSend(c, "ok master %d\n", g_s.master); return; }
+    if (!strcmp(line, "off"))    { SetMaster(0, "ipc off"); IpcSend(c, "ok master %d\n", g_s.master); return; }
     if (!strcmp(line, "paper"))  { SetMode(MODE_PAPER); IpcSend(c, "ok mode paper\n"); return; }
     if (!strcmp(line, "eink"))   {
         if (!RequestMode(MODE_EINK)) { IpcSend(c, "err eink-not-implemented-on-wayland\n"); return; }
@@ -1829,10 +1852,10 @@ static void WorkerResultsReady(void) {
             /* A settings change, a resize or a scale change beat this bake.
              * Never a silent gap: re-queue deduped so the output converges. */
             if (o) {
-                L("output %d: stale bake dropped (gen %d vs %d, %.2fx vs %.2fx) "
-                  "- re-queued",
-                  r.idx, r.gen, g_settings_gen, (double)r.fs,
-                  (double)SurfaceFs(o));
+                L("output %d: stale bake dropped (gen %d vs %d, %dx%d at "
+                  "%.2fx vs %dx%d at %.2fx) - re-queued",
+                  r.idx, r.gen, g_settings_gen, r.w, r.h, (double)r.fs,
+                  o->w, o->h, (double)SurfaceFs(o));
                 QueueBake(o);
             } else {
                 L("output %d: stale bake dropped, output gone", r.idx);
@@ -2009,9 +2032,14 @@ int main(int argc, char **argv) {
      * first try and pays nothing. */
     {
         int tries;
-        for (tries = 0; !(g_dpy = wl_display_connect(NULL)) && tries < 40; tries++) {
-            if (!tries)
-                L("compositor not reachable yet - waiting (autostart race)");
+        /* 60 s, not 20: a real 2026-10-24 boot outlived the old bound - the
+         * autostart instance exited "cannot connect" and only Plasma's
+         * session-restore second start gave the session a paper.  This is a
+         * login race the process idles through, not a wait a human watches. */
+        for (tries = 0; !(g_dpy = wl_display_connect(NULL)) && tries < 120; tries++) {
+            if (!(tries % 20))
+                L("compositor not reachable yet - waiting (autostart race, "
+                  "%d s so far)", tries / 2);
             struct timespec ts = { 0, 500 * 1000 * 1000 };
             nanosleep(&ts, NULL);
         }
