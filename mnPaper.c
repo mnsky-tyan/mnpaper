@@ -534,11 +534,12 @@ static volatile LONG g_pepoch[MAX_MON];
  * narrower than the [0,1] that a naive |2n-1| suggests.  Measured over a full
  * 1800x1125 frame the grain field's folded magnitude has mean 0.216, sd 0.152
  * and max 0.895 (2026-10-27, single-field after the pattern decoupling).  The
- * scale is 1/(3 sigma) so the swing reaches its design range at three sigma
- * and clips only past it; the alpha it buys at intensity 30 is median 38 /
- * p99 68, matching the calibration the user accepted in 2.7.23.  Keep it tied
- * to the noise: if the octave weights or the field count change, re-measure
- * and update this.  Keep it identical to linux/paper_core.h. */
+ * scale is ~1/(3 sigma) of that spread, so the swing reaches its design
+ * range at about three sigma and clips only past it; the alpha it buys at
+ * intensity 30 is median 38 / p99 68, matching the calibration the user
+ * accepted in 2.7.23.  Keep it tied to the noise: if the octave weights or
+ * the field count change, re-measure and update this.  Keep it identical
+ * to linux/paper_core.h. */
 #define PAPER_MAG_SCALE 2.3f
 
 typedef struct {
@@ -609,12 +610,13 @@ static PAPERPARAMS PaperParams(int w, float fs, const SETTINGS *sp) {
     p.bias = sp->intensity / 4;             /* 0..10  */
     p.spread = sp->intensity * 6 / 5;       /* 0..48  */
     /* Fibre and blotch used to only nudge the noise mix (early feedback:
-     * "they don't seem to do much"). They now add their own alpha modulation on
-     * top of the mix, scaled with the strength slider, so the endpoints are
-     * unmistakable and 0 still means off.  The gain is one float expression
-     * with a single truncation at the end; over every reachable spread/fibre
-     * pair it rounds to exactly what the old `spread * 13 * fibre / 10 / 100`
-     * produced, so the visible gain comes from the spread change above. */
+     * "they don't seem to do much"). They now add their own alpha modulation
+     * on top of the grain field's swing, scaled with the strength slider, so
+     * the endpoints are unmistakable and 0 still means off.  The gain is one
+     * float expression with a single truncation at the end; over every
+     * reachable spread/fibre pair it rounds to exactly what the old
+     * `spread * 13 * fibre / 10 / 100` produced, so the visible gain comes
+     * from the spread change above. */
     p.fspread = (int)(p.spread * 1.3f * sp->fibre / 100.f);   /* up to +1.3x */
     p.bspread = (int)(p.spread * 1.2f * sp->blotch / 100.f);  /* up to +1.2x */
     return p;
