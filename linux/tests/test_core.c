@@ -386,15 +386,21 @@ static void TestSettingsActuallyChangePixels(void) {
  * sliders can fade strands and patches in and out but can never re-decide
  * which patches are warm highlights and which are shadows.  Before
  * 2026-10-27 the mix weights WERE the settings: fibre 40 -> 100 flipped a
- * third of the screen across the highlight/shadow line while adjacent steps
+ * tenth of the screen across the highlight/shadow line while adjacent steps
  * moved under 2% of pixels - the user's "same settings, different output". */
 static void TestStrengthSlidersDoNotRepaintPattern(void) {
     SETTINGS s = PaperDefaultSettings();
     int w = 240, h = 160, x, y, flips = 0, compared = 0, colbad = 0;
+    PAPERPARAMS pp = PaperParams(w, 1.f, &s);
+    int hi = (pp.wr * 299 + pp.wg_r * 587 + pp.wb_r * 114) / 1000;
+    int lo = (pp.dr * 299 + pp.dg * 587 + pp.db * 114) / 1000;
+    int mid = (hi + lo) / 2;
     unsigned char *a = malloc((size_t)w * h * 4);
     unsigned char *b = malloc((size_t)w * h * 4);
     CHECK(a && b, "alloc");
     if (!a || !b) { free(a); free(b); return; }
+    CHECK(hi - lo > 64,
+          "family colours sit far enough apart to classify at alpha 8");
 
     s.fibre = 0; s.blotch = 0;
     BuildPaperFull(a, w, h, 1.f, &s, NULL);
@@ -407,13 +413,14 @@ static void TestStrengthSlidersDoNotRepaintPattern(void) {
             unsigned char *pb = b + 4 * ((size_t)y * w + x);
             int c, la, lb;
             if (pa[3] < 8 || pb[3] < 8) continue;   /* too thin to un-multiply */
-            /* the branch map: highlight vs shadow, un-premultiplied luminance.
-             * At warmth 45 the two classes sit near 232 and 133, so 190 is
-             * mid-gap and safe from un-multiply rounding at alpha >= 8. */
+            /* the branch map: highlight vs shadow, un-premultiplied luminance
+             * against the midpoint of the two family colours.  Un-multiply
+             * only rounds down and by at most 255/alpha levels, so with the
+             * gap checked above, alpha >= 8 cannot cross the midpoint. */
             la = (pa[2] * 299 + pa[1] * 587 + pa[0] * 114) * 255 / (1000 * pa[3]);
             lb = (pb[2] * 299 + pb[1] * 587 + pb[0] * 114) * 255 / (1000 * pb[3]);
             compared++;
-            if ((la >= 190) != (lb >= 190)) flips++;
+            if ((la >= mid) != (lb >= mid)) flips++;
             /* where both are solid, the un-premultiplied colour must also
              * match within quantization (255/100 amplifies by 2.5) */
             if (pa[3] >= 100 && pb[3] >= 100)

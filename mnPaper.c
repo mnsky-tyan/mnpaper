@@ -633,13 +633,14 @@ static void PaperPixel(unsigned char *out, int x, int y, const PAPERPARAMS *p) {
     /* The light/dark pattern is the grain field ALONE.  It used to be a
      * weighted mix whose fibre and macro weights were the fibre and blotch
      * SETTINGS, so moving those sliders re-decided which patches are warm
-     * highlights and which are shadows - a third of the screen flips sides
-     * between fibre 40 and 100 (measured 2026-10-27), while adjacent steps
-     * moved under 2% of pixels.  Half the dial felt dead and the rest felt
-     * like a different paper: the user called it "same settings, different
-     * output".  Sliders must scale VISIBILITY, never re-weight the pattern:
-     * grain sizes the pattern, fibre and blotch are pure alpha overlays on
-     * it, and warmth only tints.  Keep identical to linux/paper_core.h. */
+     * highlights and which are shadows - a tenth of the screen flips sides
+     * between fibre 40 and 100 at the defaults (measured 2026-10-27), while
+     * adjacent steps moved under 2% of pixels.  Half the dial felt dead and
+     * the rest felt like a different paper: the user called it "same
+     * settings, different output".  Sliders must scale VISIBILITY, never
+     * re-weight the pattern: grain sizes the pattern, fibre and blotch are
+     * pure alpha overlays on it, and warmth only tints.  Keep identical to
+     * linux/paper_core.h. */
     float d = (grain - 0.5f) * 2.f;
     float mag = d < 0 ? -d : d;
     /* Normalise the folded magnitude to the range the swing is scaled for; see

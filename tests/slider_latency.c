@@ -413,6 +413,59 @@ int main(void) {
             Check(med >= floor * 3, "most of the veil is texture, not a flat bias floor");
             free(buf);
         }
+        /* The strength sliders must scale visibility, never repaint the
+         * pattern: the branch that picks each pixel's colour family belongs
+         * to the grain field alone, so the UN-premultiplied colour is
+         * identical at any fibre and blotch.  Same property and same
+         * threshold derivation as TestStrengthSlidersDoNotRepaintPattern in
+         * linux/tests/test_core.c, driven here against this engine's own
+         * full-resolution bake. */
+        {
+            int w = 240, h = 160, x, y, c, flips = 0, compared = 0, colbad = 0;
+            int hi, lo, mid;
+            unsigned char *a = malloc((size_t)w * h * 4);
+            unsigned char *b = malloc((size_t)w * h * 4);
+            PAPERPARAMS pp;
+            SETTINGS s = before;       /* the shipped defaults */
+            pp = PaperParams(w, 1.f, &s);
+            hi = (pp.wr * 299 + pp.wg_r * 587 + pp.wb_r * 114) / 1000;
+            lo = (pp.dr * 299 + pp.dg * 587 + pp.db * 114) / 1000;
+            mid = (hi + lo) / 2;
+            Check(a && b, "branch-map buffers allocated");
+            Check(hi - lo > 64, "family colours far enough apart to classify at alpha 8");
+            s.fibre = 0; s.blotch = 0;
+            Check(BuildPaperFull(a, w, h, 1.f, &s, NULL, 0), "bare-grain bake renders");
+            s.fibre = 100; s.blotch = 100;
+            Check(BuildPaperFull(b, w, h, 1.f, &s, NULL, 0), "fully-overlaid bake renders");
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++) {
+                    unsigned char *pa = a + 4 * ((size_t)y * w + x);
+                    unsigned char *pb = b + 4 * ((size_t)y * w + x);
+                    int la, lb;
+                    if (pa[3] < 8 || pb[3] < 8) continue;   /* too thin to un-multiply */
+                    la = (pa[2] * 299 + pa[1] * 587 + pa[0] * 114) * 255 / (1000 * pa[3]);
+                    lb = (pb[2] * 299 + pb[1] * 587 + pb[0] * 114) * 255 / (1000 * pb[3]);
+                    compared++;
+                    if ((la >= mid) != (lb >= mid)) flips++;
+                    if (pa[3] >= 100 && pb[3] >= 100)
+                        for (c = 0; c < 3; c++) {
+                            int ca = (pa[c] * 255 + pa[3] / 2) / pa[3];
+                            int cb = (pb[c] * 255 + pb[3] / 2) / pb[3];
+                            if (abs(ca - cb) > 4) colbad++;
+                        }
+                }
+            printf("METRIC branch flips fibre/blotch 0->100: %d of %d\n", flips, compared);
+            Check(compared > w * h / 4, "both bakes carry real alpha");
+            Check(flips == 0, "fibre/blotch must not repaint the branch map");
+            Check(colbad == 0, "solid pixels keep their un-premultiplied colour");
+            {
+                size_t j, n = (size_t)w * h;
+                long sum = 0;
+                for (j = 0; j < n; j++) sum += b[4*j+3] - a[4*j+3];
+                Check(sum > 0, "fibre/blotch overlays add alpha");
+            }
+            free(a); free(b);
+        }
     }
     /* Grain, fibre and blotch must be visible in the PREVIEW itself - the
      * old 8px preview sampled the true frequencies on the coarse grid and
