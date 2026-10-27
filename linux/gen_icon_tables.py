@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Regenerate the mnPaper icon pixels from the mn-brand 2048x2048 render.
 
-    python3 gen_icon_tables.py <mnpaper-2048.png>            > icon_tables.h
+    python3 gen_icon_tables.py <mnpaper-2048.png> --header icon_tables.h
     python3 gen_icon_tables.py <mnpaper-2048.png> --ico OUT.ico
 
+The header is always written to the --header path (default icon_tables.h
+in the current directory); --ico additionally writes a multi-size .ico.
 Both outputs come from the same pipeline, so the tray tables and every .ico
 entry are the same pixels by construction.
 
