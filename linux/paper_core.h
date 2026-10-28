@@ -440,10 +440,11 @@ static int BuildPaperFull(unsigned char *px, int w, int h, float fs,
 }
 
 /* Composite a premultiplied BGRA buffer over a flat background, in place.
- * This is "what a person sees", the same premise the measuring rules below
- * rely on, so there is exactly one copy: the Linux daemon, --dump-tex and
- * the tests all call this one.  mnPaper.c keeps its own byte-identical copy
- * until the Windows build is unified onto this header - keep them identical. */
+ * This is "what a person sees", the same premise the tests' visibility
+ * floors rely on, so there is exactly one copy: the Linux daemon,
+ * --dump-tex and the tests all call this one.  mnPaper.c keeps its own
+ * byte-identical copy until the Windows build is unified onto this header -
+ * keep them identical. */
 static void CompositeOver(unsigned char *px, int w, int h, int bg) {
     int i;
     for (i = 0; i < w * h; i++) {

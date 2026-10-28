@@ -88,7 +88,8 @@ static const struct TRAYCB g_cb = {
 };
 
 /* Menu ids the test uses: the "Show paper" toggle, the first row of each
- * radio submenu, plus one id the model does not have. */
+ * radio submenu, the last Warmth row, the three plain rows, plus one id
+ * the model does not have. */
 #define ID_SHOW 1
 #define ID_AUTOSTART 6
 #define ID_EDITCFG 7
