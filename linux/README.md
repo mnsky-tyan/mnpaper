@@ -71,7 +71,8 @@ Keys accepted by `--set` (same names and bounds as the Windows registry
 values): `master`, `mode`, `intensity` (0-40), `warmth` (0-100), `grain`
 (2-12), `fibre` (0-100), `blotch` (0-100), `shades`, `contrast`, `dither`,
 `share`, `tbmode`, `autostart`, `autoupd`, `panelgap` (0-512). `cfgver` is
-written by the program for its own migration and is not meant to be set.
+also accepted but clamped to 0-2; it is the program's own migration marker -
+do not set it.
 `autostart` is applied to the `.desktop` file rather than stored in the
 config, and is read back from it.
 The keys that change the Linux image are `grain`, `fibre`, `blotch`,
@@ -355,7 +356,8 @@ touching the buffer or layer-surface code):
 ./mnpaper --set warmth=80          # expect exactly one new "baked" line
 ./mnpaper --off; ./mnpaper --on    # expect NO new "baked" line
 ./mnpaper --toggle                 # rapid toggles: still no re-bakes
-./mnpaper --quit                   # socket and shm must disappear
+./mnpaper --quit                   # socket must disappear (the shm object is
+                                   # unlinked at open; check fds, not /dev/shm)
 ```
 
 ## Known limitations

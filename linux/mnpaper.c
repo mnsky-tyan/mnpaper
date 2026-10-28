@@ -1813,18 +1813,6 @@ static int DumpBmp(const char *path, const unsigned char *bgra, int w, int h) {
     return ok;
 }
 
-static void CompositeOver(unsigned char *bgra, int w, int h, int bg) {
-    int i;
-    for (i = 0; i < w * h; i++) {
-        unsigned char *p = bgra + 4 * (size_t)i;
-        int a = p[3];
-        p[0] = (unsigned char)(p[0] + bg * (255 - a) / 255);
-        p[1] = (unsigned char)(p[1] + bg * (255 - a) / 255);
-        p[2] = (unsigned char)(p[2] + bg * (255 - a) / 255);
-        p[3] = 255;
-    }
-}
-
 /* -------------------------------------------------- worker results pump --- */
 
 static void WorkerResultsReady(void) {
